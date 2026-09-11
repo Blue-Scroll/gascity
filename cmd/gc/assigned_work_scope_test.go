@@ -484,6 +484,123 @@ func TestSessionHasOpenAssignedWorkMatchesConfiguredNamedSessionRuntimeFallback(
 	}
 }
 
+// A namepool worker claims under its alias (gc hook --claim writes the alias
+// first), so the drain guards must find work assigned to that alias. Before
+// they did, the reconciler drained workers in the middle of their beads and the
+// orphan lane reopened the work, over and over (2026-09-11). Without a namepool
+// the alias is a transient slot name and must still not count; that is the
+// negative pin in session_alias_assignment_guard_test.go.
+func TestSessionHasOpenAssignedWorkMatchesNamepoolAlias(t *testing.T) {
+	session := beads.Bead{
+		ID:     "session-dag",
+		Type:   sessionBeadType,
+		Status: "open",
+		Metadata: map[string]string{
+			"template":     "pack.polecat",
+			"session_name": "rig--dag",
+			"alias":        "rig/dag",
+		},
+	}
+	namepoolCfg := &config.City{
+		Workspace: config.Workspace{Name: "test-city"},
+		Agents: []config.Agent{{
+			Name:          "polecat",
+			BindingName:   "pack",
+			NamepoolNames: []string{"dag", "nux"},
+		}},
+	}
+	slotCfg := &config.City{
+		Workspace: config.Workspace{Name: "test-city"},
+		Agents: []config.Agent{{
+			Name:        "polecat",
+			BindingName: "pack",
+		}},
+	}
+
+	for _, tc := range []struct {
+		name string
+		cfg  *config.City
+		want bool
+	}{
+		{"namepool alias counts", namepoolCfg, true},
+		{"slot alias without a namepool does not count", slotCfg, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := beads.NewMemStore()
+			mustCreateInProgressWork(t, store, "rig/dag")
+			info := sessiontest.SeedBead(t, session)
+
+			checks := []struct {
+				name  string
+				check func() (bool, error)
+			}{
+				{"sessionHasOpenAssignedWorkForConfigInfo", func() (bool, error) {
+					return sessionHasOpenAssignedWorkForConfigInfo("", tc.cfg, store, nil, info)
+				}},
+				{"sessionHasOpenAssignedWorkForReachableStore", func() (bool, error) {
+					return sessionHasOpenAssignedWorkForReachableStore("", tc.cfg, store, nil, info)
+				}},
+				{"sessionHasAwakeAssignedWorkForReachableStore", func() (bool, error) {
+					return sessionHasAwakeAssignedWorkForReachableStore("", tc.cfg, store, nil, info)
+				}},
+				{"sessionHasOpenAssignedWorkForReachableStoreForCloseGate", func() (bool, error) {
+					return sessionHasOpenAssignedWorkForReachableStoreForCloseGate("", tc.cfg, store, nil, info)
+				}},
+			}
+			for _, c := range checks {
+				has, err := c.check()
+				if err != nil {
+					t.Fatalf("%s: %v", c.name, err)
+				}
+				if has != tc.want {
+					t.Fatalf("%s = %v, want %v for work claimed under the alias", c.name, has, tc.want)
+				}
+			}
+
+			gotRaw := containsString(sessionAssignmentIdentifiersForConfig(session, tc.cfg), "rig/dag")
+			gotInfo := containsString(sessionAssignmentIdentifiersForConfigInfo(info, tc.cfg), "rig/dag")
+			if gotRaw != tc.want || gotInfo != tc.want {
+				t.Fatalf("alias in identifiers: raw=%v info=%v, want %v", gotRaw, gotInfo, tc.want)
+			}
+		})
+	}
+}
+
+// The town shape: a rig-scoped namepool agent resolved from the session's
+// template. The awake bridge feeds this value into ComputeAwakeSet, so a
+// lookup miss here would silently switch the wake half of the fix off.
+func TestSessionNamepoolAliasInfoResolvesRigScopedNamepoolAgent(t *testing.T) {
+	cfg := &config.City{
+		Workspace: config.Workspace{Name: "test-city"},
+		Agents: []config.Agent{
+			{Name: "polecat-opus-high", Dir: "vessel-network", NamepoolNames: []string{"nux"}},
+			{Name: "witness", Dir: "vessel-network"},
+		},
+	}
+	pool := sessiontest.SeedBead(t, beads.Bead{
+		ID: "session-nux", Type: sessionBeadType, Status: "open",
+		Metadata: map[string]string{
+			"template":     "vessel-network/polecat-opus-high",
+			"session_name": "vessel-network--nux",
+			"alias":        "vessel-network/nux",
+		},
+	})
+	if got := sessionNamepoolAliasInfo(pool, cfg); got != "vessel-network/nux" {
+		t.Fatalf("sessionNamepoolAliasInfo(namepool worker) = %q, want vessel-network/nux", got)
+	}
+	other := sessiontest.SeedBead(t, beads.Bead{
+		ID: "session-witness", Type: sessionBeadType, Status: "open",
+		Metadata: map[string]string{
+			"template":     "vessel-network/witness",
+			"session_name": "vessel-network--witness",
+			"alias":        "vessel-network/witness",
+		},
+	})
+	if got := sessionNamepoolAliasInfo(other, cfg); got != "" {
+		t.Fatalf("sessionNamepoolAliasInfo(no namepool) = %q, want empty", got)
+	}
+}
+
 func TestSessionAssignmentIdentifiersForConfigConfiguredNamedSessionFallbackIsConservative(t *testing.T) {
 	cfg := &config.City{
 		Workspace: config.Workspace{Name: "test-city"},

@@ -890,6 +890,94 @@ func TestScaleDemandCountsAssignedSessionBeforeKeepingIdlePoolSibling(t *testing
 	assertReason(t, result, "gc__run-operator-mc-new", "assigned-work")
 }
 
+// Regression for a pool drain loop seen live on 2026-09-11. gc hands a pool
+// polecat its alias as BEADS_ACTOR, so its claim writes the alias as the
+// assignee. Here the claimant sits after an idle sibling in slice order. Before
+// the alias counted, the positional scaled:demand pass gave the only slot to
+// the idle sibling and drained the polecat in the middle of its bead.
+func TestScaleDemandCountsAliasAssignedSessionBeforeKeepingIdlePoolSibling(t *testing.T) {
+	const template = "vessel-network/polecat-opus-high"
+	result := ComputeAwakeSet(AwakeInput{
+		Agents: []AwakeAgent{{QualifiedName: template}},
+		SessionBeads: []AwakeSessionBead{
+			{ID: "hq-idle", SessionName: "vessel-network--rictus", Template: template, State: "active", NamepoolAlias: "vessel-network/rictus"},
+			{ID: "hq-busy", SessionName: "vessel-network--dag", Template: template, State: "active", NamepoolAlias: "vessel-network/dag"},
+		},
+		WorkBeads: []AwakeWorkBead{{
+			ID: "vn-work", Assignee: "vessel-network/dag", Status: "in_progress",
+		}},
+		ScaleCheckCounts: map[string]int{template: 1},
+		RunningSessions:  map[string]bool{"vessel-network--rictus": true, "vessel-network--dag": true},
+		Now:              now,
+	})
+
+	assertAsleep(t, result, "vessel-network--rictus")
+	assertAwake(t, result, "vessel-network--dag")
+	assertReason(t, result, "vessel-network--dag", "assigned-work")
+	if got := result["vessel-network--dag"].AssignedWorkBeadID; got != "vn-work" {
+		t.Fatalf("AssignedWorkBeadID = %q, want vn-work", got)
+	}
+}
+
+// With no scale demand at all, a polecat holding in_progress work under its
+// alias must still stay awake. Before the fix it had no wake reason at all.
+func TestAliasAssignedInProgressWorkKeepsPoolSessionAwakeWithoutScaleDemand(t *testing.T) {
+	const template = "vessel-network/polecat-opus-high"
+	result := ComputeAwakeSet(AwakeInput{
+		Agents: []AwakeAgent{{QualifiedName: template}},
+		SessionBeads: []AwakeSessionBead{
+			{ID: "hq-busy", SessionName: "vessel-network--nux", Template: template, State: "active", NamepoolAlias: "vessel-network/nux"},
+		},
+		WorkBeads: []AwakeWorkBead{{
+			ID: "vn-work", Assignee: "vessel-network/nux", Status: "in_progress",
+		}},
+		RunningSessions: map[string]bool{"vessel-network--nux": true},
+		Now:             now,
+	})
+
+	assertAwake(t, result, "vessel-network--nux")
+	assertReason(t, result, "vessel-network--nux", "assigned-work")
+}
+
+// A session with no namepool alias (a transient-slot pool, or any session the
+// bridge did not mark) does not answer for alias-form work, even when the alias
+// text would match. This mirrors TestAssignmentGuardsIgnoreTransientPoolSlotAliases
+// on the wake side.
+func TestAliasFormWorkDoesNotKeepSessionWithoutNamepoolAliasAwake(t *testing.T) {
+	const template = "gascity/gc.run-operator"
+	result := ComputeAwakeSet(AwakeInput{
+		Agents: []AwakeAgent{{QualifiedName: template}},
+		SessionBeads: []AwakeSessionBead{
+			{ID: "gcg-session-x", SessionName: "gc__run-operator-gcg-session-x", Template: template, State: "active"},
+		},
+		WorkBeads: []AwakeWorkBead{{
+			ID: "ga-work", Assignee: "gascity/gc.run-operator-1", Status: "in_progress",
+		}},
+		RunningSessions: map[string]bool{"gc__run-operator-gcg-session-x": true},
+		Now:             now,
+	})
+
+	assertAsleep(t, result, "gc__run-operator-gcg-session-x")
+}
+
+// Another session's alias must not make a pool session look busy.
+func TestAnotherSessionsAliasDoesNotKeepPoolSessionAwake(t *testing.T) {
+	const template = "vessel-network/polecat-opus-high"
+	result := ComputeAwakeSet(AwakeInput{
+		Agents: []AwakeAgent{{QualifiedName: template}},
+		SessionBeads: []AwakeSessionBead{
+			{ID: "hq-idle", SessionName: "vessel-network--rictus", Template: template, State: "active", NamepoolAlias: "vessel-network/rictus"},
+		},
+		WorkBeads: []AwakeWorkBead{{
+			ID: "vn-work", Assignee: "vessel-network/dag", Status: "in_progress",
+		}},
+		RunningSessions: map[string]bool{"vessel-network--rictus": true},
+		Now:             now,
+	})
+
+	assertAsleep(t, result, "vessel-network--rictus")
+}
+
 func TestScaleDemandCountsAssignedSessionBeforeKeepingStartPendingPoolSibling(t *testing.T) {
 	result := ComputeAwakeSet(AwakeInput{
 		Agents: []AwakeAgent{{QualifiedName: "gascity/gc.run-operator"}},

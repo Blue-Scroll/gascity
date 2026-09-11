@@ -874,11 +874,12 @@ func sessionAssignmentIdentifiers(sessionBead beads.Bead) []string {
 }
 
 // sessionAssignmentIdentifiersForConfig extends the persisted session-bead
-// identifiers with the configured named-session identity when a recovered bead
-// is missing identity metadata. Keep this fallback aligned with
-// sessionAssigneeMatches and compute_awake_bridge's AwakeNamedSession fields.
+// identifiers with a namepool worker's alias (see sessionNamepoolAlias) and with
+// the configured named-session identity when a recovered bead is missing
+// identity metadata. Keep both aligned with sessionAssigneeMatches and
+// compute_awake_bridge's AwakeSessionBead / AwakeNamedSession fields.
 func sessionAssignmentIdentifiersForConfig(sessionBead beads.Bead, cfg *config.City) []string {
-	raw := sessionAssignmentIdentifierRaw(sessionBead)
+	raw := append(sessionAssignmentIdentifierRaw(sessionBead), sessionNamepoolAlias(sessionBead, cfg))
 	if cfg == nil ||
 		strings.TrimSpace(sessionBead.Metadata[namedSessionMetadataKey]) != "true" ||
 		strings.TrimSpace(sessionBead.Metadata[namedSessionIdentityMetadata]) != "" {
@@ -911,6 +912,56 @@ func sessionAssignmentIdentifiersForConfig(sessionBead beads.Bead, cfg *config.C
 	return compactSessionAssignmentIdentifiers(raw)
 }
 
+// agentUsesNamepool reports whether the agent names its pool workers from a
+// namepool ("nux", "dag"). That is the one pool shape that keeps its alias:
+// usesTransientPoolSlotIdentity is false for it.
+func agentUsesNamepool(a *config.Agent) bool {
+	return a != nil && (strings.TrimSpace(a.Namepool) != "" || len(a.NamepoolNames) > 0)
+}
+
+// sessionNamepoolAlias returns the session's alias when its agent names workers
+// from a namepool, and "" otherwise.
+//
+// A namepool worker keeps its alias, gc hands it that alias as BEADS_ACTOR, and
+// `gc hook --claim` writes the alias first. So a namepool worker's claims land
+// in alias form, and the assignment guards have to count it. Without it they
+// read a busy worker as idle: the reconciler drained claim holders as
+// no-wake-reason and orphaned, the orphan lane reopened their beads, and the
+// pool respawned a worker that was drained the same way (a loop seen live on
+// 2026-09-11). Transient pool slot aliases still do not count, because a slot
+// name is handed to the next session; session_alias_assignment_guard_test.go
+// pins that.
+func sessionNamepoolAlias(sessionBead beads.Bead, cfg *config.City) string {
+	alias := strings.TrimSpace(sessionBead.Metadata["alias"])
+	if alias == "" || cfg == nil {
+		return ""
+	}
+	template := normalizedSessionTemplate(sessionBead, cfg)
+	if template == "" {
+		template = strings.TrimSpace(sessionBead.Metadata["template"])
+	}
+	if !agentUsesNamepool(findAgentByTemplate(cfg, template)) {
+		return ""
+	}
+	return alias
+}
+
+// sessionNamepoolAliasInfo is the session.Info form of sessionNamepoolAlias.
+func sessionNamepoolAliasInfo(info session.Info, cfg *config.City) string {
+	alias := strings.TrimSpace(info.Alias)
+	if alias == "" || cfg == nil {
+		return ""
+	}
+	template := normalizedSessionTemplateInfo(info, cfg)
+	if template == "" {
+		template = strings.TrimSpace(info.Template)
+	}
+	if !agentUsesNamepool(findAgentByTemplate(cfg, template)) {
+		return ""
+	}
+	return alias
+}
+
 func sessionAssignmentIdentifierRaw(sessionBead beads.Bead) []string {
 	return []string{
 		strings.TrimSpace(sessionBead.ID),
@@ -925,7 +976,7 @@ func sessionAssignmentIdentifierRaw(sessionBead beads.Bead) []string {
 // SessionNameMetadata, Template) instead of cracking the raw bead, staying
 // byte-identical to the raw form (TestSessionClassifierInfoEquivalence pins it).
 func sessionAssignmentIdentifiersForConfigInfo(info session.Info, cfg *config.City) []string {
-	raw := sessionAssignmentIdentifierRawInfo(info)
+	raw := append(sessionAssignmentIdentifierRawInfo(info), sessionNamepoolAliasInfo(info, cfg))
 	if cfg == nil ||
 		!info.ConfiguredNamedSession ||
 		strings.TrimSpace(info.ConfiguredNamedIdentity) != "" {

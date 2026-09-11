@@ -77,6 +77,12 @@ type AwakeSessionBead struct {
 	RestartRequested          bool      // restart_requested metadata is still active
 	ContinuationResetPending  bool      // continuation_reset_pending metadata is set
 	CurrentlyProcessingBeadID string    // work bead the session is currently processing
+	// NamepoolAlias is the session's alias when its agent names workers from a
+	// namepool ("nux"), and "" otherwise (see sessionNamepoolAliasInfo). A
+	// namepool worker's claims land in alias form, so sessionAssigneeMatches
+	// must treat it as the session's own identity, or a worker holding claimed
+	// work looks idle. Transient pool slot aliases are left out on purpose.
+	NamepoolAlias string
 }
 
 // AwakeWorkBead represents a work bead with an assignee.
@@ -737,6 +743,15 @@ func sessionAssigneeMatches(named []AwakeNamedSession, bead AwakeSessionBead, as
 		return false
 	}
 	if assignee == bead.ID || assignee == bead.SessionName {
+		return true
+	}
+	// A namepool worker claims under its alias (gc hook --claim writes the alias
+	// first). Without this check its claimed work never counted: the session
+	// got no assigned-work wake reason, filled no scale slot, and the positional
+	// scaled:demand pass could hand its slot to an idle sibling and drain it
+	// mid-bead. The drain guards count the same alias
+	// (sessionAssignmentIdentifiersForConfigInfo).
+	if bead.NamepoolAlias != "" && assignee == bead.NamepoolAlias {
 		return true
 	}
 	if bead.NamedIdentity != "" {
