@@ -89,6 +89,12 @@ const (
 
 var errNudgeSessionFenceMismatch = errors.New("queued nudge session fence mismatch")
 
+// nudgeSessionReplacedReason is the dead-letter reason for a pending row whose
+// session bead is already closed: the agent it named was replaced, so the row
+// can never deliver. Before hq-02cr3 such a row burned a dispatch tick every
+// cycle until its 24h TTL expired it.
+const nudgeSessionReplacedReason = "session replaced"
+
 var (
 	// Test seams for cmd_nudge_test.go. Tests that replace these package
 	// variables must stay serial; do not use t.Parallel in those tests.
@@ -1827,9 +1833,16 @@ func queuedNudgeIDs(items []queuedNudge) []string {
 	return ids
 }
 
+// queuedNudgeMatchesTargetFence reports whether a claimed row may go to this
+// target. A row that names a session bead belongs to that bead: when the ids
+// match it is delivered even if the continuation epoch has moved on, because
+// that is the same agent after a restart, not a stranger (before hq-02cr3
+// every epoch bump killed such rows with no retry). When the ids differ the
+// row is another session's and is rejected. A row with no session id keeps
+// the epoch-only check it always had.
 func queuedNudgeMatchesTargetFence(target nudgeTarget, item queuedNudge) bool {
-	if item.SessionID != "" && item.SessionID != target.sessionID {
-		return false
+	if item.SessionID != "" {
+		return item.SessionID == target.sessionID
 	}
 	if item.ContinuationEpoch != "" && item.ContinuationEpoch != target.continuationEpoch {
 		return false
@@ -2462,9 +2475,18 @@ func recordNudgeDispatchSkips(cityPath string, counts map[string]int64) error {
 // never matches never gets swept by any of them. The supervisor dispatch
 // tick is the one path that iterates the whole queue every cycle regardless
 // of match outcome, so it owns running this sweep unconditionally.
-func runNudgeQueueMaintenanceSweep(cityPath string, now time.Time) error {
+//
+// sessStore is the session-class store. When it is backed, pending rows whose
+// session bead is already closed are dead-lettered as "session replaced"
+// (hq-02cr3). A nil or unbacked store skips that pass.
+func runNudgeQueueMaintenanceSweep(cityPath string, sessStore beads.Store, now time.Time) error {
 	maint := nudgeMaintenanceStore{cityPath: cityPath}
 	defer maint.close() //nolint:errcheck // best-effort
+	// The session reads happen before the queue flock is taken, so a slow
+	// session store never makes a foreground `gc sling --nudge` wait on the
+	// lock. A closed session stays closed, so the verdict cannot go stale
+	// while we wait for the lock.
+	replaced := closedSessionsForQueuedNudges(cityPath, sessionFrontDoor(sessStore))
 	return withNudgeQueueState(cityPath, func(state *nudgeQueueState) error {
 		front := maint.frontForState(state)
 		deadline := noMaintenanceDeadline()
@@ -2474,8 +2496,73 @@ func runNudgeQueueMaintenanceSweep(cityPath string, now time.Time) error {
 		if err := pruneExpiredQueuedNudges(state, front, now, deadline); err != nil {
 			return err
 		}
+		if err := deadLetterReplacedSessionNudges(state, front, replaced, now, deadline); err != nil {
+			return err
+		}
 		return pruneDeadQueuedNudges(state, front, now, deadline)
 	})
+}
+
+// closedSessionsForQueuedNudges returns the session ids named by pending rows
+// whose session bead is closed. It reads the queue without the lock (the same
+// unlocked LoadState the dispatcher does) and asks the session store once per
+// distinct id. A read error or a missing bead is not proof the session was
+// replaced, so those ids are left out and their rows fall to the TTL as
+// before. An unbacked store (tests, no session class) yields nothing.
+func closedSessionsForQueuedNudges(cityPath string, sessFront *session.Store) map[string]bool {
+	if !sessFront.Backed() {
+		return nil
+	}
+	state, err := nudgequeue.LoadState(cityPath)
+	if err != nil || len(state.Pending) == 0 {
+		return nil
+	}
+	closed := make(map[string]bool)
+	seen := make(map[string]bool)
+	for _, item := range state.Pending {
+		id := item.SessionID
+		if id == "" || seen[id] {
+			continue
+		}
+		seen[id] = true
+		if _, isClosed, err := sessFront.GetState(id); err == nil && isClosed {
+			closed[id] = true
+		}
+	}
+	return closed
+}
+
+// deadLetterReplacedSessionNudges moves pending rows whose session id is in
+// replaced (a closed session bead) to Dead with reason "session replaced".
+// Same shape as pruneExpiredQueuedNudges: the queue move is authoritative and
+// the bead terminalize is best-effort, so a failed bead write never traps the
+// row in pending.
+func deadLetterReplacedSessionNudges(state *nudgeQueueState, front *nudgequeue.Store, replaced map[string]bool, now, deadline time.Time) error {
+	return deadLetterReplacedSessionNudgesWithClock(state, front, replaced, now, deadline, clock.Real{})
+}
+
+func deadLetterReplacedSessionNudgesWithClock(state *nudgeQueueState, front *nudgequeue.Store, replaced map[string]bool, now, deadline time.Time, clk clock.Clock) error {
+	if len(replaced) == 0 {
+		return nil
+	}
+	filtered := state.Pending[:0]
+	for i, item := range state.Pending {
+		if clk.Now().After(deadline) {
+			filtered = append(filtered, state.Pending[i:]...)
+			break
+		}
+		if item.SessionID == "" || !replaced[item.SessionID] {
+			filtered = append(filtered, item)
+			continue
+		}
+		item.DeadAt = now.UTC()
+		item.LastError = nudgeSessionReplacedReason
+		state.Dead = append(state.Dead, item)
+		_ = front.Terminalize(item, "failed", item.LastError, "", now)
+	}
+	state.Pending = filtered
+	sortQueuedNudges(state)
+	return nil
 }
 
 func pruneExpiredQueuedNudges(state *nudgeQueueState, front *nudgequeue.Store, now, deadline time.Time) error {

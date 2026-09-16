@@ -609,3 +609,66 @@ func TestEnqueuePingsWakeSocket(t *testing.T) {
 		t.Fatal("wakeCh not signaled after enqueue")
 	}
 }
+
+// TestDispatchAllQueuedNudgesDeadLettersRowsForClosedSession: a pending row
+// that names a session bead which is already closed (the polecat was
+// replaced) can never deliver. The dispatch tick's sweep dead-letters it as
+// "session replaced" even though no open session matches it (hq-02cr3).
+func TestDispatchAllQueuedNudgesDeadLettersRowsForClosedSession(t *testing.T) {
+	clearGCEnv(t)
+	disableManagedDoltRecoveryForTest(t)
+	clearInheritedCityRoutingEnv(t)
+	t.Setenv("GC_BEADS", "file")
+
+	dir := t.TempDir()
+	store := openNudgeBeadStore(dir)
+	if store.Store == nil {
+		t.Fatal("openNudgeBeadStore returned nil")
+	}
+	created, err := store.Create(beads.Bead{
+		Title:  "Session: worker",
+		Type:   session.BeadType,
+		Status: "open",
+		Labels: []string{session.LabelSession},
+		Metadata: map[string]string{
+			"session_name": "worker-session",
+			"agent_name":   "worker",
+			"template":     "worker",
+		},
+	})
+	if err != nil {
+		t.Fatalf("store.Create session bead: %v", err)
+	}
+	if err := store.Close(created.ID); err != nil {
+		t.Fatalf("store.Close: %v", err)
+	}
+	item := newQueuedNudgeWithOptions("worker", "msg", "session", time.Now().Add(-time.Minute), queuedNudgeOptions{
+		ID:        "n-replaced",
+		SessionID: created.ID,
+	})
+	if err := enqueueQueuedNudgeWithStore(dir, store, item); err != nil {
+		t.Fatalf("enqueueQueuedNudgeWithStore: %v", err)
+	}
+
+	delivered, err := dispatchAllQueuedNudges(dir, supervisorCfg(), store, store, runtime.NewFake(), newSessionBeadSnapshot(nil), nil)
+	if err != nil {
+		t.Fatalf("dispatchAllQueuedNudges: %v", err)
+	}
+	if delivered != 0 {
+		t.Fatalf("delivered = %d, want 0", delivered)
+	}
+
+	state, err := nudgequeue.LoadState(dir)
+	if err != nil {
+		t.Fatalf("LoadState: %v", err)
+	}
+	if len(state.Pending) != 0 {
+		t.Fatalf("pending = %d, want 0 (row for a closed session should be dead-lettered by the dispatch tick)", len(state.Pending))
+	}
+	if len(state.Dead) != 1 || state.Dead[0].ID != "n-replaced" {
+		t.Fatalf("dead = %#v, want only n-replaced", state.Dead)
+	}
+	if state.Dead[0].LastError != nudgeSessionReplacedReason {
+		t.Fatalf("dead[0].LastError = %q, want %q", state.Dead[0].LastError, nudgeSessionReplacedReason)
+	}
+}

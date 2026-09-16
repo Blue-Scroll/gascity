@@ -2879,8 +2879,10 @@ func TestTryDeliverQueuedNudgesByPollerDeliversDespiteStaleFenceBeadMarkFailure(
 	idleSince := time.Now().Add(-10 * time.Second)
 	fake.Activity = map[string]time.Time{info.SessionName: idleSince}
 
+	// Since hq-02cr3 a row that names this session bead passes the fence
+	// whatever its epoch, so the only fence-rejectable shape left is an
+	// epoch-only fence (no session id) with a moved epoch.
 	stale := newQueuedNudgeWithOptions("worker", "stale fenced reminder", "session", now, queuedNudgeOptions{
-		SessionID:         info.ID,
 		ContinuationEpoch: "1",
 	})
 	if err := enqueueQueuedNudgeWithStore(dir, beads.NudgesStore{Store: store}, stale); err != nil {
@@ -3418,12 +3420,14 @@ func TestClaimDueQueuedNudgesForTargetClaimsSameSessionStaleEpoch(t *testing.T) 
 		t.Fatalf("claimed = %#v, want stale same-session nudge", claimed)
 	}
 
+	// hq-02cr3: the same session bead with an older epoch is the same agent
+	// after a restart, so the fence lets it through instead of killing it.
 	deliverable, rejected := splitQueuedNudgesForTarget(target, claimed)
-	if len(deliverable) != 0 {
-		t.Fatalf("deliverable = %#v, want none", deliverable)
+	if len(deliverable) != 1 || deliverable[0].ID != item.ID {
+		t.Fatalf("deliverable = %#v, want the same-session stale-epoch nudge", deliverable)
 	}
-	if len(rejected) != 1 || rejected[0].ID != item.ID {
-		t.Fatalf("rejected = %#v, want stale same-session nudge rejected", rejected)
+	if len(rejected) != 0 {
+		t.Fatalf("rejected = %#v, want none", rejected)
 	}
 }
 
@@ -5161,4 +5165,176 @@ func TestResolveNudgePollInterval(t *testing.T) {
 			t.Fatalf("resolveNudgePollInterval = %v, want default %v", got, defaultNudgePollInterval)
 		}
 	})
+}
+
+func TestQueuedNudgeMatchesTargetFence(t *testing.T) {
+	target := nudgeTarget{sessionID: "gc-1", continuationEpoch: "2"}
+	tests := []struct {
+		name   string
+		target nudgeTarget
+		item   queuedNudge
+		want   bool
+	}{
+		// hq-02cr3: same session bead, epoch moved on = same agent after a restart.
+		{"same session, older epoch passes", target, queuedNudge{SessionID: "gc-1", ContinuationEpoch: "1"}, true},
+		{"same session, same epoch passes", target, queuedNudge{SessionID: "gc-1", ContinuationEpoch: "2"}, true},
+		{"same session, no epoch passes", target, queuedNudge{SessionID: "gc-1"}, true},
+		{"other session is rejected", target, queuedNudge{SessionID: "gc-2", ContinuationEpoch: "2"}, false},
+		{"row names a session but target has none", nudgeTarget{}, queuedNudge{SessionID: "gc-1", ContinuationEpoch: "2"}, false},
+		// Empty-field behavior is unchanged.
+		{"no session, epoch differs is rejected", target, queuedNudge{ContinuationEpoch: "1"}, false},
+		{"no session, epoch matches passes", target, queuedNudge{ContinuationEpoch: "2"}, true},
+		{"no session, no epoch passes", target, queuedNudge{}, true},
+		{"no session, no epoch, empty target passes", nudgeTarget{}, queuedNudge{}, true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := queuedNudgeMatchesTargetFence(tc.target, tc.item); got != tc.want {
+				t.Fatalf("queuedNudgeMatchesTargetFence(%+v, %+v) = %v, want %v", tc.target, tc.item, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestDeadLetterReplacedSessionNudges(t *testing.T) {
+	now := time.Now().UTC()
+	front := nudgeFrontDoor(beads.NudgesStore{Store: beads.NewMemStore()})
+	state := &nudgeQueueState{
+		Pending: []queuedNudge{
+			{ID: "n-replaced", Agent: "worker", SessionID: "gc-old", CreatedAt: now, DeliverAfter: now, ExpiresAt: now.Add(time.Hour)},
+			{ID: "n-live", Agent: "worker", SessionID: "gc-live", CreatedAt: now, DeliverAfter: now, ExpiresAt: now.Add(time.Hour)},
+			{ID: "n-unfenced", Agent: "worker", CreatedAt: now, DeliverAfter: now, ExpiresAt: now.Add(time.Hour)},
+		},
+	}
+
+	if err := deadLetterReplacedSessionNudges(state, front, map[string]bool{"gc-old": true}, now, noMaintenanceDeadline()); err != nil {
+		t.Fatalf("deadLetterReplacedSessionNudges: %v", err)
+	}
+	if got := queuedNudgeIDs(state.Pending); !sameQueuedNudgeIDSet(got, []string{"n-live", "n-unfenced"}) {
+		t.Fatalf("pending = %#v, want n-live and n-unfenced", got)
+	}
+	if len(state.Dead) != 1 || state.Dead[0].ID != "n-replaced" {
+		t.Fatalf("dead = %#v, want only n-replaced", state.Dead)
+	}
+	if state.Dead[0].LastError != nudgeSessionReplacedReason {
+		t.Fatalf("dead[0].LastError = %q, want %q", state.Dead[0].LastError, nudgeSessionReplacedReason)
+	}
+	if state.Dead[0].DeadAt.IsZero() {
+		t.Fatal("dead[0].DeadAt is zero, want stamped")
+	}
+	if state.Dead[0].Attempts != 0 {
+		t.Fatalf("dead[0].Attempts = %d, want 0 (never attempted)", state.Dead[0].Attempts)
+	}
+
+	// An empty verdict set is a no-op and never touches the queue.
+	before := len(state.Pending)
+	if err := deadLetterReplacedSessionNudges(state, front, nil, now, noMaintenanceDeadline()); err != nil {
+		t.Fatalf("deadLetterReplacedSessionNudges(nil): %v", err)
+	}
+	if len(state.Pending) != before || len(state.Dead) != 1 {
+		t.Fatalf("pending/dead = %d/%d after empty verdict, want %d/1", len(state.Pending), len(state.Dead), before)
+	}
+}
+
+func TestRunNudgeQueueMaintenanceSweepDeadLettersRowsForClosedSession(t *testing.T) {
+	t.Setenv("GC_BEADS", "file")
+	dir := t.TempDir()
+	store := openNudgeBeadStore(dir)
+	if store.Store == nil {
+		t.Fatal("openNudgeBeadStore returned nil")
+	}
+	newSessionBead := func(name string) beads.Bead {
+		created, err := store.Create(beads.Bead{
+			Title:  "Session: " + name,
+			Type:   session.BeadType,
+			Status: "open",
+			Labels: []string{session.LabelSession},
+			Metadata: map[string]string{
+				"session_name": name,
+				"agent_name":   "worker",
+				"template":     "worker",
+			},
+		})
+		if err != nil {
+			t.Fatalf("store.Create session bead %s: %v", name, err)
+		}
+		return created
+	}
+	replaced := newSessionBead("worker-old")
+	live := newSessionBead("worker-live")
+	if err := store.Close(replaced.ID); err != nil {
+		t.Fatalf("store.Close(%s): %v", replaced.ID, err)
+	}
+
+	now := time.Now().Add(-time.Minute)
+	rows := []queuedNudge{
+		newQueuedNudgeWithOptions("worker", "for the replaced session", "session", now, queuedNudgeOptions{ID: "n-replaced", SessionID: replaced.ID}),
+		newQueuedNudgeWithOptions("worker", "for the live session", "session", now, queuedNudgeOptions{ID: "n-live", SessionID: live.ID}),
+		newQueuedNudgeWithOptions("worker", "for a session bead that does not exist", "session", now, queuedNudgeOptions{ID: "n-missing", SessionID: "gc-nope"}),
+		newQueuedNudgeWithOptions("worker", "unfenced", "session", now, queuedNudgeOptions{ID: "n-unfenced"}),
+	}
+	for _, row := range rows {
+		if err := enqueueQueuedNudgeWithStore(dir, store, row); err != nil {
+			t.Fatalf("enqueueQueuedNudgeWithStore(%s): %v", row.ID, err)
+		}
+	}
+
+	if err := runNudgeQueueMaintenanceSweep(dir, store.Store, time.Now()); err != nil {
+		t.Fatalf("runNudgeQueueMaintenanceSweep: %v", err)
+	}
+
+	// Read the raw persisted state so no listing helper's own sweep masks the result.
+	state, err := nudgequeue.LoadState(dir)
+	if err != nil {
+		t.Fatalf("LoadState: %v", err)
+	}
+	if got := queuedNudgeIDs(state.Pending); !sameQueuedNudgeIDSet(got, []string{"n-live", "n-missing", "n-unfenced"}) {
+		t.Fatalf("pending = %#v, want n-live, n-missing and n-unfenced (only a CLOSED session bead dead-letters its row)", got)
+	}
+	if len(state.Dead) != 1 || state.Dead[0].ID != "n-replaced" {
+		t.Fatalf("dead = %#v, want only n-replaced", state.Dead)
+	}
+	if state.Dead[0].LastError != nudgeSessionReplacedReason {
+		t.Fatalf("dead[0].LastError = %q, want %q", state.Dead[0].LastError, nudgeSessionReplacedReason)
+	}
+	// The backing nudge bead was terminalized with the same reason.
+	shadow, ok, err := nudgeFrontDoor(store).FindIncludingTerminal("n-replaced")
+	if err != nil || !ok {
+		t.Fatalf("FindIncludingTerminal(n-replaced) = ok=%v err=%v", ok, err)
+	}
+	if shadow.TerminalReason != nudgeSessionReplacedReason {
+		t.Fatalf("shadow.TerminalReason = %q, want %q", shadow.TerminalReason, nudgeSessionReplacedReason)
+	}
+
+	// A nil session store skips the pass and leaves the queue alone.
+	if err := runNudgeQueueMaintenanceSweep(dir, nil, time.Now()); err != nil {
+		t.Fatalf("runNudgeQueueMaintenanceSweep(nil sessStore): %v", err)
+	}
+	state, err = nudgequeue.LoadState(dir)
+	if err != nil {
+		t.Fatalf("LoadState: %v", err)
+	}
+	if len(state.Pending) != 3 || len(state.Dead) != 1 {
+		t.Fatalf("pending/dead = %d/%d after nil-store sweep, want 3/1", len(state.Pending), len(state.Dead))
+	}
+}
+
+// sameQueuedNudgeIDSet reports whether got holds exactly the ids in want, in
+// any order. Queue order among rows with equal timestamps is the sorter's
+// business, not the sweep's.
+func sameQueuedNudgeIDSet(got, want []string) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	seen := make(map[string]int, len(got))
+	for _, id := range got {
+		seen[id]++
+	}
+	for _, id := range want {
+		if seen[id] == 0 {
+			return false
+		}
+		seen[id]--
+	}
+	return true
 }
