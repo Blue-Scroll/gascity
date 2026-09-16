@@ -87,9 +87,8 @@ const (
 	// peak cadence; an order whose last run is older than the window misses
 	// the index and pays one LIMIT-1 LastRun fallback (itself limit-pushed
 	// now), after which cachedLastRun remembers it across ticks and rebuilds.
-	orderTrackingHistoryIndexLimit   = 256
-	defaultMaxOrderDispatchesPerTick = 4
-	orderTrackingSweepCloseBudget    = 4
+	orderTrackingHistoryIndexLimit = 256
+	orderTrackingSweepCloseBudget  = 4
 
 	// orderTrackingRetentionWatchdogInterval is the minimum time between
 	// controller-driven closed-bead retention sweeps. 15 minutes balances
@@ -536,8 +535,9 @@ var orderConditionCheckConcurrency = 8
 //
 // It exists so the condition checks can run between the two halves: resolution
 // and the open-tracking gate are index-served and serial, the checks are
-// subprocesses and concurrent, and the fire loop is serial again because the
-// dispatch budget's rotation is order-dependent.
+// subprocesses and concurrent, and the fire loop picks serially again because the
+// dispatch budget's rotation is order-dependent. The picked orders' tracking
+// beads are then written concurrently (writeTrackingAndLaunch).
 type orderDispatchCandidate struct {
 	idx           int
 	order         orders.Order
@@ -707,7 +707,7 @@ func (m *memoryOrderDispatcher) dispatch(ctx context.Context, cityPath string, n
 		// store times the gate out and skips the order every cycle (#2893
 		// dispatch starvation -> stale cooldown cache -> fail-closed health).
 		// These orders are still single-flight-bounded by their own cooldown
-		// interval plus the synchronous tracking bead created below.
+		// interval plus the tracking bead this tick writes before it returns.
 		if !a.NoWorkGate {
 			if m.gateBackoffActive(scoped, now) {
 				continue
@@ -746,14 +746,22 @@ func (m *memoryOrderDispatcher) dispatch(ctx context.Context, cityPath string, n
 	m.prefetchConditionResults(candidates, now)
 
 	// Phase 2: the fire loop, in the same rotation order, over the same
-	// per-order state phase 1 resolved.
+	// per-order state phase 1 resolved. It only PICKS the orders to fire.
+	// Phase 3 (writeTrackingAndLaunch) writes their tracking beads at once.
+	fires := make([]*orderDispatchCandidate, 0, len(candidates))
+	// picked holds the scoped names already in fires. Phase 3 writes
+	// concurrently, so the same order picked twice would get two tracking
+	// beads and two runs in one tick. The gates cannot catch that: they read
+	// the store as it was before this tick wrote anything.
+	picked := make(map[string]bool, len(candidates))
 	for _, cand := range candidates {
 		idx := cand.idx
 		a := cand.order
-		target := cand.target
-		store := cand.store
 		storesForGate, storeKeysForGate := cand.gateStores, cand.gateStoreKeys
 		scoped := cand.scoped
+		if picked[scoped] {
+			continue
+		}
 
 		baseLastRunFn := trackingIndex.lastRunFunc(storesForGate, storeKeysForGate, orders.LastRunAcross(orderFrontDoorsForStores(storesForGate)))
 		var lastRunErr error
@@ -780,26 +788,13 @@ func (m *memoryOrderDispatcher) dispatch(ctx context.Context, cityPath string, n
 			}
 		}
 		triggerOpts := cand.triggerOpts
-		if err := cand.triggerErr; err != nil {
-			redacted := redactOrderEnvError(err, os.Environ())
-			msg := fmt.Sprintf("building trigger env: %s", redacted)
-			logDispatchError(m.stderr, "gc: order dispatch: building trigger env for %s: %s", a.ScopedName(), redacted)
-			// Leave this open so the existing open-work gate suppresses repeat
-			// ticks until the normal stale tracking sweep gives the order another try.
-			trackingBead, createErr := m.orderFrontDoorFor(store).CreateRun(scoped, orders.RunOpts{Outcome: orders.RunOutcomeTriggerEnvFailed})
-			if createErr != nil {
-				logDispatchError(m.stderr, "gc: order dispatch: creating trigger env failure tracking bead for %s: %v", scoped, createErr)
-			} else {
-				m.rememberLastRun(scoped, storeKeysForGate, trackingBead.CreatedAt)
-			}
-			m.rec.Record(events.Event{
-				Type:    events.OrderFailed,
-				Actor:   "controller",
-				Subject: a.ScopedName(),
-				Message: msg,
-			})
+		if cand.triggerErr != nil {
+			// The failure is recorded by writeTrackingAndLaunch, which writes
+			// its tracking bead alongside the tick's other fires.
+			picked[scoped] = true
+			fires = append(fires, cand)
 			if spendDispatchBudget(idx) {
-				return
+				break
 			}
 			continue
 		}
@@ -897,27 +892,119 @@ func (m *memoryOrderDispatcher) dispatch(ctx context.Context, cityPath string, n
 			m.clearOpenWorkSuppression(scoped)
 		}
 
-		// Create the tracking bead (which suppresses re-fire on the next tick)
-		// and launch the shared dispatch core. The webhook receiver fires the
-		// same launchResolvedDispatch → dispatchOne path through the exported
-		// seam, so a tick dispatch and a webhook dispatch run the identical core,
-		// not two implementations. inFlight (this tick's WaitGroup) is reserved
-		// before the launch and released via onDone; on a create failure nothing
-		// launched, so it is released immediately to balance the reservation.
-		//
-		// Auto-triggered orders carry no args channel: vars/execEnv are nil.
-		inFlight.Add(1)
-		trackingBead, err := m.launchResolvedDispatch(ctx, store, target, a, cityPath, nil, nil, inFlight.Done)
-		if err != nil {
-			inFlight.Done()
-			logDispatchError(m.stderr, "gc: order dispatch: creating tracking bead for %s: %v", scoped, err)
-			continue
-		}
-		m.rememberLastRun(scoped, storeKeysForGate, trackingBead.CreatedAt)
+		// Picked. The tracking bead is written below, with the other picks.
+		picked[scoped] = true
+		fires = append(fires, cand)
 		if spendDispatchBudget(idx) {
-			return
+			break
 		}
 	}
+
+	m.writeTrackingAndLaunch(ctx, cityPath, fires, &inFlight)
+}
+
+// defaultMaxOrderDispatchesPerTick is the dispatch budget when city.toml sets
+// none. It equals orderTrackingWriteConcurrency on purpose: a tick at the
+// default budget writes all its tracking beads in ONE store write latency.
+//
+// It was 4 while the writes ran one after another. At 4, a city with 50
+// orders gave each order one turn every 12.5 ticks, so a 3 minute order ran
+// every 25 to 45 minutes (hq-xe7ohr). 16 covers every order due in a normal
+// tick and still spreads a cold start's backlog over a few ticks.
+const defaultMaxOrderDispatchesPerTick = 16
+
+// orderTrackingWriteConcurrency bounds how many tracking beads one tick
+// writes at once. A budget above it still works; that tick just pays more
+// than one write latency.
+//
+// It is a var so a test can pin it to 1 and prove the concurrent path and
+// the serial path agree.
+var orderTrackingWriteConcurrency = defaultMaxOrderDispatchesPerTick
+
+// writeTrackingAndLaunch writes the tracking bead of every order the fire
+// loop picked, concurrently, and launches each order's dispatch as soon as
+// its own bead exists.
+//
+// Why concurrent: each write is a store round trip, 10 to 60 seconds on a
+// loaded Dolt server. Written one after another inside the tick, they made
+// the tick grow with the dispatch budget, so raising the budget fired no
+// more orders per minute (hq-xe7ohr, measured 2026-09-14).
+//
+// What keeps it safe:
+//
+//   - It returns only after EVERY write has finished. The next tick's
+//     open-tracking gate reads the store, so it always sees this tick's
+//     beads. An order can never fire again before its bead exists.
+//   - The fire loop picks each scoped order at most once per tick, so two
+//     writes here never race for the same order.
+//   - A dispatch launches only after its own bead is written, the same
+//     order launchResolvedDispatch has always kept. addInflight therefore
+//     still runs before dispatch returns, which is what drain relies on.
+//   - inFlight (the tick's store-close barrier) is reserved before a write
+//     starts and released when the dispatch goroutine ends, or at once when
+//     the write fails and nothing launched.
+//
+// A failed write skips that order for this tick, exactly as the serial loop
+// did. Its budget slot is still spent, because the fire loop had to decide
+// the whole wave before any write finished.
+func (m *memoryOrderDispatcher) writeTrackingAndLaunch(ctx context.Context, cityPath string, fires []*orderDispatchCandidate, inFlight *sync.WaitGroup) {
+	if len(fires) == 0 {
+		return
+	}
+	limit := orderTrackingWriteConcurrency
+	if limit < 1 {
+		limit = 1
+	}
+	sem := make(chan struct{}, limit)
+	var writes sync.WaitGroup
+	for _, cand := range fires {
+		writes.Add(1)
+		inFlight.Add(1)
+		go func(cand *orderDispatchCandidate) {
+			defer writes.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			if cand.triggerErr != nil {
+				m.recordTriggerEnvFailure(cand)
+				inFlight.Done()
+				return
+			}
+			// The webhook receiver fires the same launchResolvedDispatch →
+			// dispatchOne core through the exported seam, so a tick dispatch and
+			// a webhook dispatch are one implementation, not two.
+			//
+			// Auto-triggered orders carry no args channel: vars/execEnv are nil.
+			trackingBead, err := m.launchResolvedDispatch(ctx, cand.store, cand.target, cand.order, cityPath, nil, nil, inFlight.Done)
+			if err != nil {
+				inFlight.Done()
+				logDispatchError(m.stderr, "gc: order dispatch: creating tracking bead for %s: %v", cand.scoped, err)
+				return
+			}
+			m.rememberLastRun(cand.scoped, cand.gateStoreKeys, trackingBead.CreatedAt)
+		}(cand)
+	}
+	writes.Wait()
+}
+
+// recordTriggerEnvFailure writes the tracking bead and the order.failed event
+// for an order whose trigger env could not be built.
+func (m *memoryOrderDispatcher) recordTriggerEnvFailure(cand *orderDispatchCandidate) {
+	redacted := redactOrderEnvError(cand.triggerErr, os.Environ())
+	logDispatchError(m.stderr, "gc: order dispatch: building trigger env for %s: %s", cand.scoped, redacted)
+	// Leave this open so the existing open-work gate suppresses repeat
+	// ticks until the normal stale tracking sweep gives the order another try.
+	trackingBead, err := m.orderFrontDoorFor(cand.store).CreateRun(cand.scoped, orders.RunOpts{Outcome: orders.RunOutcomeTriggerEnvFailed})
+	if err != nil {
+		logDispatchError(m.stderr, "gc: order dispatch: creating trigger env failure tracking bead for %s: %v", cand.scoped, err)
+	} else {
+		m.rememberLastRun(cand.scoped, cand.gateStoreKeys, trackingBead.CreatedAt)
+	}
+	m.rec.Record(events.Event{
+		Type:    events.OrderFailed,
+		Actor:   "controller",
+		Subject: cand.scoped,
+		Message: fmt.Sprintf("building trigger env: %s", redacted),
+	})
 }
 
 // launchDispatchOne spawns dispatchOne with a context that cancels when

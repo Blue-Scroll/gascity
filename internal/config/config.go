@@ -2094,7 +2094,7 @@ type OrdersConfig struct {
 	// emit max_dispatches_per_tick = 0 into every marshaled city.toml.
 
 	// MaxDispatchesPerTick caps how many orders the supervisor dispatches
-	// per tick. Unset keeps the built-in default of 4; set to 1 to drain
+	// per tick. Unset keeps the built-in default of 16; set to 1 to drain
 	// overdue cooldown orders one-per-tick at cold start instead of firing
 	// several concurrent goroutines at once.
 	MaxDispatchesPerTick *int `toml:"max_dispatches_per_tick,omitempty"`
