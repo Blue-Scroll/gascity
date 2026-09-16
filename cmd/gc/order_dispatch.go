@@ -1086,7 +1086,9 @@ func (m *memoryOrderDispatcher) cancel() {
 }
 
 // addInflight increments the in-flight count and lazily creates the done
-// signal. Called synchronously from dispatch on the tick goroutine.
+// signal. Called from writeTrackingAndLaunch's write goroutines, which
+// dispatch waits on before it returns, so the count is always raised
+// before drain can look at it.
 func (m *memoryOrderDispatcher) addInflight() {
 	m.inflightMu.Lock()
 	m.inflightN++
