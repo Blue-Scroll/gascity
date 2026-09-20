@@ -357,3 +357,108 @@ func ValidateAncestorWorktreesNotStale(path string) error {
 		cur = parent
 	}
 }
+
+// ValidateNotNestedInSessionWorktree returns an error when path would be
+// created INSIDE another agent's checkout under worktreesRoot. It is the other
+// half of the spawn-time guard: ValidateAncestorWorktreesNotStale catches an
+// ancestor whose worktree pointer is BROKEN, and this catches an ancestor that
+// is a perfectly healthy checkout, which the stale walk stops on and allows.
+//
+// WHY A HEALTHY ANCESTOR IS ALSO WRONG. "git worktree add" at a path inside an
+// existing worktree registers the child through its parent, and from then on
+// both paths answer as one checkout. Two sessions handed those two paths are
+// two sessions in one tree: they fight over HEAD, and a setup step that resets
+// the tree onto its own branch deletes the other session's uncommitted work.
+// That happened twice in fifteen minutes on 2026-08-23 and took the only copy
+// of two beads' work with it (vn-rm9u8g, from vn-equwvo).
+//
+// THE PER-BEAD LAYOUT IS EXEMPT, AND MUST STAY EXEMPT. A "worktrees" directory
+// inside an agent home is the sanctioned place for per-bead worktrees: the core
+// polecat formula creates "$(pwd)/worktrees/$WORK_BEAD_ID" itself, and
+// reapClosedBeadWorktrees collects them there. So a target whose path reaches
+// its checkout ancestor through a directory named "worktrees" is allowed. Only
+// OTHER nesting is refused, which is the shape that came from one leaf name
+// resolving into two sessions.
+//
+// THE BOUND IS DELIBERATE. The walk only inspects ancestors strictly under
+// worktreesRoot, the directory the city hands out session worktrees from. Above
+// that line a checkout is normal and expected: the city checkout itself holds
+// .gc/worktrees, and a city that is ITSELF a git worktree would otherwise make
+// every spawn in town illegal.
+//
+// The spawn target itself is not inspected. A session worktree IS a checkout;
+// that is the point. Only its ancestors are.
+//
+// Both a ".git" file (a linked worktree) and a real ".git" directory (a whole
+// repository someone cloned into a slot) are refused, because a worktree added
+// underneath either one lands inside a tree that already belongs to somebody.
+func ValidateNotNestedInSessionWorktree(path, worktreesRoot string) error {
+	if strings.TrimSpace(path) == "" || strings.TrimSpace(worktreesRoot) == "" {
+		return nil
+	}
+	root := filepath.Clean(worktreesRoot)
+	cur := filepath.Dir(filepath.Clean(path))
+	// True once the walk has passed a "worktrees" directory on its way up, so
+	// a checkout found above it is the per-bead layout described above.
+	viaPerBeadDir := false
+	for pathIsUnder(cur, root) {
+		gitPath := filepath.Join(cur, ".git")
+		info, err := os.Lstat(gitPath)
+		if err == nil && (info.Mode().IsRegular() || info.IsDir()) {
+			if viaPerBeadDir {
+				return nil
+			}
+			shape := "that directory has a .git file, so it is a git worktree"
+			if info.IsDir() {
+				shape = "that directory has a real .git directory, so it is a whole repository"
+			}
+			return fmt.Errorf(
+				"worktree spawn rejected: %q is inside the checkout at %q (%s). "+
+					"A worktree created inside another worktree resolves through its parent, so both paths become one tree and two sessions overwrite each other. "+
+					"Move this agent's work_dir out of %q, or remove that stray checkout. "+
+					"(A per-bead worktree under %q/worktrees/<bead-id> is the sanctioned exception and is not affected.)",
+				path, cur, shape, cur, cur)
+		}
+		if filepath.Base(cur) == perBeadWorktreesDir {
+			viaPerBeadDir = true
+		}
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			return nil
+		}
+		cur = parent
+	}
+	return nil
+}
+
+// perBeadWorktreesDir is the directory name an agent puts its per-bead
+// worktrees in, inside its own home. The core polecat formula writes
+// "$(pwd)/worktrees/$WORK_BEAD_ID" and reapClosedBeadWorktrees reads it back.
+const perBeadWorktreesDir = "worktrees"
+
+// pathIsUnder reports whether path sits strictly below root. Equal paths and
+// anything outside root return false, so a walk bounded by it never leaves the
+// directory root names.
+func pathIsUnder(path, root string) bool {
+	rel, err := filepath.Rel(filepath.Clean(root), filepath.Clean(path))
+	if err != nil {
+		return false
+	}
+	if rel == "." || rel == ".." {
+		return false
+	}
+	return !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
+
+// ValidateSpawnTarget runs every check that must pass before a session working
+// directory is created. Call this, never one half on its own: a spawn path that
+// wires only the stale-pointer walk is the hole this guard already fell into
+// once, because a healthy nested ancestor sails straight through that walk.
+//
+// worktreesRoot bounds the nesting half; pass WorktreesRoot(cityPath).
+func ValidateSpawnTarget(path, worktreesRoot string) error {
+	if err := ValidateAncestorWorktreesNotStale(path); err != nil {
+		return err
+	}
+	return ValidateNotNestedInSessionWorktree(path, worktreesRoot)
+}
