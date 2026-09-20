@@ -49,3 +49,9 @@ jobs:
         run: go test ./internal/orders/ -run 'TestParseScope|TestValidateRejectsUnknownScope|TestValidateAcceptsCityAndRigScope|TestParseEnv' -count=1 -v
       - name: Unit tests — scale from zero (#2819)
         run: go test ./cmd/gc/ -run 'TestBuildDesiredState_ScaleFromZero' -count=1 -v
+      - name: Unit tests — spawn-storm detector counts resets, not runs (hq-2yztr2)
+        run: |
+          # The detector is a shell script and needs jq. Say so here rather
+          # than letting every row fail for a reason the log does not name.
+          jq --version
+          go test ./examples/gastown/ -run 'TestSpawnStorm' -count=1 -v

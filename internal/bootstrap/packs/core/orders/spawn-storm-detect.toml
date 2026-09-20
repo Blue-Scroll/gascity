@@ -1,10 +1,20 @@
-# Detect beads stuck in a recovery loop (crash loop indicator).
+# Detect beads stuck in a claim-and-release loop (a crash loop indicator).
 #
-# When the same bead gets reset to pool multiple times, a polecat is
-# likely crash-looping on that specific work. The script counts
-# bead.updated events where status transitions to open with assignee
-# cleared (the recovery signature) and escalates when the count for
-# any single bead exceeds the threshold.
+# When the same bead keeps being claimed by a seat and pushed back to the
+# pool, something is crash looping on that piece of work. The script walks
+# bead state changes from the city event stream and counts one reset per move
+# from held (in_progress, or an assignee is set) to free (open with no
+# assignee). It mails the mayor once per NEW reset past the threshold.
+#
+# It does NOT count its own runs. That was the old bug: a bead that simply
+# waited in a pool line collected one count and one mail per run (hq-2yztr2).
+#
+# The script asks the event stream for SPAWN_STORM_WINDOW (default 1h), which
+# must stay comfortably longer than the interval below, because a reset
+# outside that window is never seen. Re-reading the same event is free: the
+# ledger remembers the highest event sequence it counted.
+#
+# Prove the script still works: spawn-storm-detect.sh --self-test
 [order]
 description = "Detect beads repeatedly bouncing back to pool (spawn storm)"
 trigger = "cooldown"
