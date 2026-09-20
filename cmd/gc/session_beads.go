@@ -2781,6 +2781,10 @@ func closeFailedCreateBead(sessFront *session.Store, id string, now time.Time, s
 // is responsible for restarting completed-but-dead session beads so the
 // original assignee resumes its work.
 //
+// A bead whose async start is still in flight in this process is never reaped
+// either, whatever its age: the time windows below only ever guess that a start
+// has died, and starts is the tracker that knows (hq-dx354v).
+//
 // This prevents infinite retry loops for stuck-creating sessions while
 // preserving claim continuity across tmux death+restart for active ones.
 //
@@ -2789,6 +2793,7 @@ func reapStaleSessionBeads(
 	store beads.Store,
 	sp runtime.Provider,
 	dt *drainTracker,
+	starts *asyncStartTracker,
 	clk clock.Clock,
 	stderr io.Writer,
 ) int {
@@ -2833,6 +2838,19 @@ func reapStaleSessionBeads(
 		// managing their lifecycle and the tmux session may have just died
 		// as part of the drain sequence.
 		if dt != nil && dt.get(info.ID) != nil {
+			continue
+		}
+		// Don't reap a bead whose own start goroutine is still running in this
+		// process. Every grace window below is a guess at "this start is never
+		// coming"; the tracker KNOWS. On a slow disk a real provider start
+		// outruns the guess, and closing the bead mid-start made the start
+		// commit throw the finished session away as stale_async_start and then
+		// STOP the live session. No start succeeded for 20 minutes on
+		// 2026-09-20, and six claimed work beads were freed by the closes
+		// (hq-dx354v). The mark dies with the goroutine, which provider.Start
+		// bounds by startup_timeout, so this cannot hold a bead open forever
+		// and the gc-5tyf5 phantom reap still fires once the start ends.
+		if starts.startInFlight(info.ID) {
 			continue
 		}
 		// Configured named-session beads are controller-owned identities.
