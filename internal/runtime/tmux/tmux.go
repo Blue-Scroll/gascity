@@ -1855,8 +1855,19 @@ func nextPasteBufferName() string {
 	return fmt.Sprintf("gc-nudge-%d-%d", os.Getpid(), seq)
 }
 
+// sendLiteralText puts text into target's input. Only one short line is
+// typed as keys. Anything with a line break, or too long for one send-keys,
+// goes in as ONE bracketed paste.
+//
+// Why a line break forces the paste (hq-q1cpc): typed keys arrive as a fast
+// stream with no paste markers, so claude's input box has to guess where a
+// paste starts, and it sometimes guesses wrong and throws away the front of
+// the message. Measured 2026-09-21 on the mayor and deacon transcripts: 233 of
+// 1454 typed multi-line nudges arrived cut, some down to the last line
+// "</system-reminder>", while 0 of 150 bracketed pastes did. A cut message
+// still submits, so neither side sees an error.
 func (t *Tmux) sendLiteralText(target, text string) error {
-	if len(text) > maxSendKeysLiteralLen {
+	if len(text) > maxSendKeysLiteralLen || strings.ContainsAny(text, "\r\n") {
 		return t.pasteLiteralText(target, text)
 	}
 	_, err := t.run("send-keys", "-t", target, "-l", text)
@@ -2101,7 +2112,8 @@ func (t *Tmux) sendNudgeSubmitSequence(target string, keys []string) error {
 
 // NudgeSession sends a message to a Claude Code session reliably.
 // This is the canonical way to send messages to Claude sessions.
-// Uses: literal mode + 500ms debounce + separate Enter.
+// Uses: literal text (one bracketed paste when it has a line break, see
+// sendLiteralText) + 500ms debounce + separate Enter.
 // After sending, triggers SIGWINCH to wake Claude in detached sessions.
 // Verification is the Witness's job (AI), not this function.
 //
