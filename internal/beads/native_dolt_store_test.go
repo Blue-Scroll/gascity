@@ -24,6 +24,7 @@ func TestNativeDoltStoreCreateDelegatesToUpstreamStorage(t *testing.T) {
 	priority := 1
 	var captured *beadslib.Issue
 	var capturedActor string
+	var capturedDeps []*beadslib.Dependency
 	storage := &nativeDoltStorageSpy{
 		getIssue: func(_ context.Context, id string) (*beadslib.Issue, error) {
 			return &beadslib.Issue{ID: id, Status: beadslib.StatusOpen, IssueType: beadslib.TypeTask, Priority: 2}, nil
@@ -34,6 +35,11 @@ func TestNativeDoltStoreCreateDelegatesToUpstreamStorage(t *testing.T) {
 			issue.ID = "gc-native"
 			issue.CreatedAt = createdAt
 			issue.UpdatedAt = createdAt
+			return nil
+		},
+		addDependency: func(_ context.Context, dep *beadslib.Dependency, _ string) error {
+			depCopy := *dep
+			capturedDeps = append(capturedDeps, &depCopy)
 			return nil
 		},
 	}
@@ -64,8 +70,16 @@ func TestNativeDoltStoreCreateDelegatesToUpstreamStorage(t *testing.T) {
 	if captured.IssueType != beadslib.TypeTask {
 		t.Fatalf("upstream issue type = %q, want task", captured.IssueType)
 	}
-	if len(captured.Dependencies) != 1 || captured.Dependencies[0].DependsOnID != "ga-parent" || captured.Dependencies[0].Type != beadslib.DepBlocks {
-		t.Fatalf("upstream dependencies = %#v, want blocks:ga-parent", captured.Dependencies)
+	// The edge is written by its own AddDependency call, never handed to
+	// CreateIssue inline. The library's single-issue create persists labels
+	// and comments and silently ignores Issue.Dependencies (only its BATCH
+	// path reads that field), so an inline list would look like a write and
+	// be none.
+	if len(captured.Dependencies) != 0 {
+		t.Fatalf("CreateIssue was handed inline dependencies %#v, which the single-issue path drops on the floor", captured.Dependencies)
+	}
+	if len(capturedDeps) != 1 || capturedDeps[0].IssueID != "gc-native" || capturedDeps[0].DependsOnID != "ga-parent" || capturedDeps[0].Type != beadslib.DepBlocks {
+		t.Fatalf("upstream dependency writes = %#v, want one blocks:ga-parent for gc-native", capturedDeps)
 	}
 	if !json.Valid(captured.Metadata) {
 		t.Fatalf("upstream metadata is invalid JSON: %q", captured.Metadata)
@@ -2006,7 +2020,11 @@ func TestNativeDoltStoreUpdateRollsBackScalarOnValidReparentFailure(t *testing.T
 	}
 }
 
-func TestNativeDoltStoreCreateDependencyFailureDeletesPartialIssue(t *testing.T) {
+// A create whose edge write fails leaves no bead behind. It used to get there
+// by deleting the bead it had already committed; now the transaction rolls
+// back and there is nothing to delete. The outcome below is what callers care
+// about, and it holds either way.
+func TestNativeDoltStoreCreateDependencyFailureLeavesNoBead(t *testing.T) {
 	failingAdd := errors.New("add dependency failed")
 	storage := &nativeDoltFailingDependencyStorage{
 		nativeDoltMemStorage: newNativeDoltMemStorage(),
@@ -2038,7 +2056,11 @@ func TestNativeDoltStoreCreateDependencyFailureDeletesPartialIssue(t *testing.T)
 	}
 }
 
-func TestNativeDoltStoreCreateDependencyTimeoutCleansUpWithFreshContext(t *testing.T) {
+// The same holds when the edge write runs out of time rather than failing.
+// The old cleanup needed a fresh context of its own, because the operation
+// context it would have used was the expired one. A rollback needs no such
+// trick.
+func TestNativeDoltStoreCreateDependencyTimeoutLeavesNoBead(t *testing.T) {
 	oldTimeout := bdCommandTimeout
 	bdCommandTimeout = time.Millisecond
 	t.Cleanup(func() {

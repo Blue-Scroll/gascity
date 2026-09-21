@@ -81,10 +81,6 @@ func nativeGraphApplyDeadline(plan *GraphApplyPlan) time.Duration {
 	return d + time.Duration(len(plan.Nodes)+len(plan.Edges))*perItem
 }
 
-func nativeDoltCleanupContext() (context.Context, context.CancelFunc) {
-	return context.WithTimeout(context.Background(), bdCommandTimeout)
-}
-
 // ProcessEnvSnapshotExcludingNativeDoltOpen returns a process environment
 // snapshot after any in-flight native Dolt open has restored scoped BEADS_* env.
 func ProcessEnvSnapshotExcludingNativeDoltOpen() []string {
@@ -855,37 +851,45 @@ func (s *NativeDoltStore) SupportsEphemeralGraphApply() bool {
 }
 
 // Create persists a new bead through the upstream beads storage layer.
+//
+// The bead row and every one of its dependency rows, the parent-child edge
+// included, are written in ONE transaction. They used to be two separate
+// writes with a compensating delete if the second one returned an error. A
+// returned error was never the problem: when the PROCESS DIED between the two
+// writes nothing compensated, and the bead row survived with no parent edge. A
+// step bead like that is invisible to everything that reaches a step through
+// its molecule, so it can never be run and never be swept, and it just piles
+// up. 72 of them existed on 2026-09-20 (vn-g3yqvvk). Nothing can compensate
+// for a dead process, so the fix is that there is no longer a window to die
+// in.
 func (s *NativeDoltStore) Create(b Bead) (Bead, error) {
-	issue, err := nativeIssueFromBead(b)
-	if err != nil {
-		return Bead{}, err
-	}
 	storage, release, err := s.acquireStorage()
 	if err != nil {
 		return Bead{}, err
 	}
 	defer release()
-	ctx, cancel := nativeDoltOperationContext(context.TODO())
-	defer cancel()
-	pendingDependencies := cloneNativeDependencies(issue.Dependencies)
-	if err := s.validateCreatedDependencies(ctx, storage, issue.ID, pendingDependencies); err != nil {
-		return Bead{}, err
+	commitMsg := "gc: create bead"
+	if id := strings.TrimSpace(b.ID); id != "" {
+		commitMsg += " " + id
 	}
-	if err := storage.CreateIssue(ctx, issue, s.actor); err != nil {
-		return Bead{}, err
-	}
-	createdDependencies, err := s.persistCreatedDependencies(ctx, storage, issue.ID, pendingDependencies)
+	var created Bead
+	// Retry a lost serialization race, for the same reason Update does. One
+	// transaction around the whole create means a conflict with a concurrent
+	// writer now fails the create outright instead of one statement, and a
+	// concurrent writer to the same bead store is normal.
+	err = retryOnNativeDoltSerializationConflict(func() error {
+		ctx, cancel := nativeDoltOperationContext(context.TODO())
+		defer cancel()
+		return storage.RunInTransaction(ctx, commitMsg, func(tx beadslib.Transaction) error {
+			var err error
+			created, err = s.applyCreateInTx(ctx, tx, b)
+			return err
+		})
+	})
 	if err != nil {
-		cleanupCtx, cleanupCancel := nativeDoltCleanupContext()
-		cleanupErr := s.compensateFailedCreate(cleanupCtx, storage, issue.ID, createdDependencies)
-		cleanupCancel()
-		if cleanupErr != nil {
-			return Bead{}, errors.Join(err, cleanupErr)
-		}
 		return Bead{}, err
 	}
-	issue.Dependencies = createdDependencies
-	return beadFromNativeIssue(issue)
+	return created, nil
 }
 
 // Get retrieves a bead by ID from the upstream beads storage layer.
@@ -1024,7 +1028,10 @@ func (s *NativeDoltStore) applyCloseInTx(ctx context.Context, tx beadslib.Transa
 }
 
 // applyCreateInTx creates a bead and its dependencies within an open
-// transaction. Unlike the standalone Create, no compensation is needed: a
+// transaction. It is the ONLY way this store creates a bead: both the
+// standalone Create (one op, one commit) and the Store.Tx path (many ops, one
+// commit) route through here, so a bead row and its edges are always written
+// together or not at all. No compensation is needed, and none is offered: a
 // mid-create failure rolls the whole transaction back.
 func (s *NativeDoltStore) applyCreateInTx(ctx context.Context, tx beadslib.Transaction, b Bead) (Bead, error) {
 	issue, err := nativeIssueFromBead(b)
@@ -1032,10 +1039,25 @@ func (s *NativeDoltStore) applyCreateInTx(ctx context.Context, tx beadslib.Trans
 		return Bead{}, err
 	}
 	deps := cloneNativeDependencies(issue.Dependencies)
+	// Check the edge targets before minting the bead, so a dependency on a
+	// bead that exists nowhere is a clean ErrNotFound rather than a dangling
+	// edge. The transaction reads its own writes, so a target created earlier
+	// in this same transaction is found.
+	if err := s.validateCreatedDependencies(ctx, tx, issue.ID, deps); err != nil {
+		return Bead{}, err
+	}
+	// The library's single-issue create persists labels and comments and
+	// ignores Issue.Dependencies; only its batch path reads that field. Clear
+	// it so nobody reads this call as writing the edges, then write each edge
+	// with the call that really does.
 	issue.Dependencies = nil
 	if err := tx.CreateIssue(ctx, issue, s.actor); err != nil {
 		return Bead{}, err
 	}
+	// CreateIssue mints the ID when the caller did not pin one, so the edges
+	// learn which bead they belong to only here. Keep the copies that carry
+	// it: they, not the originals, are what was written.
+	persistedDeps := make([]*beadslib.Dependency, 0, len(deps))
 	for _, dep := range deps {
 		if dep == nil {
 			continue
@@ -1047,8 +1069,9 @@ func (s *NativeDoltStore) applyCreateInTx(ctx context.Context, tx beadslib.Trans
 		if err := tx.AddDependency(ctx, &persisted, s.actor); err != nil {
 			return Bead{}, fmt.Errorf("persisting native create dependency %q -> %q: %w", persisted.IssueID, persisted.DependsOnID, nativeStoreError(persisted.IssueID, err))
 		}
+		persistedDeps = append(persistedDeps, &persisted)
 	}
-	issue.Dependencies = deps
+	issue.Dependencies = persistedDeps
 	return beadFromNativeIssue(issue)
 }
 
@@ -1815,32 +1838,14 @@ func (s *NativeDoltStore) updateParentInTransaction(ctx context.Context, tx bead
 	return nil
 }
 
-func (s *NativeDoltStore) persistCreatedDependencies(ctx context.Context, storage beadslib.Storage, issueID string, deps []*beadslib.Dependency) ([]*beadslib.Dependency, error) {
-	if len(deps) == 0 {
-		return nil, nil
-	}
-	if strings.TrimSpace(issueID) == "" {
-		return nil, fmt.Errorf("persisting native create dependencies: upstream create did not assign an issue ID")
-	}
-	created := make([]*beadslib.Dependency, 0, len(deps))
-	for _, dep := range deps {
-		if dep == nil {
-			continue
-		}
-		persisted := *dep
-		if strings.TrimSpace(persisted.IssueID) == "" {
-			persisted.IssueID = issueID
-		}
-		if err := storage.AddDependency(ctx, &persisted, s.actor); err != nil {
-			return created, fmt.Errorf("persisting native create dependency %q -> %q: %w", persisted.IssueID, persisted.DependsOnID, nativeStoreError(persisted.IssueID, err))
-		}
-		depCopy := persisted
-		created = append(created, &depCopy)
-	}
-	return created, nil
+// nativeIssueReader is the one read that dependency validation needs. Both an
+// open transaction and the bare storage handle serve it, and taking the narrow
+// type means a validator handed a transaction cannot read around it.
+type nativeIssueReader interface {
+	GetIssue(ctx context.Context, id string) (*beadslib.Issue, error)
 }
 
-func (s *NativeDoltStore) validateCreatedDependencies(ctx context.Context, storage beadslib.Storage, issueID string, deps []*beadslib.Dependency) error {
+func (s *NativeDoltStore) validateCreatedDependencies(ctx context.Context, reader nativeIssueReader, issueID string, deps []*beadslib.Dependency) error {
 	for _, dep := range deps {
 		if dep == nil {
 			continue
@@ -1852,7 +1857,7 @@ func (s *NativeDoltStore) validateCreatedDependencies(ctx context.Context, stora
 		if !shouldPrevalidateNativeDependency(issueID, targetID, s.idPrefix) {
 			continue
 		}
-		issue, err := storage.GetIssue(ctx, targetID)
+		issue, err := reader.GetIssue(ctx, targetID)
 		if err != nil {
 			return fmt.Errorf("validating native create dependency %q -> %q: %w", issueID, targetID, nativeStoreError(targetID, err))
 		}
@@ -1861,25 +1866,6 @@ func (s *NativeDoltStore) validateCreatedDependencies(ctx context.Context, stora
 		}
 	}
 	return nil
-}
-
-func (s *NativeDoltStore) compensateFailedCreate(ctx context.Context, storage beadslib.Storage, issueID string, deps []*beadslib.Dependency) error {
-	if strings.TrimSpace(issueID) == "" {
-		return nil
-	}
-	var errs []error
-	for _, dep := range deps {
-		if dep == nil {
-			continue
-		}
-		if err := storage.RemoveDependency(ctx, issueID, dep.DependsOnID, s.actor); err != nil {
-			errs = append(errs, fmt.Errorf("removing partial native dependency %q -> %q: %w", issueID, dep.DependsOnID, nativeStoreError(issueID, err)))
-		}
-	}
-	if err := storage.DeleteIssue(ctx, issueID); err != nil {
-		errs = append(errs, fmt.Errorf("deleting partial native issue %q: %w", issueID, nativeStoreError(issueID, err)))
-	}
-	return errors.Join(errs...)
 }
 
 func nativeCloseReasonFromIssue(issue *beadslib.Issue) string {
