@@ -17,7 +17,7 @@ none requires per-city configuration.
 | `orphan-sweep` | cooldown 5m | Reset beads assigned to dead agents back to the work pool |
 | `cross-rig-deps` | cooldown 5m | Convert satisfied cross-rig `blocks` deps to `related` |
 | `order-tracking-sweep` | cooldown | Close stale order-tracking beads and prune expired tracking history |
-| `spawn-storm-detect` | cooldown | Detect beads repeatedly bouncing back to pool |
+| `spawn-storm-detect` | cooldown | Detect beads repeatedly bouncing back to pool (counts real resets from the event stream, not its own runs) |
 | `prune-branches` | cooldown | Clean stale `gc/*` branches from all rigs |
 | `wisp-compact` | cooldown | TTL-based cleanup of expired ephemeral beads (wisps) |
 | **`nudge-on-route`** | **event `bead.updated`** | **Nudge the target session when a bead is routed to it** |
