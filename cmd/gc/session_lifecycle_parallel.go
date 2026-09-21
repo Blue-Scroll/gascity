@@ -419,6 +419,17 @@ type asyncStartTracker struct {
 	wg               sync.WaitGroup
 	stopping         bool
 	drainAckStopKeys sync.Map
+	// startsInFlight counts, per session bead ID, the async starts whose
+	// goroutine is still running in THIS process. reapStaleSessionBeads reads
+	// it so a start that outlives its grace window is not closed out from
+	// under itself (hq-dx354v). It is a count, not a flag, so two overlapping
+	// starts for one session cannot have the first one to finish clear the
+	// mark while the second is still inside the provider. The map is
+	// per-process on purpose: after a supervisor restart nothing is in flight,
+	// so a bead left creating by a dead process is reaped on the old clock as
+	// before. startsMu guards it.
+	startsMu       sync.Mutex
+	startsInFlight map[string]int
 }
 
 func (t *asyncStartTracker) start() (func(), bool) {
@@ -432,6 +443,53 @@ func (t *asyncStartTracker) start() (func(), bool) {
 	}
 	t.wg.Add(1)
 	return t.wg.Done, true
+}
+
+// beginStart takes a tracker slot for one session's async start AND records
+// that session bead as having a start in flight. Use this, not start(), for a
+// provider start: the returned done clears both, so the in-flight mark can
+// never outlive the goroutine or be forgotten on an early return.
+func (t *asyncStartTracker) beginStart(sessionID string) (func(), bool) {
+	done, ok := t.start()
+	if !ok {
+		return nil, false
+	}
+	sessionID = strings.TrimSpace(sessionID)
+	if t == nil || sessionID == "" {
+		return done, true
+	}
+	t.startsMu.Lock()
+	if t.startsInFlight == nil {
+		t.startsInFlight = make(map[string]int)
+	}
+	t.startsInFlight[sessionID]++
+	t.startsMu.Unlock()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			t.startsMu.Lock()
+			if t.startsInFlight[sessionID] <= 1 {
+				delete(t.startsInFlight, sessionID)
+			} else {
+				t.startsInFlight[sessionID]--
+			}
+			t.startsMu.Unlock()
+		})
+		done()
+	}, true
+}
+
+// startInFlight reports whether this process is inside a provider start for the
+// given session bead right now. A start that is still running is not stale,
+// however old the bead's start boundary looks.
+func (t *asyncStartTracker) startInFlight(sessionID string) bool {
+	sessionID = strings.TrimSpace(sessionID)
+	if t == nil || sessionID == "" {
+		return false
+	}
+	t.startsMu.Lock()
+	defer t.startsMu.Unlock()
+	return t.startsInFlight[sessionID] > 0
 }
 
 func (t *asyncStartTracker) startDrainAckStop(key string) (func(), bool) {
@@ -2763,7 +2821,7 @@ func executePlannedStartsTraced(
 				var done func()
 				if startOpts.async {
 					var tracking bool
-					done, tracking = startOpts.asyncTracker.start()
+					done, tracking = startOpts.asyncTracker.beginStart(candidate.info.ID)
 					if !tracking {
 						logLifecycleOutcome(stderr, "start", wave, candidate.name(), candidate.logicalTemplate(cfg), "context_canceled", time.Time{}, time.Time{}, nil)
 						continue
