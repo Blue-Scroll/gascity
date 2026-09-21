@@ -1314,6 +1314,9 @@ func applySchemaOptionOverridesForLaunch(agentCfg *runtime.Config, tp *TemplateP
 	}
 }
 
+// resolvePreparedTaskWorkDir picks the directory a session launches in from
+// the work_dir of the task bead it holds. It never hands back a directory that
+// another open session calls home: see taskWorkDirOwnedByOtherSession.
 func resolvePreparedTaskWorkDir(
 	candidate startCandidate,
 	cityPath string,
@@ -1321,12 +1324,57 @@ func resolvePreparedTaskWorkDir(
 	store beads.Store,
 	workDirResolver taskWorkDirResolver,
 ) string {
+	workDir := ""
 	if workDirResolver != nil {
-		if workDir := workDirResolver(candidate, cfg); workDir != "" {
-			return workDir
+		workDir = workDirResolver(candidate, cfg)
+	}
+	if workDir == "" {
+		workDir = resolveTaskWorkDir(cityPath, store, taskWorkDirAssignees(candidate, cfg)...)
+	}
+	if workDir == "" || taskWorkDirOwnedByOtherSession(candidate, cityPath, store, workDir) {
+		return ""
+	}
+	return workDir
+}
+
+// taskWorkDirOwnedByOtherSession reports whether workDir is the home
+// directory of a DIFFERENT open session.
+//
+// A task bead's work_dir is a hint left by whoever worked the bead last. It
+// goes stale: a bead is released, re-slung, or claimed by a new pool seat, and
+// the field still names the old seat's tree. Launching there sets GC_DIR and
+// the pane's cwd to a tree another live agent is working in. Every tool that
+// then checks "am I in my own tree?" compares against GC_DIR, so the check
+// passes, and a reset or rebase lands on the other agent's uncommitted work
+// (hq-jw5qlu: measured 4 of 11 and 5 of 7 in-flight beads poisoned this way).
+//
+// The session registry is the owner of record for a directory, so it is the
+// independent witness here, not the bead. The match is exact on purpose: a
+// session whose home is a parent directory (a city or rig root) does not own
+// every worktree under it.
+func taskWorkDirOwnedByOtherSession(candidate startCandidate, cityPath string, store beads.Store, workDir string) bool {
+	if store == nil {
+		return false
+	}
+	if own := resolveWorkDirAgainstCity(cityPath, candidate.info.WorkDir); own != "" && samePath(own, workDir) {
+		return false
+	}
+	snapshot, err := loadSessionBeadSnapshot(store)
+	if err != nil {
+		// Unknown owner: launching in the session's own configured
+		// directory is always safe, a foreign tree is not.
+		return true
+	}
+	for _, other := range snapshot.OpenInfos() {
+		if other.ID == candidate.info.ID {
+			continue
+		}
+		otherDir := resolveWorkDirAgainstCity(cityPath, strings.TrimSpace(other.WorkDir))
+		if otherDir != "" && samePath(otherDir, workDir) {
+			return true
 		}
 	}
-	return resolveTaskWorkDir(cityPath, store, taskWorkDirAssignees(candidate, cfg)...)
+	return false
 }
 
 // generatedPreStartPrefixes are the exact command prefixes
