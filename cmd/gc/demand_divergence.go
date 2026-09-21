@@ -111,20 +111,72 @@ func classifyDemandTrigger(triggerID, dir string, opts hookClaimOptions, ops hoo
 	}
 	status = strings.ToLower(strings.TrimSpace(bead.Status))
 	// The invariant is about a row that is STILL claimable by a worker for this
-	// template: open, unassigned, route-matching, and not excluded by the shared
-	// serving rules. Anything else means the row moved on — which is what a
-	// sibling claim looks like, and is correct pull.
-	if status == "open" && demandRowServable(bead) && hookClaimMatchesRoute(bead, opts.RouteTargets) {
-		return status, events.DemandClaimDivergence
+	// template: open, unassigned, route-matching, not excluded by the shared
+	// serving rules, and not blocked. Anything else means the row moved on —
+	// which is what a sibling claim looks like, and is correct pull.
+	if status != "open" || !demandRowServable(bead) || !hookClaimMatchesRoute(bead, opts.RouteTargets) {
+		return status, events.DemandClaimBenign
 	}
-	return status, events.DemandClaimBenign
+	// The worker's query is built on `bd ready`, which never serves a row with
+	// an open blocker. The controller counted this row from Ready(), so it was
+	// unblocked then; a blocker added since is the row moving on, not the two
+	// readers disagreeing. Without this check every such drain printed a false
+	// "still claimable" line (vn-w4huxh6). demandRowServable cannot carry it:
+	// the demand loop runs that predicate on Ready() rows, which are already
+	// dependency-filtered, and it must stay a pure read of one row.
+	blocked, err := demandTriggerBlocked(ctx, bead, func(id string) (beads.Bead, error) {
+		return ops.ReadWorkMeta(ctx, dir, opts.Env, id, opts.Assignee)
+	})
+	if err != nil {
+		return status, events.DemandClaimUnknown
+	}
+	if blocked {
+		return status, events.DemandClaimBenign
+	}
+	return status, events.DemandClaimDivergence
+}
+
+// demandTriggerBlocked reports whether bd ready would hold this row back for an
+// open blocker. It uses the same rule as the cache's ready read
+// (beads.cachedBeadReady): bd's own is_blocked answer wins when the store sent
+// one; otherwise any ready-blocking edge whose target is not closed blocks.
+//
+// A by-id read keeps the edges but drops each blocker's status, so each blocker
+// is read here. A blocker read that fails returns the error, never "unblocked":
+// guessing either way would let a flaky store fake the metric.
+func demandTriggerBlocked(ctx context.Context, bead beads.Bead, read func(id string) (beads.Bead, error)) (bool, error) {
+	if bead.IsBlocked != nil {
+		return *bead.IsBlocked, nil
+	}
+	for _, dep := range bead.Dependencies {
+		if !beads.IsReadyBlockingDependencyType(dep.Type) {
+			continue
+		}
+		if err := ctx.Err(); err != nil {
+			return false, err
+		}
+		blocker, err := read(dep.DependsOnID)
+		if err != nil {
+			return false, err
+		}
+		if strings.ToLower(strings.TrimSpace(blocker.Status)) != "closed" {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // demandDivergenceOpsForBead is a tiny adapter so the classification read can be
-// driven directly in tests without constructing a whole claim.
-func demandDivergenceOpsForBead(bead beads.Bead, err error) hookClaimOps {
+// driven directly in tests without constructing a whole claim. A read for the id
+// of one of blockers returns that blocker; every other read returns bead, err.
+func demandDivergenceOpsForBead(bead beads.Bead, err error, blockers ...beads.Bead) hookClaimOps {
 	return hookClaimOps{
-		ReadWorkMeta: func(context.Context, string, []string, string, string) (beads.Bead, error) {
+		ReadWorkMeta: func(_ context.Context, _ string, _ []string, id, _ string) (beads.Bead, error) {
+			for _, blocker := range blockers {
+				if blocker.ID == id {
+					return blocker, nil
+				}
+			}
 			return bead, err
 		},
 	}
