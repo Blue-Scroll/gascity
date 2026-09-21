@@ -1,6 +1,7 @@
 package sling
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
@@ -190,5 +191,110 @@ func TestLegacyAttachReplacesAnAlreadyAttachedMoleculeInPlace(t *testing.T) {
 	}
 	if got := after.Metadata["molecule_id"]; got != roots[0].ID {
 		t.Fatalf("molecule_id on %s = %q, want the one live root %q", bead.ID, got, roots[0].ID)
+	}
+}
+
+// legacyBatchAttachRaceDeps builds one shared store, city path and convoy with
+// childCount open children, ready for a race between several DoSlingBatch calls
+// on that one convoy.
+func legacyBatchAttachRaceDeps(t *testing.T, childCount int) (SlingDeps, beads.Bead, []beads.Bead, config.Agent) {
+	t.Helper()
+	runner := &countingRunner{}
+	cfg := &config.City{Workspace: config.Workspace{Name: "test"}}
+	deps := testDeps(cfg, runtime.NewFake(), runner.run)
+	// Own city path, for the same reason as legacyAttachRaceDeps: the lock
+	// file lives under it, and the shared test city dir would let an
+	// unrelated test's lock decide this one.
+	deps.CityPath = t.TempDir()
+	convoy, err := deps.Store.Create(beads.Bead{Title: "convoy", Type: "convoy"})
+	if err != nil {
+		t.Fatalf("create convoy: %v", err)
+	}
+	children := make([]beads.Bead, 0, childCount)
+	for i := range childCount {
+		child, err := deps.Store.Create(beads.Bead{Title: fmt.Sprintf("child %d", i), Type: "task", Status: "open"})
+		if err != nil {
+			t.Fatalf("create child %d: %v", i, err)
+		}
+		if err := deps.Store.DepAdd(convoy.ID, child.ID, "tracks"); err != nil {
+			t.Fatalf("track child %d: %v", i, err)
+		}
+		children = append(children, child)
+	}
+	return deps, convoy, children, config.Agent{Name: "mayor", MaxActiveSessions: intPtr(1)}
+}
+
+// TestLegacyBatchAttachRaceLeavesOneMoleculeRootPerChild is the convoy twin of
+// TestLegacyAttachRaceLeavesOneMoleculeRoot, and the regression test for
+// vn-w7bhfu2: several routers expanding the SAME convoy at the same time must
+// leave exactly ONE open molecule root per child, never one per racer per child.
+//
+// The batch path's gap was wider than the single-bead one. Its "is a molecule
+// already attached?" check, CheckBatchNoMoleculeChildren, runs once in
+// DoSlingBatch before any child is touched, off a snapshot of the children
+// taken before that. Each child then only gets its molecule_id at the end of
+// its own attach, so every child read free from that one batch check until its
+// own write, and both routers built a full molecule for every child.
+//
+// Without the per-child lock this fails with up to racers*children open roots.
+func TestLegacyBatchAttachRaceLeavesOneMoleculeRootPerChild(t *testing.T) {
+	const childCount = 3
+	deps, convoy, children, agent := legacyBatchAttachRaceDeps(t, childCount)
+
+	const racers = 4
+	var wg sync.WaitGroup
+	errs := make([]error, racers)
+	for i := range racers {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			_, errs[i] = DoSlingBatch(SlingOpts{
+				Target:        agent,
+				BeadOrFormula: convoy.ID,
+				OnFormula:     "mol-polecat-work",
+			}, deps, deps.Store)
+		}(i)
+	}
+	wg.Wait()
+
+	won := 0
+	for _, err := range errs {
+		if err == nil {
+			won++
+		}
+	}
+	if won == 0 {
+		t.Fatalf("every batch sling failed, so the test proves nothing; errs = %v", errs)
+	}
+
+	roots := openMoleculeRoots(t, deps.Store)
+	if len(roots) != childCount {
+		ids := make([]string, 0, len(roots))
+		for _, root := range roots {
+			ids = append(ids, root.ID)
+		}
+		t.Fatalf("open molecule roots = %d %v, want exactly %d (one per child of %s): a second router built a second molecule for at least one child", len(roots), ids, childCount, convoy.ID)
+	}
+
+	live := make(map[string]bool, len(roots))
+	for _, root := range roots {
+		live[root.ID] = true
+	}
+	for _, child := range children {
+		after, err := deps.Store.Get(child.ID)
+		if err != nil {
+			t.Fatalf("Get(%s): %v", child.ID, err)
+		}
+		got := after.Metadata["molecule_id"]
+		if got == "" {
+			t.Fatalf("molecule_id on child %s is empty; it was never attached", child.ID)
+		}
+		if !live[got] {
+			t.Fatalf("molecule_id on child %s = %q, which is not one of the open roots %v: the child points at a burned molecule", child.ID, got, roots)
+		}
+		delete(live, got)
+	}
+	if len(live) != 0 {
+		t.Fatalf("open molecule roots %v belong to no child of %s; they are orphans a losing router left behind", live, convoy.ID)
 	}
 }
