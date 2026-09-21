@@ -586,11 +586,9 @@ func attachFormulaToBead(opts SlingOpts, deps SlingDeps, querier BeadQuerier, be
 	// The graph path returned above, so this is the legacy (non-graph) region:
 	// isGraph is always false here, so the former `isGraph && opts.Force`
 	// live-workflow allowance could never fire. Attachments are always checked
-	// with CheckNoMoleculeChildren on this path.
-	if err := CheckNoMoleculeChildren(querier, beadID, deps.Store, &result); err != nil {
-		return result, fmt.Errorf("%w", err)
-	}
-	run := func() (SlingResult, error) {
+	// with CheckNoMoleculeChildren on this path, and that check now runs inside
+	// the per-source-bead lock below.
+	attach := func() (SlingResult, error) {
 		mResult, err := InstantiateSlingFormula(context.Background(), formulaName, SlingFormulaSearchPaths(deps, a), molecule.Options{
 			Title:            opts.Title,
 			Vars:             formulaVars,
@@ -623,21 +621,9 @@ func attachFormulaToBead(opts SlingOpts, deps SlingDeps, querier BeadQuerier, be
 		// work. See gastownhall/gascity#2848 and TestOnFormulaAttachesAndRoutes.
 		return finalize(opts, deps, beadID, method, result)
 	}
-	runGraph := func() (pendingSourceWorkflowLaunch, error) {
-		mResult, err := InstantiateSlingFormula(context.Background(), formulaName, SlingFormulaSearchPaths(deps, a), molecule.Options{
-			Title:            opts.Title,
-			Vars:             formulaVars,
-			PriorityOverride: BeadPriorityOverride(querier, beadID),
-		}, beadID, opts.ScopeKind, opts.ScopeRef, a, deps)
-		if err != nil {
-			return pendingSourceWorkflowLaunch{}, fmt.Errorf("instantiating %s %q on %s: %w", errLabel, formulaName, beadID, err)
-		}
-		return pendingGraphWorkflowLaunch(mResult.RootID, beadID, a, method, formulaName, deps), nil
-	}
-	if !isGraph {
-		return run()
-	}
-	return withSourceWorkflowLaunchLock(context.Background(), deps, beadID, opts.Force, runGraph)
+	return withLegacyAttachLock(context.Background(), deps, beadID, &result, func() error {
+		return CheckNoMoleculeChildren(querier, beadID, deps.Store, &result)
+	}, attach)
 }
 
 // slingPlainBead handles plain bead routing (no formula).
@@ -1226,6 +1212,56 @@ func withSourceWorkflowLaunchLock(ctx context.Context, deps SlingDeps, sourceBea
 		return nil
 	})
 	return result, err
+}
+
+// withLegacyAttachLock runs the legacy (non-graph) formula attach for one
+// source bead under the same per-source-bead lock the two graph paths above
+// use, and runs the "is a molecule already attached?" check INSIDE it.
+//
+// Both halves matter, because attaching is a check-then-act that is minutes
+// wide. InstantiateSlingFormula mints the molecule root and one bead per step
+// first, and the source bead only gets its molecule_id afterwards. For that
+// whole gap the bead still reads open, unassigned, unrouted and unmoleculed,
+// so a second router picks it up and slings it again. Both slings then finish
+// and the bead ends up with two live molecule roots and a full set of orphan
+// step beads for the loser.
+//
+// Measured 2026-09-20 on vn-5ogw5pv: root vn-3w1trsn was made at 13:06:54Z and
+// a second root vn-0iqcywg at 13:09:08Z, three seconds before the first route
+// even landed, leaving 11 stray open beads. Nine work beads in that rig carried
+// two open roots at 13:17Z.
+//
+// With the lock the loser waits, re-runs the check, and sees the winner's
+// molecule. It does not refuse: checkNoMoleculeChildren auto-burns a live
+// molecule when the source bead is unassigned, which every pool bead is, so the
+// loser closes the winner's molecule and pours its own. That is the designed
+// re-sling behaviour and this lock leaves it alone. What changes is the count:
+// exactly one molecule root stays open either way.
+//
+// sourceworkflow.WithLock is an in-process mutex plus an on-disk flock, so this
+// holds across two `gc sling` processes, which is the case that was measured.
+// See vn-7cw0yut.
+//
+// check is re-run under the lock and its error is returned unchanged. onFree
+// runs only when check passes. pending is the caller's own result, which check
+// writes into (auto-burn ids, bead warnings); it is what a refusal reports, so
+// read it AFTER the lock body and never copy it before.
+func withLegacyAttachLock(ctx context.Context, deps SlingDeps, sourceBeadID string, pending *SlingResult, check func() error, onFree func() (SlingResult, error)) (SlingResult, error) {
+	var attached SlingResult
+	ran := false
+	err := sourceworkflow.WithLock(ctx, deps.CityPath, sourceWorkflowLockScope(deps), sourceBeadID, func() error {
+		if err := check(); err != nil {
+			return err
+		}
+		var runErr error
+		attached, runErr = onFree()
+		ran = true
+		return runErr
+	})
+	if !ran {
+		return *pending, err
+	}
+	return attached, err
 }
 
 func withGraphV2SourceWorkflowLock(ctx context.Context, deps SlingDeps, sourceBeadID string, fn func() (SlingResult, error)) (SlingResult, error) {
