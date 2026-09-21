@@ -49,3 +49,7 @@ jobs:
         run: go test ./internal/orders/ -run 'TestParseScope|TestValidateRejectsUnknownScope|TestValidateAcceptsCityAndRigScope|TestParseEnv' -count=1 -v
       - name: Unit tests — scale from zero (#2819)
         run: go test ./cmd/gc/ -run 'TestBuildDesiredState_ScaleFromZero' -count=1 -v
+      - name: Unit tests, worktree spawn guard and pool-name identity (vn-rm9u8g)
+        run: |
+          go test ./internal/workdir/ -run 'TestValidateAncestorWorktreesNotStale|TestValidateNotNestedInSessionWorktree|TestValidateSpawnTarget' -count=1 -v
+          go test ./internal/config/ -run 'TestValidateSemanticsNamepool|TestValidateSemanticsSameNamepoolNameInTwoRigsIsFine|TestLoadReportsNamepoolCollisionFromDisk' -count=1 -v

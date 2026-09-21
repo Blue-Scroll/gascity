@@ -76,6 +76,9 @@ func ValidateSemantics(cfg *City, source string) []string {
 		}
 	}
 
+	// A pool name must belong to exactly one slot of exactly one agent.
+	warnings = append(warnings, namepoolIdentityCollisions(cfg, source)...)
+
 	// Check overlapping idle lifecycle controls.
 	for _, a := range cfg.Agents {
 		if a.IdleTimeout != "" && a.SleepAfterIdle != "" {
@@ -151,5 +154,55 @@ func ValidateSemantics(cfg *City, source string) []string {
 		}
 	}
 
+	return warnings
+}
+
+// namepoolIdentityCollisions reports every pool name that more than one slot
+// can be handed. A pool session's identity is its name qualified by the agent's
+// dir and binding, so a namepool name IS the session identity: "vessel-network/
+// nux" names one session and says nothing about which pool it came from.
+//
+// When two agents in one dir offer the same name, that one identity means two
+// sessions. They claim the same beads, read the same mail, and each one's
+// work_dir stamp overwrites the other's, which is how two sessions ended up in
+// one git worktree and deleted each other's uncommitted work (vn-rm9u8g,
+// twice in fifteen minutes on 2026-08-23). The same is true of one agent
+// listing a name twice: slot 2 and slot 5 then resolve to one identity.
+//
+// It is a warning, not a hard error, on purpose. A town whose pools already
+// overlap must still start, and the operator sees this in "gc doctor" (the
+// config-semantics check) instead of a dead city.
+func namepoolIdentityCollisions(cfg *City, source string) []string {
+	if cfg == nil {
+		return nil
+	}
+	var warnings []string
+	// identity -> the qualified agent name that claimed it first.
+	claimed := make(map[string]string)
+	for i := range cfg.Agents {
+		a := &cfg.Agents[i]
+		owner := a.QualifiedName()
+		for _, name := range a.NamepoolNames {
+			name = strings.TrimSpace(name)
+			if name == "" {
+				continue
+			}
+			identity := a.QualifiedInstanceName(name)
+			first, taken := claimed[identity]
+			if !taken {
+				claimed[identity] = owner
+				continue
+			}
+			if first == owner {
+				warnings = append(warnings, fmt.Sprintf(
+					"%s: agent %q lists pool name %q more than once; two slots would share session identity %q, so two sessions would share one work_dir",
+					source, owner, name, identity))
+				continue
+			}
+			warnings = append(warnings, fmt.Sprintf(
+				"%s: agents %q and %q both offer pool name %q, so both resolve to session identity %q; a pool name belongs to exactly one agent, or one identity means two sessions in one work_dir",
+				source, first, owner, name, identity))
+		}
+	}
 	return warnings
 }

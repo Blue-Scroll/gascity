@@ -768,6 +768,16 @@ func LoadWithIncludesOptions(fs fsys.FS, path string, opts LoadOptions, extraInc
 		return nil, nil, err
 	}
 
+	// Finish enriching every agent BEFORE anything validates them. Both of
+	// these fill agent fields from convention: the agent-local asset dirs,
+	// then the pool names those dirs hold. A check that runs first reads an
+	// empty field and passes on a config that is wrong, which is how a guard
+	// gets written and never fires (namepoolIdentityCollisions reads
+	// NamepoolNames). Composition and path adjustment are both finished here,
+	// which is all either call needs.
+	populateAgentLocalAssetDirs(fs, root, cityRoot)
+	loadNamepools(fs, root, cityRoot)
+
 	// Validate cross-entity semantic constraints.
 	if !opts.AllowMissingProviderReferences {
 		if err := ValidateProviderReferences(root); err != nil {
@@ -791,11 +801,6 @@ func LoadWithIncludesOptions(fs fsys.FS, path string, opts LoadOptions, extraInc
 	if err := BuildResolvedProviderCache(root); err != nil {
 		return nil, nil, fmt.Errorf("%s: provider cache build failed: %w", path, err)
 	}
-
-	populateAgentLocalAssetDirs(fs, root, cityRoot)
-
-	// Load namepool files for pool agents.
-	loadNamepools(fs, root, cityRoot)
 
 	// v0.15.1: emit a one-time deprecation warning if the loaded config
 	// still populates the v0.15.0 attachment-list tombstone fields. The

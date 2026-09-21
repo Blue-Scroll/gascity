@@ -535,3 +535,151 @@ func TestPathContextRigScopedAgentPrefersStampedDir(t *testing.T) {
 		t.Fatalf("ctx.RigRoot = %q, want %q", ctx.RigRoot, rigPath)
 	}
 }
+
+// The nesting guard: a session worktree must never be created inside another
+// checkout that lives under the worktrees root (vn-rm9u8g).
+
+// townPaths returns the two paths every nesting test needs: the worktrees root
+// a city hands session trees out of, and one polecat slot path under it.
+func townPaths(t *testing.T) (worktreesRoot, slot string) {
+	t.Helper()
+	city := t.TempDir()
+	worktreesRoot = filepath.Join(city, ".gc", "worktrees")
+	slot = filepath.Join(worktreesRoot, "demo", "polecats", "polecat-opus-high", "furiosa")
+	return worktreesRoot, slot
+}
+
+func TestValidateNotNestedInSessionWorktree_CleanAncestryIsAllowed(t *testing.T) {
+	worktreesRoot, slot := townPaths(t)
+	if err := ValidateNotNestedInSessionWorktree(slot, worktreesRoot); err != nil {
+		t.Fatalf("ValidateNotNestedInSessionWorktree() = %v, want nil (no ancestor holds a checkout)", err)
+	}
+}
+
+func TestValidateNotNestedInSessionWorktree_TargetItselfIsAWorktree(t *testing.T) {
+	// The normal case, and the one a wrong guard would break: the slot was
+	// prebuilt, so the path itself IS a worktree. Only ancestors are judged.
+	worktreesRoot, slot := townPaths(t)
+	writeValidGitPointer(t, slot, filepath.Join(t.TempDir(), "rig", ".git", "worktrees", "furiosa"))
+	if err := ValidateNotNestedInSessionWorktree(slot, worktreesRoot); err != nil {
+		t.Fatalf("ValidateNotNestedInSessionWorktree() = %v, want nil (the spawn target is allowed to be a worktree)", err)
+	}
+}
+
+func TestValidateNotNestedInSessionWorktree_AncestorIsALinkedWorktree(t *testing.T) {
+	// The measured shape: worktrees created inside a polecat slot that is
+	// already a checkout, so both paths answer as one tree.
+	worktreesRoot, slot := townPaths(t)
+	writeValidGitPointer(t, slot, filepath.Join(t.TempDir(), "rig", ".git", "worktrees", "furiosa"))
+	// A second agent home landing inside the first one: the measured shape,
+	// where one leaf name resolved into two sessions sharing a tree.
+	nested := filepath.Join(slot, "polecat-opus-high", "nux")
+	err := ValidateNotNestedInSessionWorktree(nested, worktreesRoot)
+	if err == nil {
+		t.Fatal("ValidateNotNestedInSessionWorktree() = nil, want error (spawn target is inside an existing worktree)")
+	}
+	for _, want := range []string{nested, slot} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q missing reference %q", err.Error(), want)
+		}
+	}
+}
+
+func TestValidateNotNestedInSessionWorktree_PerBeadWorktreeUnderAnAgentHomeIsAllowed(t *testing.T) {
+	// The sanctioned exception. The core polecat formula creates
+	// "$(pwd)/worktrees/$WORK_BEAD_ID" inside the agent home, and the bead
+	// worktree reaper collects them there. Refusing this shape would break
+	// per-bead worktrees in every town that uses them.
+	worktreesRoot, slot := townPaths(t)
+	writeValidGitPointer(t, slot, filepath.Join(t.TempDir(), "rig", ".git", "worktrees", "furiosa"))
+	perBead := filepath.Join(slot, "worktrees", "vn-4b67ts")
+	if err := ValidateNotNestedInSessionWorktree(perBead, worktreesRoot); err != nil {
+		t.Fatalf("ValidateNotNestedInSessionWorktree() = %v, want nil (per-bead worktrees live under <home>/worktrees/<bead-id>)", err)
+	}
+}
+
+func TestValidateNotNestedInSessionWorktree_AncestorIsAWholeRepository(t *testing.T) {
+	worktreesRoot, slot := townPaths(t)
+	if err := os.MkdirAll(filepath.Join(slot, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	nested := filepath.Join(slot, "polecat-opus-high", "nux")
+	err := ValidateNotNestedInSessionWorktree(nested, worktreesRoot)
+	if err == nil {
+		t.Fatal("ValidateNotNestedInSessionWorktree() = nil, want error (spawn target is inside a cloned repository)")
+	}
+	if !strings.Contains(err.Error(), slot) {
+		t.Errorf("error %q does not name the repository at %q", err.Error(), slot)
+	}
+}
+
+func TestValidateNotNestedInSessionWorktree_CheckoutAboveTheWorktreesRootIsAllowed(t *testing.T) {
+	// The brick test. The city checkout holds .gc/worktrees, and a city that
+	// is itself a git worktree has a .git FILE at its root. If the walk went
+	// above the worktrees root, every spawn in that town would be refused.
+	city := t.TempDir()
+	writeValidGitPointer(t, city, filepath.Join(t.TempDir(), "city-repo", ".git", "worktrees", "town"))
+	worktreesRoot := filepath.Join(city, ".gc", "worktrees")
+	slot := filepath.Join(worktreesRoot, "demo", "polecats", "polecat-opus-high", "furiosa")
+	if err := ValidateNotNestedInSessionWorktree(slot, worktreesRoot); err != nil {
+		t.Fatalf("ValidateNotNestedInSessionWorktree() = %v, want nil (a checkout above the worktrees root is normal)", err)
+	}
+}
+
+func TestValidateNotNestedInSessionWorktree_WorktreesRootItselfIsNotJudged(t *testing.T) {
+	// A marker ON the worktrees root is above the bound, not under it.
+	city := t.TempDir()
+	worktreesRoot := filepath.Join(city, ".gc", "worktrees")
+	writeValidGitPointer(t, worktreesRoot, filepath.Join(t.TempDir(), "repo", ".git", "worktrees", "wt"))
+	slot := filepath.Join(worktreesRoot, "demo", "polecats", "furiosa")
+	if err := ValidateNotNestedInSessionWorktree(slot, worktreesRoot); err != nil {
+		t.Fatalf("ValidateNotNestedInSessionWorktree() = %v, want nil (the worktrees root is the bound, not an ancestor under it)", err)
+	}
+}
+
+func TestValidateNotNestedInSessionWorktree_MissingArgsAreNoOps(t *testing.T) {
+	worktreesRoot, slot := townPaths(t)
+	if err := ValidateNotNestedInSessionWorktree("", worktreesRoot); err != nil {
+		t.Errorf("ValidateNotNestedInSessionWorktree(\"\", root) = %v, want nil", err)
+	}
+	if err := ValidateNotNestedInSessionWorktree(slot, ""); err != nil {
+		t.Errorf("ValidateNotNestedInSessionWorktree(slot, \"\") = %v, want nil (no bound means nothing to judge)", err)
+	}
+}
+
+func TestValidateNotNestedInSessionWorktree_PathOutsideTheWorktreesRoot(t *testing.T) {
+	// An agent whose work_dir is the rig root, which is nowhere near the
+	// worktrees root. There is no ancestor under the bound, so nothing to say.
+	worktreesRoot, _ := townPaths(t)
+	outside := filepath.Join(t.TempDir(), "rigs", "vessel-network")
+	if err := ValidateNotNestedInSessionWorktree(outside, worktreesRoot); err != nil {
+		t.Fatalf("ValidateNotNestedInSessionWorktree() = %v, want nil (path is not under the worktrees root)", err)
+	}
+}
+
+func TestValidateSpawnTarget_RunsBothHalves(t *testing.T) {
+	// One door, both guards. A spawn path that wires only the stale half is
+	// the hole this bead closed, so prove the wrapper catches each fault.
+	staleRoot := t.TempDir()
+	staleWorktrees := filepath.Join(staleRoot, ".gc", "worktrees")
+	staleSlot := filepath.Join(staleWorktrees, "demo", "polecats", "furiosa")
+	writeStaleGitPointer(t, staleSlot, filepath.Join(staleRoot, "repo", ".git", "worktrees", "gone"))
+	if err := ValidateSpawnTarget(filepath.Join(staleSlot, "child"), staleWorktrees); err == nil {
+		t.Error("ValidateSpawnTarget() = nil on a stale ancestor pointer, want error")
+	}
+
+	liveRoot := t.TempDir()
+	liveWorktrees := filepath.Join(liveRoot, ".gc", "worktrees")
+	liveSlot := filepath.Join(liveWorktrees, "demo", "polecats", "furiosa")
+	writeValidGitPointer(t, liveSlot, filepath.Join(liveRoot, "repo", ".git", "worktrees", "furiosa"))
+	if err := ValidateSpawnTarget(filepath.Join(liveSlot, "child"), liveWorktrees); err == nil {
+		t.Error("ValidateSpawnTarget() = nil on a healthy nested ancestor, want error")
+	}
+
+	cleanRoot := t.TempDir()
+	cleanWorktrees := filepath.Join(cleanRoot, ".gc", "worktrees")
+	cleanSlot := filepath.Join(cleanWorktrees, "demo", "polecats", "furiosa")
+	if err := ValidateSpawnTarget(cleanSlot, cleanWorktrees); err != nil {
+		t.Errorf("ValidateSpawnTarget() = %v on a clean ancestry, want nil", err)
+	}
+}
