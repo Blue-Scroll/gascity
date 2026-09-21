@@ -21,23 +21,33 @@
 # back loop IS a reset: a pr-review refusal moves a bead from claimed to
 # open-and-unassigned every time, and that is the loop working, not a crash.
 # So before counting, the detector asks whether the bead's work moved. It
-# builds one line from the three fields that change when it does:
+# builds one line from the two fields that only change when code does:
 #
-#   branch=<metadata.branch>  sha=<metadata.rejected_at_sha>  pr=<its PR>
+#   sha=<metadata.rejected_at_sha>  pr=<its PR>
 #
-# If that line changed, somebody pushed, got re-judged, or opened a PR. The
-# count goes back to zero and nothing is said. The count only climbs while
-# the line stays EXACTLY the same, which is the shape of a seat that claims
-# the work and dies without touching it.
+# If that line changed, somebody pushed code and got it re-judged, or opened
+# a PR. The count goes back to zero and nothing is said. The count only
+# climbs while the line stays EXACTLY the same, which is the shape of a seat
+# that claims the work and dies without touching it.
 #
-# THE HOLE THIS LEAVES, SAID OUT LOUD
-# The sha and the PR are strong evidence that code moved. The branch NAME is
-# weaker: a seat that claims a bead with no branch yet, writes its own
-# branch name at branch-setup and then dies would change the line every
-# round and never be reported. Measured over 8 hours of real traffic, 11 of
-# the 13 beads forgiven here kept ONE branch name and were forgiven by the
-# sha, so this is not what is happening today. It is still a way for a real
-# crash loop to hide, and vn-tweh24y is open to close it.
+# THE BRANCH NAME IS NOT IN THAT LINE, ON PURPOSE (vn-tweh24y)
+# It used to be, and that was a hole. A branch name is not evidence that code
+# moved: it is written at branch-setup, before any code exists. So a seat
+# that claims a bead, writes its own branch name (they look like
+# polecat/<bead>-<seat>) and then dies hands the next seat a bead whose name
+# changes EVERY round. The line changed every round, so the count went back
+# to zero every round, and the crash loop this whole script exists for could
+# never be reported.
+#
+# Dropping the name costs nothing real. Measured over 8 hours of traffic on
+# 2026-09-21, 11 of the 13 beads forgiven here kept ONE branch name and were
+# forgiven by the sha moving instead. And a round that got only as far as
+# writing a branch name and then died IS a failed round. Counting it is the
+# right answer, not a false alarm.
+#
+# The branch is still shown to the mayor, as a plain observation the mail
+# labels as not-compared. The rule to keep: a field belongs in the line above
+# only when its change PROVES code moved.
 #
 # Measured 2026-09-21: 30 SPAWN_STORM mails reached the mayor in about four
 # hours. Every one was triaged. ZERO were a crash loop. An alarm that is
@@ -118,31 +128,35 @@ mkdir -p "$(dirname "$LEDGER")"
 # Step 1: load the ledger.
 #
 # Shape:
-#   { "version": 3,
+#   { "version": 4,
 #     "runs": <how many times this script has completed>,
 #     "cursor_seq": <highest event seq already counted>,
 #     "beads": { "<id>": { "state": "held" | "free",
 #                          "resets": <returns to the pool with NOTHING moving>,
 #                          "mailed": <resets already reported>,
-#                          "progress": "<the branch/sha/pr line, see below>",
+#                          "progress": "<the sha/pr line, see below>",
+#                          "branch_seen": "<last branch name, NEVER compared>",
 #                          "seen_run": <run number of its last event>,
 #                          "seen": "<timestamp, for humans only>",
 #                          "title": "<string>" } } }
 #
-# Only a version 3 ledger is loaded. Older ones are thrown away, because
+# Only a version 4 ledger is loaded. Older ones are thrown away, because
 # their "resets" was counted by a different rule and the number would be
 # read as meaning something it never meant:
 #   version 1 - a flat {"<id>": <int>} map of the old RUN counts (hq-2yztr2).
 #   version 2 - every real reset, including the refusal-and-fix rounds this
 #               version deliberately forgives (hq-hehd2m).
+#   version 3 - a branch RENAME counted as progress, so a seat that died at
+#               branch-setup every round zeroed the count every round and was
+#               never reported (vn-tweh24y).
 # Dropping them costs one quiet window and buys a number that is true.
-LEDGER_JSON='{"version":3,"runs":0,"cursor_seq":0,"beads":{}}'
+LEDGER_JSON='{"version":4,"runs":0,"cursor_seq":0,"beads":{}}'
 if [ -f "$LEDGER" ]; then
-    LOADED=$(jq -c 'if type == "object" and (.version? == 3) then . else null end' "$LEDGER" 2>/dev/null || echo null)
+    LOADED=$(jq -c 'if type == "object" and (.version? == 4) then . else null end' "$LEDGER" 2>/dev/null || echo null)
     if [ -n "$LOADED" ] && [ "$LOADED" != "null" ]; then
         LEDGER_JSON="$LOADED"
     else
-        echo "spawn-storm-detect: ledger reset (counted by an older rule, see hq-2yztr2 and hq-hehd2m)" >&2
+        echo "spawn-storm-detect: ledger reset (counted by an older rule, see hq-2yztr2, hq-hehd2m and vn-tweh24y)" >&2
     fi
 fi
 
@@ -179,10 +193,15 @@ NEXT_LEDGER=$(printf '%s\n' "$EVENTS" | jq -c -n \
           elif $s == "" then "unknown"
           else "held" end;
 
-    # One line naming everything that moves when the work moves. It is BOTH
+    # One line naming everything whose change PROVES code moved. It is BOTH
     # the thing compared and the thing the mail prints, on purpose: a
     # separate message string could say the sha did not move while the
     # comparison was looking at something else.
+    #
+    # The branch NAME is deliberately absent (vn-tweh24y). It is written at
+    # branch-setup, before any code exists, so a seat that claims the bead
+    # and dies there renames it every round and would be forgiven forever.
+    # See the header. Anything added here must pass the same test.
     #
     # "" means this event carried no metadata object at all, which is not the
     # same as a bead with empty metadata. An absent object tells us nothing,
@@ -191,10 +210,20 @@ NEXT_LEDGER=$(printf '%s\n' "$EVENTS" | jq -c -n \
     def progress_line($b):
         ($b.metadata? // null) as $m
         | if ($m | type) != "object" then ""
-          else "branch=" + (($m.branch // "none") | tostring)
-             + " sha=" + (($m.rejected_at_sha // "none") | tostring)
+          # MUTANT ANCHOR 3 (do not reflow): leaving the branch name out of
+          # this line is the vn-tweh24y fix. --self-test rewrites this one
+          # line to put the name back and requires the rename rows to fail.
+          else "sha=" + (($m.rejected_at_sha // "none") | tostring)
              + " pr=" + (($m.pr_url // $m.existing_pr // "none") | tostring)
           end;
+
+    # The branch name, for the MAIL ONLY. Never compared, never allowed to
+    # forgive a reset. The mayor still wants to know which branch a stuck
+    # bead is wearing, and a name that changes every round is itself the
+    # fingerprint of a seat dying at branch-setup. Same "" rule as above.
+    def branch_name($b):
+        ($b.metadata? // null) as $m
+        | if ($m | type) != "object" then "" else (($m.branch // "") | tostring) end;
 
     ($st | .runs = ((.runs // 0) + 1)) as $base
     | reduce (inputs
@@ -213,6 +242,7 @@ NEXT_LEDGER=$(printf '%s\n' "$EVENTS" | jq -c -n \
             | (progress_line($e.bead)) as $line
             # An event with no metadata object keeps the line we already had.
             | (if $line == "" then $prev_progress else $line end) as $progress
+            | (branch_name($e.bead)) as $branch
             | if $e.seq <= .cursor_seq or $next == "unknown" then .
               else
                 .cursor_seq = $e.seq
@@ -234,6 +264,9 @@ NEXT_LEDGER=$(printf '%s\n' "$EVENTS" | jq -c -n \
                         + (if ($prev == "held" and $next == "free") then 1 else 0 end))
                     | .beads[$id].mailed = (.beads[$id].mailed // 0)
                     | .beads[$id].progress = $progress
+                    # Recorded AFTER the forgiving test above, and read by
+                    # nothing but the mail. Do not move it into $progress.
+                    | .beads[$id].branch_seen = (if $branch == "" then (.beads[$id].branch_seen // "") else $branch end)
                     | .beads[$id].state = $next
                     | .beads[$id].seen_run = .runs
                     | .beads[$id].seen = $e.ts
@@ -261,8 +294,8 @@ NEXT_LEDGER=$(printf '%s\n' "$EVENTS" | jq -c -n \
 MAILED_OK="$(mktemp)"
 trap 'rm -f "$MAILED_OK"' EXIT
 
-send_storm_mail() { # bead-id title count progress-line -> 0 when the mail went
-    local bead_id="$1" title="$2" count="$3" progress="$4" out="" subject="" body=""
+send_storm_mail() { # bead-id title count progress-line branch -> 0 when the mail went
+    local bead_id="$1" title="$2" count="$3" progress="$4" branch="$5" out="" subject="" body=""
     subject="SPAWN_STORM: bead $bead_id reset ${count}x with no progress"
     body="Bead $bead_id ($title) went back to the pool $count times in a row and
 NOTHING about the work moved in between (threshold: $THRESHOLD).
@@ -270,9 +303,15 @@ NOTHING about the work moved in between (threshold: $THRESHOLD).
 What did not move, on every one of those $count rounds:
   $progress
 
-That line is the bead's branch, the sha the refinery last judged, and its PR.
-A refusal-and-fix round changes at least one of them, and this bead changed
-none, which is the shape of a seat that claims the work and dies.
+That line is the sha the refinery last judged and the bead's PR. A
+refusal-and-fix round changes at least one of them, and this bead changed
+neither, which is the shape of a seat that claims the work and dies.
+
+The branch NAME is not in that line and never forgives a reset (vn-tweh24y).
+It is written at branch-setup, before any code exists, so a seat that dies
+there renames the bead every round. If the name below is not the one you
+expect, that rename is the fingerprint of exactly this fault.
+  branch last seen on this bead: $branch
 
 What to do:
 - Look at the bead: gc bd show $bead_id --json
@@ -297,9 +336,9 @@ What to do:
 }
 
 STORMS=0
-while IFS=$'\t' read -r bead_id count title progress; do
+while IFS=$'\t' read -r bead_id count title progress branch; do
     [ -z "$bead_id" ] && continue
-    if send_storm_mail "$bead_id" "$title" "$count" "$progress"; then
+    if send_storm_mail "$bead_id" "$title" "$count" "$progress" "$branch"; then
         printf '%s\n' "$bead_id" >> "$MAILED_OK"
         STORMS=$((STORMS + 1))
     fi
@@ -307,7 +346,8 @@ done < <(printf '%s\n' "$NEXT_LEDGER" | jq -r --argjson thr "$THRESHOLD" '
     .beads | to_entries[]
     | select((.value.resets // 0) >= $thr and (.value.resets // 0) > (.value.mailed // 0))
     | [.key, (.value.resets // 0), (.value.title // "unknown"),
-       (if (.value.progress // "") == "" then "nothing recorded" else .value.progress end)]
+       (if (.value.progress // "") == "" then "nothing recorded" else .value.progress end),
+       (if (.value.branch_seen // "") == "" then "none recorded" else .value.branch_seen end)]
     | @tsv')
 
 # Step 6: write down the mails that went, then save.

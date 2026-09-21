@@ -21,6 +21,13 @@
 #   6. Three resets with the work NOT moving raise exactly one mail, and that
 #      mail names the count and the sha that never moved.
 #
+# The rename row is the one bead vn-tweh24y asked for:
+#   7. A bead wearing a DIFFERENT branch name every round, with nothing else
+#      moving, is a storm. A branch name is written at branch-setup, before
+#      any code exists, so a seat that dies there must not be forgiven for
+#      renaming the bead. The mail still shows the mayor that name, and the
+#      compared line still does not contain it.
+#
 # Then it proves the rows can actually fail. Each fix gets its own mutant,
 # because a row only proves something if breaking the thing it guards makes
 # it go red:
@@ -28,6 +35,8 @@
 #              rows must fail.
 #   mutant 2 - never forgive a reset that came with progress (the hq-hehd2m
 #              bug). The progress rows must fail.
+#   mutant 3 - put the branch name back in the compared line (the vn-tweh24y
+#              bug). The rename rows must fail.
 set -uo pipefail
 
 TARGET="${1:-}"
@@ -161,6 +170,21 @@ mail_line_for() { # bead-id
     ev_meta 216 hq-deadloop open "" "seat keeps dying" b9 dead00 ""
 } > "$WORK/progress.jsonl"
 
+# ------------------------------------------------- rename fixture (vn-tweh24y)
+# hq-renameloop is the fault the branch name used to hide. Three seats each
+# claim it, write their own branch name at branch-setup, and die. No sha, no
+# PR, no code: the only thing that ever changes is the name. While the name
+# was compared, that read as progress three times over and the count could
+# never leave zero.
+{
+    ev_meta 221 hq-renameloop in_progress vessel-network/capable "seat dies at branch-setup" polecat/hq-renameloop-capable "" ""
+    ev_meta 222 hq-renameloop open "" "seat dies at branch-setup" polecat/hq-renameloop-capable "" ""
+    ev_meta 223 hq-renameloop in_progress vessel-network/nux "seat dies at branch-setup" polecat/hq-renameloop-nux "" ""
+    ev_meta 224 hq-renameloop open "" "seat dies at branch-setup" polecat/hq-renameloop-nux "" ""
+    ev_meta 225 hq-renameloop in_progress vessel-network/dune "seat dies at branch-setup" polecat/hq-renameloop-dune "" ""
+    ev_meta 226 hq-renameloop open "" "seat dies at branch-setup" polecat/hq-renameloop-dune "" ""
+} > "$WORK/rename.jsonl"
+
 # ---------------------------------------------------------------- the rows
 # Returns 0 when every row passes. Used for the real script AND the mutant.
 run_rows() {
@@ -228,8 +252,37 @@ run_progress_rows() {
         *) fail "row 6: the mail must name the sha that never moved, got: $line" ;;
     esac
     case "$line" in
-        *"branch=b9"*) ;;
-        *) fail "row 6: the mail must name the branch that never moved, got: $line" ;;
+        *"branch last seen on this bead: b9"*) ;;
+        *) fail "row 6: the mail must still show the mayor the branch, got: $line" ;;
+    esac
+
+    [ "$FAILURES" -eq "$before" ]
+}
+
+# Row 7: the vn-tweh24y fix. A branch name is written before any code exists,
+# so renaming a bead is not the work moving. Returns 0 when the row passes.
+run_rename_rows() {
+    local before=$FAILURES line=""
+    reset_world
+
+    run_detector "$WORK/rename.jsonl"
+
+    [ "$(resets_of hq-renameloop)" = "3" ] || fail "row 7: three resets with only the branch NAME changing expected 3, got '$(resets_of hq-renameloop)'"
+    [ "$(mail_count_for hq-renameloop)" = "1" ] || fail "row 7: a seat dying at branch-setup three times must raise exactly 1 mail, got $(mail_count_for hq-renameloop)"
+    line="$(mail_line_for hq-renameloop)"
+    case "$line" in
+        *"reset 3x"*) ;;
+        *) fail "row 7: the mail must name the count, got: $line" ;;
+    esac
+    # The compared line must not carry the name. This is the fix itself, read
+    # straight off what the mayor is sent.
+    case "$line" in
+        *"branch=polecat/"*) fail "row 7: the branch name is back in the compared line, got: $line" ;;
+    esac
+    # ... and the mayor must still be told it, as an observation.
+    case "$line" in
+        *"branch last seen on this bead: polecat/hq-renameloop-dune"*) ;;
+        *) fail "row 7: the mail must still show the mayor the last branch name, got: $line" ;;
     esac
 
     [ "$FAILURES" -eq "$before" ]
@@ -245,6 +298,11 @@ else
 fi
 if run_progress_rows; then
     ok "progress rows pass"
+else
+    echo "  the script under test is broken" >&2
+fi
+if run_rename_rows; then
+    ok "rename rows pass"
 else
     echo "  the script under test is broken" >&2
 fi
@@ -305,6 +363,13 @@ check_mutant "mutant 1: count every sighting" \
 # is what made every refusal-and-fix round look like a crash loop.
 check_mutant "mutant 2: never forgive progress" \
     '($prev_progress != "" and $progress != $prev_progress)' '(false)' run_progress_rows
+
+# Mutant 3 (vn-tweh24y): put the branch name back in the compared line, which
+# is what let a seat dying at branch-setup rename its way out of the count.
+check_mutant "mutant 3: compare the branch name" \
+    'else "sha=" + (($m.rejected_at_sha // "none") | tostring)' \
+    'else "branch=" + (($m.branch // "none") | tostring) + " sha=" + (($m.rejected_at_sha // "none") | tostring)' \
+    run_rename_rows
 
 if [ "$FAILURES" -eq 0 ]; then
     echo "spawn-storm-detect: self-test PASSED"

@@ -6600,7 +6600,7 @@ func TestDoltDoctorScriptUsesExplicitSQLTarget(t *testing.T) {
 	}
 }
 
-// The spawn-storm tests below were rewritten twice.
+// The spawn-storm tests below were rewritten three times.
 //
 // hq-2yztr2: the detector used to list open unassigned beads and add 1 to each
 // on every run, so its "reset count" was really a run count. It now walks bead
@@ -6609,9 +6609,16 @@ func TestDoltDoctorScriptUsesExplicitSQLTarget(t *testing.T) {
 //
 // hq-hehd2m: counting real resets was still wrong, because the town's ordinary
 // refusal-and-fix round IS a reset. The detector now builds one line from the
-// bead's branch, its rejected_at_sha and its PR, and a reset whose line moved
-// sets the count back to zero. Only resets with that line standing still are
-// counted, and the threshold rose from 2 to 3.
+// fields that move when the work does, and a reset whose line moved sets the
+// count back to zero. Only resets with that line standing still are counted,
+// and the threshold rose from 2 to 3.
+//
+// vn-tweh24y: that line held the bead's BRANCH NAME, and a name is written at
+// branch-setup before any code exists. A seat that claims a bead, names its
+// branch and dies renamed the bead every round, so the line moved every round
+// and the crash loop could never be reported. The line is now the sha and the
+// PR alone. The name is still carried to the mayor, in the ledger's
+// branch_seen and in the mail, but it never forgives a reset.
 //
 // The tests stub `gc events` with a file of event lines and `gc mail send`
 // with a log.
@@ -6624,7 +6631,8 @@ func spawnStormEvent(seq int, id, status, assignee, title string) string {
 }
 
 // spawnStormEventWithProgress renders an event carrying the three metadata
-// fields the detector reads to decide whether the work moved.
+// fields the detector reads. Only two of them decide whether the work moved:
+// the branch name is carried to the mayor and never compared (vn-tweh24y).
 func spawnStormEventWithProgress(seq int, id, status, assignee, title, branch, rejectedAtSHA, prURL string) string {
 	return fmt.Sprintf(
 		`{"seq":%d,"type":"bead.updated","ts":"2026-09-20T12:00:00Z","subject":%q,"payload":{"bead":{"id":%q,"status":%q,"assignee":%q,"title":%q,"metadata":{"branch":%q,"rejected_at_sha":%q,"pr_url":%q}}}}`,
@@ -6637,7 +6645,7 @@ func spawnStormClosedEvent(seq int, id string) string {
 		seq, id, id)
 }
 
-// spawnStormLedger is the version 2 ledger the detector writes.
+// spawnStormLedger is the version 4 ledger the detector writes.
 type spawnStormLedger struct {
 	Version   int `json:"version"`
 	Runs      int `json:"runs"`
@@ -6647,8 +6655,11 @@ type spawnStormLedger struct {
 		Resets   int    `json:"resets"`
 		Mailed   int    `json:"mailed"`
 		Progress string `json:"progress"`
-		SeenRun  int    `json:"seen_run"`
-		Title    string `json:"title"`
+		// Read by the mail only. It is deliberately NOT part of Progress,
+		// which is the one string the reset count is judged on (vn-tweh24y).
+		BranchSeen string `json:"branch_seen"`
+		SeenRun    int    `json:"seen_run"`
+		Title      string `json:"title"`
 	} `json:"beads"`
 }
 
@@ -6729,8 +6740,8 @@ func TestSpawnStormDetectCountsResetsNotRuns(t *testing.T) {
 	runScript(t, script, env)
 
 	ledger := readSpawnStormLedger(t, ledgerPath)
-	if ledger.Version != 3 {
-		t.Fatalf("ledger version = %d, want 3", ledger.Version)
+	if ledger.Version != 4 {
+		t.Fatalf("ledger version = %d, want 4", ledger.Version)
 	}
 	if got := ledger.Beads["ga-loop"].Resets; got != 3 {
 		t.Fatalf("ga-loop was let go three times, reset count = %d, want 3", got)
@@ -6860,8 +6871,9 @@ func TestSpawnStormDetectCountsWhenEventCarriesNoTitle(t *testing.T) {
 
 // An older ledger holds counts made by an older rule: version 1 held run
 // counts (hq-2yztr2), version 2 held every reset including the refusal-and-fix
-// rounds that are now forgiven (hq-hehd2m). Neither number means what the
-// field means today, so both are dropped rather than carried forward.
+// rounds that are now forgiven (hq-hehd2m), and version 3 zeroed the count on
+// a branch RENAME (vn-tweh24y). No such number means what the field means
+// today, so all three are dropped rather than carried forward.
 func TestSpawnStormDetectDiscardsOlderLedger(t *testing.T) {
 	cityDir := t.TempDir()
 	binDir := t.TempDir()
@@ -6876,6 +6888,7 @@ func TestSpawnStormDetectDiscardsOlderLedger(t *testing.T) {
 	}{
 		{"version 1 run counts", `{"ga-stale":9}`},
 		{"version 2 reset counts", `{"version":2,"runs":4,"cursor_seq":9,"beads":{"ga-stale":{"state":"free","resets":9,"mailed":0,"seen_run":4,"title":"Stale bead"}}}`},
+		{"version 3 rename-forgiving counts", `{"version":3,"runs":4,"cursor_seq":9,"beads":{"ga-stale":{"state":"free","resets":9,"mailed":0,"progress":"branch=b1 sha=none pr=none","seen_run":4,"title":"Stale bead"}}}`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if err := os.WriteFile(ledgerPath, []byte(tc.stale), 0o644); err != nil {
@@ -6892,8 +6905,8 @@ func TestSpawnStormDetectDiscardsOlderLedger(t *testing.T) {
 			runScript(t, coreScriptPath("spawn-storm-detect.sh"), env)
 
 			ledger := readSpawnStormLedger(t, ledgerPath)
-			if ledger.Version != 3 {
-				t.Fatalf("ledger version = %d, want 3", ledger.Version)
+			if ledger.Version != 4 {
+				t.Fatalf("ledger version = %d, want 4", ledger.Version)
 			}
 			if got := ledger.Beads["ga-stale"].Resets; got != 0 {
 				t.Fatalf("an older count was carried forward as %d resets, want 0", got)
@@ -7141,10 +7154,60 @@ func TestSpawnStormDetectFiresWhenNothingMovedAndNamesTheTip(t *testing.T) {
 	if got := strings.Count(log, "SPAWN_STORM: bead ga-dead"); got != 1 {
 		t.Fatalf("want exactly 1 spawn storm mail, got %d:\n%s", got, log)
 	}
-	for _, want := range []string{"reset 3x", "branch=b9", "sha=dead00"} {
+	for _, want := range []string{"reset 3x", "sha=dead00", "branch last seen on this bead: b9"} {
 		if !strings.Contains(log, want) {
 			t.Fatalf("the mail does not name %q:\n%s", want, log)
 		}
+	}
+}
+
+// The fault the branch name used to hide (vn-tweh24y). Three seats each claim
+// the bead, write their own branch name at branch-setup, and die. No sha, no
+// PR, no code: the only thing that ever changes is the name. While the name
+// was compared, each rename read as progress and set the count back to zero,
+// so this bead could never reach the threshold however long it looped.
+func TestSpawnStormDetectCountsARenameAsNoProgress(t *testing.T) {
+	cityDir := t.TempDir()
+	binDir := t.TempDir()
+	stateDir := t.TempDir()
+	eventsFile := filepath.Join(t.TempDir(), "events.jsonl")
+	gcLog := filepath.Join(t.TempDir(), "gc.log")
+
+	writeSpawnStormEvents(t, eventsFile,
+		spawnStormEventWithProgress(1, "ga-rename", "in_progress", "rig/seat-a", "Seat dies at branch-setup", "polecat/ga-rename-seat-a", "", ""),
+		spawnStormEventWithProgress(2, "ga-rename", "open", "", "Seat dies at branch-setup", "polecat/ga-rename-seat-a", "", ""),
+		spawnStormEventWithProgress(3, "ga-rename", "in_progress", "rig/seat-b", "Seat dies at branch-setup", "polecat/ga-rename-seat-b", "", ""),
+		spawnStormEventWithProgress(4, "ga-rename", "open", "", "Seat dies at branch-setup", "polecat/ga-rename-seat-b", "", ""),
+		spawnStormEventWithProgress(5, "ga-rename", "in_progress", "rig/seat-c", "Seat dies at branch-setup", "polecat/ga-rename-seat-c", "", ""),
+		spawnStormEventWithProgress(6, "ga-rename", "open", "", "Seat dies at branch-setup", "polecat/ga-rename-seat-c", "", ""),
+	)
+	env := spawnStormEnv(t, binDir, stateDir, cityDir, eventsFile, gcLog)
+	runScript(t, coreScriptPath("spawn-storm-detect.sh"), env)
+
+	ledger := readSpawnStormLedger(t, filepath.Join(stateDir, "spawn-storm-counts.json"))
+	bead := ledger.Beads["ga-rename"]
+	if bead.Resets != 3 {
+		t.Fatalf("three resets with only the branch name changing, count = %d, want 3", bead.Resets)
+	}
+	// The compared string is where the fix lives. A name in here is the bug.
+	if strings.Contains(bead.Progress, "polecat/") {
+		t.Fatalf("the branch name is back in the compared line: %q", bead.Progress)
+	}
+	// The mayor is still told the name, from the field that is never compared.
+	if bead.BranchSeen != "polecat/ga-rename-seat-c" {
+		t.Fatalf("branch_seen = %q, want the last name the bead wore", bead.BranchSeen)
+	}
+
+	gcData, err := os.ReadFile(gcLog)
+	if err != nil {
+		t.Fatalf("ReadFile(gc log): %v", err)
+	}
+	log := string(gcData)
+	if got := strings.Count(log, "SPAWN_STORM: bead ga-rename"); got != 1 {
+		t.Fatalf("want exactly 1 spawn storm mail, got %d:\n%s", got, log)
+	}
+	if !strings.Contains(log, "branch last seen on this bead: polecat/ga-rename-seat-c") {
+		t.Fatalf("the mail does not show the mayor the branch:\n%s", log)
 	}
 }
 
