@@ -6600,17 +6600,35 @@ func TestDoltDoctorScriptUsesExplicitSQLTarget(t *testing.T) {
 	}
 }
 
-// The spawn-storm tests below were rewritten for hq-2yztr2. The detector used
-// to list open unassigned beads and add 1 to each on every run, so its "reset
-// count" was really a run count. It now walks bead state changes from the city
-// event stream and counts one reset per move from held to free. The tests
-// stub `gc events` with a file of event lines and `gc mail send` with a log.
+// The spawn-storm tests below were rewritten twice.
+//
+// hq-2yztr2: the detector used to list open unassigned beads and add 1 to each
+// on every run, so its "reset count" was really a run count. It now walks bead
+// state changes from the city event stream and counts one reset per move from
+// held to free.
+//
+// hq-hehd2m: counting real resets was still wrong, because the town's ordinary
+// refusal-and-fix round IS a reset. The detector now builds one line from the
+// bead's branch, its rejected_at_sha and its PR, and a reset whose line moved
+// sets the count back to zero. Only resets with that line standing still are
+// counted, and the threshold rose from 2 to 3.
+//
+// The tests stub `gc events` with a file of event lines and `gc mail send`
+// with a log.
 
 // spawnStormEvent renders one event line in the shape `gc events` prints.
 func spawnStormEvent(seq int, id, status, assignee, title string) string {
 	return fmt.Sprintf(
 		`{"seq":%d,"type":"bead.updated","ts":"2026-09-20T12:00:00Z","subject":%q,"payload":{"bead":{"id":%q,"status":%q,"assignee":%q,"title":%q}}}`,
 		seq, id, id, status, assignee, title)
+}
+
+// spawnStormEventWithProgress renders an event carrying the three metadata
+// fields the detector reads to decide whether the work moved.
+func spawnStormEventWithProgress(seq int, id, status, assignee, title, branch, rejectedAtSHA, prURL string) string {
+	return fmt.Sprintf(
+		`{"seq":%d,"type":"bead.updated","ts":"2026-09-20T12:00:00Z","subject":%q,"payload":{"bead":{"id":%q,"status":%q,"assignee":%q,"title":%q,"metadata":{"branch":%q,"rejected_at_sha":%q,"pr_url":%q}}}}`,
+		seq, id, id, status, assignee, title, branch, rejectedAtSHA, prURL)
 }
 
 func spawnStormClosedEvent(seq int, id string) string {
@@ -6625,11 +6643,12 @@ type spawnStormLedger struct {
 	Runs      int `json:"runs"`
 	CursorSeq int `json:"cursor_seq"`
 	Beads     map[string]struct {
-		State   string `json:"state"`
-		Resets  int    `json:"resets"`
-		Mailed  int    `json:"mailed"`
-		SeenRun int    `json:"seen_run"`
-		Title   string `json:"title"`
+		State    string `json:"state"`
+		Resets   int    `json:"resets"`
+		Mailed   int    `json:"mailed"`
+		Progress string `json:"progress"`
+		SeenRun  int    `json:"seen_run"`
+		Title    string `json:"title"`
 	} `json:"beads"`
 }
 
@@ -6693,11 +6712,15 @@ func TestSpawnStormDetectCountsResetsNotRuns(t *testing.T) {
 	eventsFile := filepath.Join(t.TempDir(), "events.jsonl")
 	gcLog := filepath.Join(t.TempDir(), "gc.log")
 
+	// Three bounces, because the default threshold is 3 (hq-hehd2m): two is
+	// one ordinary refusal-and-fix round, which every healthy bead has.
 	writeSpawnStormEvents(t, eventsFile,
 		spawnStormEvent(1, "ga-loop", "in_progress", "rig/seat-a", "Looping bead"),
 		spawnStormEvent(2, "ga-loop", "open", "", "Looping bead"),
 		spawnStormEvent(3, "ga-loop", "in_progress", "rig/seat-b", "Looping bead"),
 		spawnStormEvent(4, "ga-loop", "open", "", "Looping bead"),
+		spawnStormEvent(5, "ga-loop", "in_progress", "rig/seat-c", "Looping bead"),
+		spawnStormEvent(6, "ga-loop", "open", "", "Looping bead"),
 	)
 	env := spawnStormEnv(t, binDir, stateDir, cityDir, eventsFile, gcLog)
 	script := coreScriptPath("spawn-storm-detect.sh")
@@ -6706,17 +6729,17 @@ func TestSpawnStormDetectCountsResetsNotRuns(t *testing.T) {
 	runScript(t, script, env)
 
 	ledger := readSpawnStormLedger(t, ledgerPath)
-	if ledger.Version != 2 {
-		t.Fatalf("ledger version = %d, want 2", ledger.Version)
+	if ledger.Version != 3 {
+		t.Fatalf("ledger version = %d, want 3", ledger.Version)
 	}
-	if got := ledger.Beads["ga-loop"].Resets; got != 2 {
-		t.Fatalf("ga-loop was let go twice, reset count = %d, want 2", got)
+	if got := ledger.Beads["ga-loop"].Resets; got != 3 {
+		t.Fatalf("ga-loop was let go three times, reset count = %d, want 3", got)
 	}
 	gcData, err := os.ReadFile(gcLog)
 	if err != nil {
 		t.Fatalf("ReadFile(gc log): %v", err)
 	}
-	if !strings.Contains(string(gcData), "SPAWN_STORM: bead ga-loop reset 2x") {
+	if !strings.Contains(string(gcData), "SPAWN_STORM: bead ga-loop reset 3x") {
 		t.Fatalf("gc log missing the spawn storm mail:\n%s", gcData)
 	}
 	mailsAfterFirstRun := strings.Count(string(gcData), "SPAWN_STORM: bead ga-loop")
@@ -6726,8 +6749,8 @@ func TestSpawnStormDetectCountsResetsNotRuns(t *testing.T) {
 	runScript(t, script, env)
 
 	ledger = readSpawnStormLedger(t, ledgerPath)
-	if got := ledger.Beads["ga-loop"].Resets; got != 2 {
-		t.Fatalf("a run with no new event moved the count to %d, want 2", got)
+	if got := ledger.Beads["ga-loop"].Resets; got != 3 {
+		t.Fatalf("a run with no new event moved the count to %d, want 3", got)
 	}
 	gcData, err = os.ReadFile(gcLog)
 	if err != nil {
@@ -6787,19 +6810,21 @@ func TestSpawnStormDetectCountsRigBeads(t *testing.T) {
 		spawnStormEvent(2, "vn-rigwork", "open", "", "Rig side work"),
 		spawnStormEvent(3, "vn-rigwork", "in_progress", "vessel-network/other", "Rig side work"),
 		spawnStormEvent(4, "vn-rigwork", "open", "", "Rig side work"),
+		spawnStormEvent(5, "vn-rigwork", "in_progress", "vessel-network/third", "Rig side work"),
+		spawnStormEvent(6, "vn-rigwork", "open", "", "Rig side work"),
 	)
 	env := spawnStormEnv(t, binDir, stateDir, cityDir, eventsFile, gcLog)
 	runScript(t, coreScriptPath("spawn-storm-detect.sh"), env)
 
 	ledger := readSpawnStormLedger(t, filepath.Join(stateDir, "spawn-storm-counts.json"))
-	if got := ledger.Beads["vn-rigwork"].Resets; got != 2 {
-		t.Fatalf("rig bead reset count = %d, want 2", got)
+	if got := ledger.Beads["vn-rigwork"].Resets; got != 3 {
+		t.Fatalf("rig bead reset count = %d, want 3", got)
 	}
 	gcData, err := os.ReadFile(gcLog)
 	if err != nil {
 		t.Fatalf("ReadFile(gc log): %v", err)
 	}
-	if !strings.Contains(string(gcData), "SPAWN_STORM: bead vn-rigwork reset 2x") {
+	if !strings.Contains(string(gcData), "SPAWN_STORM: bead vn-rigwork reset 3x") {
 		t.Fatalf("gc log missing the rig bead mail:\n%s", gcData)
 	}
 }
@@ -6833,9 +6858,11 @@ func TestSpawnStormDetectCountsWhenEventCarriesNoTitle(t *testing.T) {
 	}
 }
 
-// A version 1 ledger holds the OLD run counts. Those numbers do not mean what
-// the new field means, so they must be dropped rather than carried forward.
-func TestSpawnStormDetectDiscardsVersionOneLedger(t *testing.T) {
+// An older ledger holds counts made by an older rule: version 1 held run
+// counts (hq-2yztr2), version 2 held every reset including the refusal-and-fix
+// rounds that are now forgiven (hq-hehd2m). Neither number means what the
+// field means today, so both are dropped rather than carried forward.
+func TestSpawnStormDetectDiscardsOlderLedger(t *testing.T) {
 	cityDir := t.TempDir()
 	binDir := t.TempDir()
 	stateDir := t.TempDir()
@@ -6843,29 +6870,42 @@ func TestSpawnStormDetectDiscardsVersionOneLedger(t *testing.T) {
 	gcLog := filepath.Join(t.TempDir(), "gc.log")
 	ledgerPath := filepath.Join(stateDir, "spawn-storm-counts.json")
 
-	if err := os.WriteFile(ledgerPath, []byte(`{"ga-stale":9}`), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	writeSpawnStormEvents(t, eventsFile,
-		spawnStormEvent(1, "ga-stale", "open", "", "Stale bead"),
-	)
-	env := spawnStormEnv(t, binDir, stateDir, cityDir, eventsFile, gcLog)
-	env["SPAWN_STORM_THRESHOLD"] = "1"
-	runScript(t, coreScriptPath("spawn-storm-detect.sh"), env)
+	for _, tc := range []struct {
+		name  string
+		stale string
+	}{
+		{"version 1 run counts", `{"ga-stale":9}`},
+		{"version 2 reset counts", `{"version":2,"runs":4,"cursor_seq":9,"beads":{"ga-stale":{"state":"free","resets":9,"mailed":0,"seen_run":4,"title":"Stale bead"}}}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := os.WriteFile(ledgerPath, []byte(tc.stale), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Remove(gcLog); err != nil && !os.IsNotExist(err) {
+				t.Fatal(err)
+			}
+			writeSpawnStormEvents(t, eventsFile,
+				spawnStormEvent(1, "ga-stale", "open", "", "Stale bead"),
+			)
+			env := spawnStormEnv(t, binDir, stateDir, cityDir, eventsFile, gcLog)
+			env["SPAWN_STORM_THRESHOLD"] = "1"
+			runScript(t, coreScriptPath("spawn-storm-detect.sh"), env)
 
-	ledger := readSpawnStormLedger(t, ledgerPath)
-	if ledger.Version != 2 {
-		t.Fatalf("ledger version = %d, want 2", ledger.Version)
-	}
-	if got := ledger.Beads["ga-stale"].Resets; got != 0 {
-		t.Fatalf("old run count was carried forward as %d resets, want 0", got)
-	}
-	gcData, err := os.ReadFile(gcLog)
-	if err != nil && !os.IsNotExist(err) {
-		t.Fatalf("ReadFile(gc log): %v", err)
-	}
-	if strings.Contains(string(gcData), "SPAWN_STORM") {
-		t.Fatalf("a discarded run count still raised a mail:\n%s", gcData)
+			ledger := readSpawnStormLedger(t, ledgerPath)
+			if ledger.Version != 3 {
+				t.Fatalf("ledger version = %d, want 3", ledger.Version)
+			}
+			if got := ledger.Beads["ga-stale"].Resets; got != 0 {
+				t.Fatalf("an older count was carried forward as %d resets, want 0", got)
+			}
+			gcData, err := os.ReadFile(gcLog)
+			if err != nil && !os.IsNotExist(err) {
+				t.Fatalf("ReadFile(gc log): %v", err)
+			}
+			if strings.Contains(string(gcData), "SPAWN_STORM") {
+				t.Fatalf("a discarded count still raised a mail:\n%s", gcData)
+			}
+		})
 	}
 }
 
@@ -6915,7 +6955,7 @@ func TestSpawnStormDetectFailsOnMalformedEventJSON(t *testing.T) {
 	eventsFile := filepath.Join(t.TempDir(), "events.jsonl")
 	ledgerPath := filepath.Join(stateDir, "spawn-storm-counts.json")
 
-	const before = `{"version":2,"runs":3,"cursor_seq":7,"beads":{"ga-existing":{"state":"free","resets":2,"mailed":2,"seen_run":3,"title":"Existing"}}}`
+	const before = `{"version":3,"runs":3,"cursor_seq":7,"beads":{"ga-existing":{"state":"free","resets":2,"mailed":2,"progress":"branch=b1 sha=none pr=none","seen_run":3,"title":"Existing"}}}`
 	if err := os.WriteFile(ledgerPath, []byte(before), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -6946,7 +6986,7 @@ func TestSpawnStormDetectPreservesLedgerWhenEventsUnavailable(t *testing.T) {
 	stateDir := t.TempDir()
 	ledgerPath := filepath.Join(stateDir, "spawn-storm-counts.json")
 
-	const before = `{"version":2,"runs":3,"cursor_seq":7,"beads":{"ga-existing":{"state":"free","resets":5,"mailed":5,"seen_run":3,"title":"Existing"}}}`
+	const before = `{"version":3,"runs":3,"cursor_seq":7,"beads":{"ga-existing":{"state":"free","resets":5,"mailed":5,"progress":"branch=b1 sha=none pr=none","seen_run":3,"title":"Existing"}}}`
 	if err := os.WriteFile(ledgerPath, []byte(before), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -7029,9 +7069,88 @@ exit 0
 	}
 }
 
+// The town's ordinary refusal-and-fix round is a reset every time: pr-review
+// refuses, the bead goes from claimed to open-and-unassigned, a polecat pushes
+// a fix, the refinery judges it at a new sha. That is the loop working, and it
+// sent the mayor 30 false alarms in four hours on 2026-09-21. Each release
+// here carries a NEW rejected_at_sha, so the work moved and nothing may be
+// said, however many rounds there are.
+func TestSpawnStormDetectForgivesResetsWhenTheWorkMoved(t *testing.T) {
+	cityDir := t.TempDir()
+	binDir := t.TempDir()
+	stateDir := t.TempDir()
+	eventsFile := filepath.Join(t.TempDir(), "events.jsonl")
+	gcLog := filepath.Join(t.TempDir(), "gc.log")
+
+	writeSpawnStormEvents(t, eventsFile,
+		spawnStormEventWithProgress(1, "ga-fix", "in_progress", "rig/seat-a", "Fix and hand back", "b1", "", ""),
+		spawnStormEventWithProgress(2, "ga-fix", "open", "", "Fix and hand back", "b1", "aaa111", ""),
+		spawnStormEventWithProgress(3, "ga-fix", "in_progress", "rig/seat-b", "Fix and hand back", "b1", "aaa111", ""),
+		spawnStormEventWithProgress(4, "ga-fix", "open", "", "Fix and hand back", "b1", "bbb222", ""),
+		spawnStormEventWithProgress(5, "ga-fix", "in_progress", "rig/seat-c", "Fix and hand back", "b1", "bbb222", ""),
+		spawnStormEventWithProgress(6, "ga-fix", "open", "", "Fix and hand back", "b1", "ccc333", ""),
+	)
+	env := spawnStormEnv(t, binDir, stateDir, cityDir, eventsFile, gcLog)
+	runScript(t, coreScriptPath("spawn-storm-detect.sh"), env)
+
+	ledger := readSpawnStormLedger(t, filepath.Join(stateDir, "spawn-storm-counts.json"))
+	// Each move set the count back to zero, so only the last reset is left.
+	if got := ledger.Beads["ga-fix"].Resets; got != 1 {
+		t.Fatalf("work moved between every reset, count = %d, want 1", got)
+	}
+	gcData, err := os.ReadFile(gcLog)
+	if err != nil && !os.IsNotExist(err) {
+		t.Fatalf("ReadFile(gc log): %v", err)
+	}
+	if strings.Contains(string(gcData), "SPAWN_STORM") {
+		t.Fatalf("a refusal-and-fix round raised a spawn storm mail:\n%s", gcData)
+	}
+}
+
+// The real fault: claimed and dropped three times with the same branch, the
+// same sha and no PR. Nobody touched the work. One mail, and it must name the
+// count and what did not move, so the reader can judge it without opening the
+// bead.
+func TestSpawnStormDetectFiresWhenNothingMovedAndNamesTheTip(t *testing.T) {
+	cityDir := t.TempDir()
+	binDir := t.TempDir()
+	stateDir := t.TempDir()
+	eventsFile := filepath.Join(t.TempDir(), "events.jsonl")
+	gcLog := filepath.Join(t.TempDir(), "gc.log")
+
+	writeSpawnStormEvents(t, eventsFile,
+		spawnStormEventWithProgress(1, "ga-dead", "in_progress", "rig/seat-a", "Seat keeps dying", "b9", "dead00", ""),
+		spawnStormEventWithProgress(2, "ga-dead", "open", "", "Seat keeps dying", "b9", "dead00", ""),
+		spawnStormEventWithProgress(3, "ga-dead", "in_progress", "rig/seat-b", "Seat keeps dying", "b9", "dead00", ""),
+		spawnStormEventWithProgress(4, "ga-dead", "open", "", "Seat keeps dying", "b9", "dead00", ""),
+		spawnStormEventWithProgress(5, "ga-dead", "in_progress", "rig/seat-c", "Seat keeps dying", "b9", "dead00", ""),
+		spawnStormEventWithProgress(6, "ga-dead", "open", "", "Seat keeps dying", "b9", "dead00", ""),
+	)
+	env := spawnStormEnv(t, binDir, stateDir, cityDir, eventsFile, gcLog)
+	runScript(t, coreScriptPath("spawn-storm-detect.sh"), env)
+
+	ledger := readSpawnStormLedger(t, filepath.Join(stateDir, "spawn-storm-counts.json"))
+	if got := ledger.Beads["ga-dead"].Resets; got != 3 {
+		t.Fatalf("three resets with nothing moving, count = %d, want 3", got)
+	}
+	gcData, err := os.ReadFile(gcLog)
+	if err != nil {
+		t.Fatalf("ReadFile(gc log): %v", err)
+	}
+	log := string(gcData)
+	if got := strings.Count(log, "SPAWN_STORM: bead ga-dead"); got != 1 {
+		t.Fatalf("want exactly 1 spawn storm mail, got %d:\n%s", got, log)
+	}
+	for _, want := range []string{"reset 3x", "branch=b9", "sha=dead00"} {
+		if !strings.Contains(log, want) {
+			t.Fatalf("the mail does not name %q:\n%s", want, log)
+		}
+	}
+}
+
 // The detector ships its own self-test. Run it here so it cannot rot: it is
-// the check that proves the rows above can fail, by re-breaking the reset test
-// and requiring the rows to catch it.
+// the check that proves the rows above can fail, by re-breaking each fix in
+// turn and requiring the rows that guard it to catch it.
 func TestSpawnStormDetectSelfTestPasses(t *testing.T) {
 	script := coreScriptPath("spawn-storm-detect.sh")
 	cmd := exec.Command(script, "--self-test")

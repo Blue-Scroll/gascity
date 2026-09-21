@@ -1,13 +1,23 @@
 # Detect beads stuck in a claim-and-release loop (a crash loop indicator).
 #
 # When the same bead keeps being claimed by a seat and pushed back to the
-# pool, something is crash looping on that piece of work. The script walks
-# bead state changes from the city event stream and counts one reset per move
-# from held (in_progress, or an assignee is set) to free (open with no
-# assignee). It mails the mayor once per NEW reset past the threshold.
+# pool WITH NOTHING MOVING, something is crash looping on that piece of work.
+# The script walks bead state changes from the city event stream and counts
+# one reset per move from held (in_progress, or an assignee is set) to free
+# (open with no assignee). It mails the mayor once per NEW reset past the
+# threshold, which is 3.
 #
-# It does NOT count its own runs. That was the old bug: a bead that simply
-# waited in a pool line collected one count and one mail per run (hq-2yztr2).
+# Two bugs are already fixed here, and both were the same mistake: calling
+# something a storm that was really the town working.
+#
+#   hq-2yztr2 - it counted its own RUNS. A bead that simply waited in a pool
+#               line collected one count and one mail per run.
+#   hq-hehd2m - it counted every reset. The town's refusal-and-fix round is a
+#               reset every time, so normal work paged the mayor: 30 mails in
+#               four hours, zero of them a crash loop. The script now builds
+#               one line from the bead's branch, its rejected_at_sha and its
+#               PR. If that line moved, somebody pushed or got re-judged, the
+#               count goes back to zero and nothing is said.
 #
 # The script asks the event stream for SPAWN_STORM_WINDOW (default 1h), which
 # must stay comfortably longer than the interval below, because a reset
