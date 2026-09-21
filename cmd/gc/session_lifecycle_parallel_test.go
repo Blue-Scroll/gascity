@@ -854,6 +854,92 @@ func TestPrepareStartCandidate_UsesAssignedWorkSnapshotForTaskWorkDir(t *testing
 	}
 }
 
+// hq-jw5qlu: a task bead whose work_dir names ANOTHER open session's home
+// directory must not move this session into that tree. The stale field used
+// to become GC_DIR and the pane's cwd, so the agent worked in a live
+// neighbour's worktree, and every "am I in my own tree?" check passed because
+// it compared against the same poisoned GC_DIR. Both the snapshot resolver
+// (the reconciler path) and the live store lookup are covered.
+func TestPrepareStartCandidate_RefusesTaskWorkDirOwnedByAnotherSession(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		withSnapshot bool
+	}{
+		{name: "live lookup"},
+		{name: "assigned-work snapshot", withSnapshot: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := beads.NewMemStore()
+			ownDir := t.TempDir()
+			neighbourDir := t.TempDir()
+			self, err := store.Create(beads.Bead{
+				Title:  "wrecka",
+				Type:   sessionBeadType,
+				Labels: []string{sessionBeadLabel, "agent:rig/wrecka"},
+				Metadata: map[string]string{
+					"template":     "rig/polecat",
+					"session_name": "rig--wrecka",
+					"work_dir":     ownDir,
+				},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := store.Create(beads.Bead{
+				Title:  "capable",
+				Type:   sessionBeadType,
+				Labels: []string{sessionBeadLabel, "agent:rig/capable"},
+				Metadata: map[string]string{
+					"template":     "rig/polecat",
+					"session_name": "rig--capable",
+					"work_dir":     neighbourDir,
+				},
+			}); err != nil {
+				t.Fatal(err)
+			}
+			// The bead was last worked in capable's tree, then re-slung to wrecka.
+			task, err := store.Create(beads.Bead{
+				Title:    "re-slung task",
+				Metadata: map[string]string{"work_dir": neighbourDir},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			status := "in_progress"
+			assignee := self.ID
+			if err := store.Update(task.ID, beads.UpdateOpts{Status: &status, Assignee: &assignee}); err != nil {
+				t.Fatal(err)
+			}
+			task, err = store.Get(task.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var resolver taskWorkDirResolver
+			if tc.withSnapshot {
+				resolver = newAssignedTaskWorkDirResolver("", []beads.Bead{task})
+			}
+
+			prepared, err := prepareStartCandidateForCity(startCandidate{
+				info: sessiontest.SeedBead(t, self),
+				tp: TemplateParams{
+					TemplateName: "rig/polecat",
+					SessionName:  "rig--wrecka",
+					WorkDir:      ownDir,
+				},
+			}, "", "", &config.City{}, nil, store, &clock.Fake{Time: time.Date(2026, 9, 21, 12, 0, 0, 0, time.UTC)}, nil, resolver)
+			if err != nil {
+				t.Fatalf("prepareStartCandidateForCity: %v", err)
+			}
+			if prepared.cfg.WorkDir != ownDir {
+				t.Fatalf("prepared.cfg.WorkDir = %q, want own dir %q (not the neighbour's %q)", prepared.cfg.WorkDir, ownDir, neighbourDir)
+			}
+			if got := prepared.cfg.Env["GC_DIR"]; got != ownDir {
+				t.Fatalf("GC_DIR = %q, want own dir %q", got, ownDir)
+			}
+		})
+	}
+}
+
 func TestPrepareStartCandidateReloadsOverridesBeforeWake(t *testing.T) {
 	store := beads.NewMemStore()
 	session, err := store.Create(beads.Bead{
