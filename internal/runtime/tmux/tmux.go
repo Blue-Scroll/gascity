@@ -2105,6 +2105,9 @@ func (t *Tmux) sendNudgeSubmitSequence(target string, keys []string) error {
 // After sending, triggers SIGWINCH to wake Claude in detached sessions.
 // Verification is the Witness's job (AI), not this function.
 //
+// Returns ErrNudgeInputOccupied, and types nothing, when the input box already
+// holds text a person typed and did not send (see guardUnsentInput).
+//
 // If the agent TUI hasn't initialized yet (cold startup), retries with backoff
 // up to NudgeReadyTimeout before giving up. See sendKeysLiteralWithRetry.
 //
