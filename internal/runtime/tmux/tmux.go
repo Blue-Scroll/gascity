@@ -1812,6 +1812,12 @@ func (t *Tmux) sendHiddenAttachedText(target, text string) (bool, error) {
 	// trailing Enter is delivered, so a later GetSessionActivity discounts gc's
 	// echo instead of counting this nudge as the agent responding (see
 	// discountPokeActivity). A failed write records nothing.
+	// The hidden client's trailing Enter submits the whole box, exactly like
+	// NudgeSession's, so it needs the same guard (hq-ibmvf).
+	if err := t.guardUnsentInput(target); err != nil {
+		return true, err
+	}
+	_ = t.recordNudgeDraft(target, text)
 	commitPoke := t.beginPoke(target)
 	if err := client.write([]byte(text)); err != nil {
 		return true, err
@@ -2146,6 +2152,13 @@ func (t *Tmux) NudgeSession(session, message string) error {
 	// below remains for the submit Enter.
 	t.WakePaneIfDetached(session)
 
+	// 0. Never paste into a box that holds somebody's unsent words: the Enter
+	// below would submit them too (hq-ibmvf).
+	if err := t.guardUnsentInput(target); err != nil {
+		return err
+	}
+	_ = t.recordNudgeDraft(target, message)
+
 	// 1. Send text in literal mode with retry on transient errors
 	if err := t.sendKeysLiteralWithRetry(target, message, t.cfg.NudgeReadyTimeout); err != nil {
 		return err
@@ -2197,6 +2210,10 @@ func (t *Tmux) NudgeSession(session, message string) error {
 			return fmt.Errorf("failed to send submit sequence: %w", err)
 		}
 		delivered = true
+		if confirmed {
+			// The box is empty again, so the draft marker has done its job.
+			_ = t.RemoveEnvironment(target, nudgeDraftEnvKey)
+		}
 		if !confirmed {
 			// Do NOT collapse this to nil: a caller that treats nil as "clean
 			// delivery" would ack a queued nudge for a message that may still
@@ -2249,6 +2266,12 @@ func (t *Tmux) NudgePane(pane, message string) error {
 			commitPoke()
 		}
 	}()
+
+	// 0. Never paste into a box that holds somebody's unsent words (hq-ibmvf).
+	if err := t.guardUnsentInput(pane); err != nil {
+		return err
+	}
+	_ = t.recordNudgeDraft(pane, message)
 
 	// 1. Send text in literal mode with retry on transient errors
 	if err := t.sendKeysLiteralWithRetry(pane, message, t.cfg.NudgeReadyTimeout); err != nil {
