@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -327,6 +328,14 @@ type memoryOrderDispatcher struct {
 	lastRunCache         map[string]time.Time
 	gateBackoffUntil     map[string]time.Time
 	openWorkSuppression  map[string]orderOpenWorkSuppression
+	// dueMisses counts, per scoped order, the consecutive ticks it was DUE and
+	// did not get one of the tick's dispatch slots. It is the period of an
+	// order that declares none: see scoreDispatchUrgency. Entries live only
+	// while an order is waiting (a pick or an undue tick deletes one), so the
+	// map is bounded by the order count. A dispatcher rebuild drops the counts
+	// and they rebuild within a few ticks, which is why they are not carried
+	// the way lastRunCache and the suppression streaks are.
+	dueMisses map[string]int
 
 	dispatchCtx    context.Context
 	dispatchCancel context.CancelFunc
@@ -535,9 +544,9 @@ var orderConditionCheckConcurrency = 8
 //
 // It exists so the condition checks can run between the two halves: resolution
 // and the open-tracking gate are index-served and serial, the checks are
-// subprocesses and concurrent, and the fire loop picks serially again because the
-// dispatch budget's rotation is order-dependent. The picked orders' tracking
-// beads are then written concurrently (writeTrackingAndLaunch).
+// subprocesses and concurrent, and the due pass reads the checks' verdicts.
+// The picked orders' tracking beads are then written concurrently
+// (writeTrackingAndLaunch).
 type orderDispatchCandidate struct {
 	idx           int
 	order         orders.Order
@@ -556,6 +565,11 @@ type orderDispatchCandidate struct {
 	// conditionResult is the prefetched verdict, nil for every trigger the
 	// parallel pass does not own.
 	conditionResult *orders.TriggerResult
+
+	// urgency is how badly this order's own declared schedule is being
+	// broken, set by the due pass and spent by the budget. See
+	// orderDispatchUrgency.
+	urgency float64
 }
 
 // prefetchConditionResults runs every candidate condition check concurrently,
@@ -642,7 +656,6 @@ func (m *memoryOrderDispatcher) dispatch(ctx context.Context, cityPath string, n
 		}()
 	}()
 	trackingIndex := newOrderDispatchTrackingIndex(m.stderr)
-	budgetSpent := 0
 
 	total := len(m.aa)
 	if total == 0 {
@@ -651,13 +664,6 @@ func (m *memoryOrderDispatcher) dispatch(ctx context.Context, cityPath string, n
 	start := 0
 	if m.maxDispatchesPerTick > 0 {
 		start = m.nextDispatchStart % total
-	}
-	spendDispatchBudget := func(idx int) bool {
-		budgetSpent++
-		if m.maxDispatchesPerTick > 0 {
-			m.nextDispatchStart = (idx + 1) % total
-		}
-		return m.maxDispatchesPerTick > 0 && budgetSpent >= m.maxDispatchesPerTick
 	}
 
 	// Phase 1: resolve and open-tracking-gate every order, in rotation order.
@@ -745,21 +751,26 @@ func (m *memoryOrderDispatcher) dispatch(ctx context.Context, cityPath string, n
 
 	m.prefetchConditionResults(candidates, now)
 
-	// Phase 2: the fire loop, in the same rotation order, over the same
-	// per-order state phase 1 resolved. It only PICKS the orders to fire.
-	// Phase 3 (writeTrackingAndLaunch) writes their tracking beads at once.
-	fires := make([]*orderDispatchCandidate, 0, len(candidates))
-	// picked holds the scoped names already in fires. Phase 3 writes
+	// Phase 2a: the due pass, in rotation order, over the same per-order state
+	// phase 1 resolved. It fires nothing. It builds this tick's complete list
+	// of due orders and scores how late each one is.
+	//
+	// It evaluates EVERY candidate instead of stopping once the budget is
+	// spent, for the same reason prefetchConditionResults does: a budget
+	// smaller than the due list can only choose well from a complete picture.
+	// The extra work is cheap. A not-due order exits on its trigger check,
+	// before the open-work gate and before any per-order store read.
+	due := make([]*orderDispatchCandidate, 0, len(candidates))
+	// dueSeen holds the scoped names already on the due list. Phase 3 writes
 	// concurrently, so the same order picked twice would get two tracking
 	// beads and two runs in one tick. The gates cannot catch that: they read
 	// the store as it was before this tick wrote anything.
-	picked := make(map[string]bool, len(candidates))
+	dueSeen := make(map[string]bool, len(candidates))
 	for _, cand := range candidates {
-		idx := cand.idx
 		a := cand.order
 		storesForGate, storeKeysForGate := cand.gateStores, cand.gateStoreKeys
 		scoped := cand.scoped
-		if picked[scoped] {
+		if dueSeen[scoped] {
 			continue
 		}
 
@@ -790,12 +801,12 @@ func (m *memoryOrderDispatcher) dispatch(ctx context.Context, cityPath string, n
 		triggerOpts := cand.triggerOpts
 		if cand.triggerErr != nil {
 			// The failure is recorded by writeTrackingAndLaunch, which writes
-			// its tracking bead alongside the tick's other fires.
-			picked[scoped] = true
-			fires = append(fires, cand)
-			if spendDispatchBudget(idx) {
-				break
-			}
+			// its tracking bead alongside the tick's other fires. It has no
+			// schedule to be late against, so it takes an ordinary turn, the
+			// same as any order that declares no period.
+			cand.urgency = orderDispatchUrgencyBaseline + float64(m.dueMissCount(scoped))
+			dueSeen[scoped] = true
+			due = append(due, cand)
 			continue
 		}
 		// A condition order's verdict was already computed by the parallel pass;
@@ -823,6 +834,9 @@ func (m *memoryOrderDispatcher) dispatch(ctx context.Context, cityPath string, n
 			// resetting on them would let a flapping store hide a permanently
 			// shut gate.
 			m.clearOpenWorkSuppression(scoped)
+			// An order that is no longer due is no longer waiting, so the
+			// turns it missed are forgotten (see scoreDispatchUrgency).
+			m.clearDueMisses(scoped)
 			// A condition check killed by its deadline never proves its
 			// condition, so the order silently never fires. Surface that
 			// distinctly (normal "condition false" is not logged) so a check
@@ -892,15 +906,229 @@ func (m *memoryOrderDispatcher) dispatch(ctx context.Context, cityPath string, n
 			m.clearOpenWorkSuppression(scoped)
 		}
 
-		// Picked. The tracking bead is written below, with the other picks.
-		picked[scoped] = true
-		fires = append(fires, cand)
-		if spendDispatchBudget(idx) {
-			break
-		}
+		// Due. How late it is against its OWN interval decides whether it gets
+		// one of this tick's slots.
+		cand.urgency = m.scoreDispatchUrgency(a, scoped, result.LastRun, now)
+		dueSeen[scoped] = true
+		due = append(due, cand)
 	}
 
-	m.writeTrackingAndLaunch(ctx, cityPath, fires, &inFlight)
+	// Phase 2b: spend the budget on the orders whose own schedule is most
+	// broken. Phase 3 writes their tracking beads at once.
+	m.writeTrackingAndLaunch(ctx, cityPath, m.pickDispatchBudget(due, total), &inFlight)
+}
+
+// orderDispatchUrgencyBaseline is the score of an order that is due right now,
+// and of every order that declares no period at all.
+const orderDispatchUrgencyBaseline = 1.0
+
+// orderDispatchUrgency scores how badly an order's OWN declared schedule is
+// being broken, in units of that schedule. 1.0 is "due this instant". 3.5 means
+// an order that asked to run every 5 minutes has not run for 17.
+//
+// This is what the dispatch budget is spent by, and the reason it exists. A busy
+// city has more orders due at once than one tick can fire, so something has to
+// choose. The choice used to be rotation position, which made an order's stated
+// interval a wish rather than a promise: power-watch, the battery fuse that
+// pages Casey at 40%, asked for 5 minutes and went 17.4 while it waited its turn
+// behind 24-hour housekeeping (hq-ggxthx). Scoring by lateness in units of the
+// order's own interval means the order asking for the tightest schedule wins
+// exactly when its schedule is the one being broken, and nobody has to declare
+// themselves important.
+//
+// It cannot be gamed, which is the point. There is no "critical" flag to set.
+// The only way to rank higher is to declare a shorter interval, which is the
+// honest signal, and one an author already pays for in run cost.
+//
+// It does not starve the slow orders either. A 24-hour order that keeps losing
+// climbs past 2.0 after two days, above every 5-minute order that is merely one
+// tick late. Lateness grows without bound for everybody, so every order's turn
+// arrives.
+//
+// Orders that declare no period (cron, condition, event) cannot be late by
+// their own measure, so they score the baseline here and are given the turns
+// they have already missed by scoreDispatchUrgency, which is what the budget
+// actually sorts by. A cooldown order that has just come due scores the
+// baseline too, so declaring an interval never demotes anyone.
+//
+// A never-run order scores +Inf. It has no evidence it works at all, and the
+// score clears itself the moment it runs once.
+func orderDispatchUrgency(a orders.Order, lastRun, now time.Time) float64 {
+	interval, ok := orderDeclaredPeriod(a)
+	if !ok {
+		return orderDispatchUrgencyBaseline
+	}
+	if lastRun.IsZero() {
+		return math.Inf(1)
+	}
+	elapsed := now.Sub(lastRun)
+	if elapsed < interval {
+		// Only due orders are scored, so reaching here means the clock moved
+		// backwards between the trigger check and now. Treat it as just-due
+		// rather than letting a negative ratio sink the order below orders
+		// that declare no period at all.
+		return orderDispatchUrgencyBaseline
+	}
+	return float64(elapsed) / float64(interval)
+}
+
+// orderDeclaredPeriod returns the schedule an order can be measured late
+// against. Only a cooldown order with a usable interval has one: a cron order
+// names instants rather than a period, and condition and event orders name no
+// clock at all.
+func orderDeclaredPeriod(a orders.Order) (time.Duration, bool) {
+	if a.Trigger != "cooldown" {
+		return 0, false
+	}
+	interval, err := time.ParseDuration(a.Interval)
+	if err != nil || interval <= 0 {
+		return 0, false
+	}
+	return interval, true
+}
+
+// scoreDispatchUrgency is orderDispatchUrgency plus the turns an order has
+// already missed, and it is what the budget actually sorts by.
+//
+// The credit exists so that declaring no period cannot mean waiting forever. A
+// city whose short cooldown orders alone fill every tick would otherwise starve
+// its cron and condition orders permanently: they sit at the baseline while the
+// cooldown orders sit above it, every tick, with nothing going red. Counting
+// missed turns gives such an order the only period it has, one tick, so its
+// score climbs by 1.0 a tick until it wins. Nothing can starve: every order's
+// score grows without bound while it waits.
+//
+// A cron order is the case that makes counting right and measuring wrong. It is
+// quiet for a day and then due; counting starts from the moment it goes due, so
+// its long quiet spell buys it nothing, while a clock reading would hand it a
+// score of 200 and let it outrank every safety watch in the city.
+func (m *memoryOrderDispatcher) scoreDispatchUrgency(a orders.Order, scoped string, lastRun, now time.Time) float64 {
+	urgency := orderDispatchUrgency(a, lastRun, now)
+	if _, ok := orderDeclaredPeriod(a); ok {
+		return urgency
+	}
+	return urgency + float64(m.dueMissCount(scoped))
+}
+
+func (m *memoryOrderDispatcher) dueMissCount(scoped string) int {
+	m.cacheMu.Lock()
+	defer m.cacheMu.Unlock()
+	return m.dueMisses[scoped]
+}
+
+// noteDueMiss records that a due order did not get a slot this tick.
+func (m *memoryOrderDispatcher) noteDueMiss(scoped string) {
+	m.cacheMu.Lock()
+	defer m.cacheMu.Unlock()
+	if m.dueMisses == nil {
+		m.dueMisses = make(map[string]int)
+	}
+	m.dueMisses[scoped]++
+}
+
+// clearDueMisses forgets an order's missed turns. Called when it fires and when
+// it stops being due, so the count always means "waiting right now".
+func (m *memoryOrderDispatcher) clearDueMisses(scoped string) {
+	m.cacheMu.Lock()
+	defer m.cacheMu.Unlock()
+	delete(m.dueMisses, scoped)
+}
+
+// pickDispatchBudget spends this tick's dispatch budget on the due orders whose
+// own declared schedule is most broken, and leaves the rotation cursor on the
+// first order it could not reach.
+//
+// due arrives in rotation order and the sort is stable, so orders that are
+// equally late keep their rotation turn. That tie is the WHOLE ordering for
+// cron, condition and event orders, none of which declare a period.
+func (m *memoryOrderDispatcher) pickDispatchBudget(due []*orderDispatchCandidate, total int) []*orderDispatchCandidate {
+	if len(due) == 0 {
+		return nil
+	}
+	budget := len(due)
+	if m.maxDispatchesPerTick > 0 && m.maxDispatchesPerTick < budget {
+		budget = m.maxDispatchesPerTick
+	}
+	ranked := append([]*orderDispatchCandidate(nil), due...)
+	sort.SliceStable(ranked, func(i, j int) bool {
+		return ranked[i].urgency > ranked[j].urgency
+	})
+	fires := ranked[:budget]
+	picked := make(map[string]bool, len(fires))
+	for _, cand := range fires {
+		picked[cand.scoped] = true
+		m.reportLateDispatch(cand)
+	}
+	for _, cand := range due {
+		if picked[cand.scoped] {
+			m.clearDueMisses(cand.scoped)
+			continue
+		}
+		m.noteDueMiss(cand.scoped)
+	}
+	if m.maxDispatchesPerTick > 0 {
+		m.advanceRotation(due, picked, total)
+	}
+	return fires
+}
+
+// advanceRotation leaves the rotation cursor on the first order that was DUE
+// this tick and did not get a slot, so the next tick starts with whoever this
+// one could not reach.
+//
+// When every due order fired, that is one past the last of them, which is
+// exactly what the old advance-on-every-pick cursor produced. What it fixes is
+// the case the urgency sort introduces: a pick taken out of rotation order must
+// not carry the cursor past an order that is still waiting, because an order
+// with no declared period has nothing BUT its turn.
+func (m *memoryOrderDispatcher) advanceRotation(due []*orderDispatchCandidate, picked map[string]bool, total int) {
+	if total <= 0 {
+		return
+	}
+	last := -1
+	for _, cand := range due {
+		if !picked[cand.scoped] {
+			m.nextDispatchStart = cand.idx % total
+			return
+		}
+		last = cand.idx
+	}
+	if last >= 0 {
+		m.nextDispatchStart = (last + 1) % total
+	}
+}
+
+// orderLateDispatchFactor is how far past its own interval an order must have
+// fallen before firing it is worth a line in the controller log. 2 means the
+// order missed at least one whole turn.
+const orderLateDispatchFactor = 2.0
+
+// reportLateDispatch names an order that is firing well after its own declared
+// interval.
+//
+// Silence is what made hq-ggxthx take a hand audit to find: an order reports
+// success whenever it finally runs, so a 5-minute safety watch running every 17
+// minutes reads exactly like a healthy one. `gc doctor`'s order-firing-current
+// check answers the same question on demand; this is the line that lands at the
+// moment it happens, in the log the dispatcher already writes to.
+//
+// It speaks only for orders that GOT a slot, so a starved order cannot turn it
+// into a per-tick stream: the worst case is one line per real run. A never-run
+// order (+Inf) is not late. It has no schedule to have missed yet.
+func (m *memoryOrderDispatcher) reportLateDispatch(cand *orderDispatchCandidate) {
+	if cand == nil || math.IsInf(cand.urgency, 1) || cand.urgency < orderLateDispatchFactor {
+		return
+	}
+	interval, ok := orderDeclaredPeriod(cand.order)
+	if !ok {
+		// An order with no declared period cannot be late. Its score above the
+		// baseline is missed turns, which is the budget being fair to it, not
+		// a fault to report.
+		return
+	}
+	logDispatchError(m.stderr,
+		"gc: order dispatch: %s fired late, %.1fx its %s interval. More orders come due at once than the dispatch budget fires, or the controller was down.",
+		cand.scoped, cand.urgency, interval)
 }
 
 // defaultMaxOrderDispatchesPerTick is the dispatch budget when city.toml sets
@@ -909,8 +1137,15 @@ func (m *memoryOrderDispatcher) dispatch(ctx context.Context, cityPath string, n
 //
 // It was 4 while the writes ran one after another. At 4, a city with 50
 // orders gave each order one turn every 12.5 ticks, so a 3 minute order ran
-// every 25 to 45 minutes (hq-xe7ohr). 16 covers every order due in a normal
-// tick and still spreads a cold start's backlog over a few ticks.
+// every 25 to 45 minutes (hq-xe7ohr). 16 spreads a cold start's backlog over
+// a few ticks.
+//
+// It does NOT cover every order a busy city has due at once, and it was once
+// written here that it did. Measured 2026-09-22 on a 75-order city: about 19
+// orders came due on a normal tick against a budget of 16 (hq-ggxthx). That
+// is why WHICH 16 is the load-bearing question, and why pickDispatchBudget
+// answers it by lateness rather than by rotation position. Raising the budget
+// is not the cure: hq-xe7ohr measured 8 and got the same throughput as 4.
 const defaultMaxOrderDispatchesPerTick = 16
 
 // orderTrackingWriteConcurrency bounds how many tracking beads one tick

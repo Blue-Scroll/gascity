@@ -45,6 +45,8 @@ jobs:
         run: |
           go test ./internal/agentutil/ -run 'TestAgentReachesWorkflowStore|TestAgentIsCrossStoreEligible' -count=1 -v
           go test ./internal/sling/ -run 'TestValidateBuiltInRouteStoreReachableAllowsCityScopedTarget|TestDoSlingRefusesCrossStore' -count=1 -v
+      - name: Unit tests, the dispatch budget goes to the most overdue order (hq-ggxthx)
+        run: go test ./cmd/gc/ -run 'TestOrderDispatchUrgency|TestOrderDispatchBudget|TestOrderDispatchMissedTurns|TestOrderDispatchRotationResumes|TestOrderDispatchRespectsMaxDispatchesPerTick|TestOrderDispatchMaxDispatchesPerTickConfig|TestOrderDispatchTriggerEnvFailuresRespectMaxDispatchesPerTick' -count=1 -v
       - name: Unit tests — order scope (#2830)
         run: go test ./internal/orders/ -run 'TestParseScope|TestValidateRejectsUnknownScope|TestValidateAcceptsCityAndRigScope|TestParseEnv' -count=1 -v
       - name: Unit tests — scale from zero (#2819)

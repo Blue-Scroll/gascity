@@ -10352,7 +10352,7 @@ func TestOrderDispatchMaxDispatchesPerTickConfig(t *testing.T) {
 		FormulaLayer: sharedTestFormulaDir,
 	}}
 
-	// Unset (zero) preserves the historical default of 4.
+	// Unset (zero) falls back to defaultMaxOrderDispatchesPerTick.
 	cfgDefault := &config.City{}
 	adDefault := buildOrderDispatcherFromOrderSet(nil, t.TempDir(), cfgDefault, aa, events.Discard, &bytes.Buffer{})
 	mDefault, ok := adDefault.(*memoryOrderDispatcher)
