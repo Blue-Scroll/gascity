@@ -418,6 +418,9 @@ func TestResolveAgentIdentityUsesRigContextForScopeUnqualifiedControlDispatcher(
 }
 
 func TestEmitLoadCityConfigWarningsFiltersNonMigrationWarnings(t *testing.T) {
+	// The advisories are off unless an operator asks (vn-ha102kr). This test
+	// is about which warnings survive the filter, so turn them on.
+	t.Setenv(configAdvisoryEnv, "1")
 	var stderr bytes.Buffer
 	emitLoadCityConfigWarnings(&stderr, &config.Provenance{
 		Warnings: []string{

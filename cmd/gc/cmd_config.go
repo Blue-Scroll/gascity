@@ -69,7 +69,11 @@ func newConfigShowCmd(stdout, stderr io.Writer) *cobra.Command {
 Loads city.toml with all includes, packs, patches, and overrides,
 then outputs the merged result. Use --validate to check for errors
 without printing. Use --provenance to see which file contributed each
-config element. Use -f to layer additional config files.`,
+config element. Use -f to layer additional config files.
+
+This is where config-load warnings live. Other gc commands do not print
+them, so their stderr stays free for real errors. Set GC_CONFIG_WARNINGS=1
+to print them on every command too.`,
 		Example: `  gc config show
   gc config show --validate
   gc config show --provenance

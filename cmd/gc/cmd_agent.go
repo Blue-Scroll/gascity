@@ -105,11 +105,42 @@ var loadCityConfigDefaultWarningWriter = func() io.Writer {
 // mode and to stderr otherwise, so `--json` output stays clean for scripting on
 // every command (extending c806e54a3's rig-list fix uniformly). Hard load errors
 // are unaffected — they always go to stderr with a non-zero exit.
+//
+// This still earns its place after the configAdvisoryEnv gate below: when an
+// operator does turn the advisories on, `--json` output stays clean anyway.
 func configWarnWriter(jsonOut bool, stderr io.Writer) io.Writer {
 	if jsonOut {
 		return io.Discard
 	}
 	return stderr
+}
+
+// configAdvisoryEnv turns the config-load advisories back on for one command.
+// Set it to any value strconv.ParseBool reads as true.
+const configAdvisoryEnv = "GC_CONFIG_WARNINGS"
+
+// configAdvisoriesEnabled reports whether this command prints the config-load
+// advisories. It is false unless an operator asks, and that default is the
+// point of the whole gate.
+//
+// These advisories are derived from city.toml, so they are identical on every
+// command and nothing acts on them. One city had eight of them, which meant
+// eight lines of stderr before every `gc` invocation did any work. Scripts
+// answered the only way they could, with `2>/dev/null`, and that threw away
+// gc's real errors too: `gc events --since 12h 2>/dev/null | wc -l` printed 0
+// for a request that had actually timed out, which reads exactly like a quiet
+// town (vn-ha102kr).
+//
+// So stderr on a one-shot command is reserved for something going wrong. The
+// advisories keep their permanent home in `gc config show`, which prints every
+// load warning unfiltered.
+func configAdvisoriesEnabled() bool {
+	raw := strings.TrimSpace(os.Getenv(configAdvisoryEnv))
+	if raw == "" {
+		return false
+	}
+	enabled, err := strconv.ParseBool(raw)
+	return err == nil && enabled
 }
 
 func resolveLoadCityConfigWarningWriter(warningWriter ...io.Writer) io.Writer {
@@ -121,7 +152,16 @@ func resolveLoadCityConfigWarningWriter(warningWriter ...io.Writer) io.Writer {
 	return loadCityConfigDefaultWarningWriter()
 }
 
+// emitLoadCityConfigWarnings prints the soft config-load advisories for a
+// one-shot gc command. It writes nothing unless configAdvisoriesEnabled says
+// an operator asked for them, so a new advisory added to
+// shouldEmitLoadCityConfigWarning is quiet by default and cannot re-flood
+// stderr. Anything that really went wrong is an error, not a warning, and
+// takes the error path with a non-zero exit.
 func emitLoadCityConfigWarnings(w io.Writer, prov *config.Provenance) {
+	if !configAdvisoriesEnabled() {
+		return
+	}
 	if w == nil || prov == nil || len(prov.Warnings) == 0 {
 		return
 	}

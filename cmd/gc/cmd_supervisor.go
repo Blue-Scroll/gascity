@@ -2505,6 +2505,12 @@ func emitCityUnregisterTerminalEvent(rec events.Recorder, requestID, cityName, p
 
 var supervisorLoadWarningSeen sync.Map
 
+// emitSupervisorLoadCityConfigWarnings keeps printing the soft config-load
+// advisories, unlike the one-shot CLI path in cmd_agent.go. The supervisor is
+// long lived, so supervisorLoadWarningSeen already holds each advisory to one
+// line per city for the whole process. That lands in a daemon log a person
+// reads on purpose, not on the stderr of every `gc` a script runs, so it was
+// never the noise that made scripts write `2>/dev/null` (vn-ha102kr).
 func emitSupervisorLoadCityConfigWarnings(w io.Writer, cityPath string, prov *config.Provenance) {
 	if w == nil || prov == nil || len(prov.Warnings) == 0 {
 		return
