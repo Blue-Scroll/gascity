@@ -3015,3 +3015,112 @@ func writeGcBdProbeScript(t *testing.T, path, identity string) {
 		t.Fatal(err)
 	}
 }
+
+// TestResolveBdScopeTargetCityNameAddressesCityStore pins the fix for
+// vn-qaqxrr0. Session, agent and mail beads live ONLY in the city (HQ) store,
+// never in a rig store. `gc rig list` prints the HQ as a rig under the city's
+// own name, but that name is not in cfg.Rigs, so `--rig <city name>` used to
+// exit 1 with "rig not found" and the one store holding those beads had no
+// --rig spelling at all. That dead end is what made a session bead read as
+// invisible: `gc bd show hq-xxx` works from a rig (the bead id in the args
+// auto-detects the city store) while `gc bd list` has no id to detect and
+// silently reads the rig store, which holds zero session beads.
+func TestResolveBdScopeTargetCityNameAddressesCityStore(t *testing.T) {
+	setCwd(t, t.TempDir())
+	cityDir := filepath.Join(t.TempDir(), "city")
+
+	// City named "bluescroll" (HQ prefix "hq"), with one unrelated rig. No rig
+	// shares the city's name here, so the city branch is reachable.
+	cfg := func() *config.City {
+		return &config.City{
+			Workspace: config.Workspace{Name: "bluescroll", Prefix: "hq"},
+			Rigs: []config.Rig{
+				{Name: "vessel-network", Path: filepath.Join("rigs", "vessel-network"), Prefix: "vn"},
+			},
+		}
+	}
+	wantCity := execStoreTarget{ScopeRoot: cityDir, ScopeKind: "city", Prefix: "hq"}
+
+	t.Run("city name resolves to the city store", func(t *testing.T) {
+		got, err := resolveBdScopeTarget(cfg(), cityDir, "bluescroll", []string{"list", "--type", "session"}, false, io.Discard)
+		if err != nil {
+			t.Fatalf("resolveBdScopeTarget(--rig bluescroll) error = %v, want the city store", err)
+		}
+		if got != wantCity {
+			t.Fatalf("resolveBdScopeTarget(--rig bluescroll) = %#v, want %#v", got, wantCity)
+		}
+	})
+
+	t.Run("city name is case insensitive like a rig name", func(t *testing.T) {
+		got, err := resolveBdScopeTarget(cfg(), cityDir, "BlueScroll", []string{"list"}, false, io.Discard)
+		if err != nil {
+			t.Fatalf("resolveBdScopeTarget(--rig BlueScroll) error = %v", err)
+		}
+		if got != wantCity {
+			t.Fatalf("resolveBdScopeTarget(--rig BlueScroll) = %#v, want %#v", got, wantCity)
+		}
+	})
+
+	t.Run("a real rig is untouched", func(t *testing.T) {
+		got, err := resolveBdScopeTarget(cfg(), cityDir, "vessel-network", []string{"list"}, false, io.Discard)
+		if err != nil {
+			t.Fatalf("resolveBdScopeTarget(--rig vessel-network) error = %v", err)
+		}
+		want := execStoreTarget{
+			ScopeRoot: filepath.Join(cityDir, "rigs", "vessel-network"),
+			ScopeKind: "rig",
+			Prefix:    "vn",
+			RigName:   "vessel-network",
+		}
+		if got != want {
+			t.Fatalf("resolveBdScopeTarget(--rig vessel-network) = %#v, want %#v", got, want)
+		}
+	})
+
+	// The HQ bead prefix is deliberately NOT accepted: --rig takes names and
+	// not prefixes for every other store, so "hq" must fail the same way "vn"
+	// does. It has to teach the working spelling instead of swallowing it.
+	t.Run("hq prefix is refused but names the city", func(t *testing.T) {
+		_, err := resolveBdScopeTarget(cfg(), cityDir, "hq", []string{"list"}, false, io.Discard)
+		if err == nil {
+			t.Fatal("resolveBdScopeTarget(--rig hq) succeeded, want an error naming the city")
+		}
+		for _, want := range []string{`rig "hq" not found`, "--rig bluescroll", "--city"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Fatalf("resolveBdScopeTarget(--rig hq) error = %q, want it to contain %q", err.Error(), want)
+			}
+		}
+	})
+
+	t.Run("an unknown name still errors and names the city", func(t *testing.T) {
+		_, err := resolveBdScopeTarget(cfg(), cityDir, "nonexistent", []string{"list"}, false, io.Discard)
+		if err == nil {
+			t.Fatal("resolveBdScopeTarget(--rig nonexistent) succeeded, want an error")
+		}
+		if !strings.Contains(err.Error(), "--rig bluescroll") {
+			t.Fatalf("resolveBdScopeTarget(--rig nonexistent) error = %q, want it to name the city store", err.Error())
+		}
+	})
+}
+
+// TestResolveBdScopeTargetRigWinsOverSameNamedCity pins the precedence:
+// rigByName is asked FIRST, so a city whose name is also a rig name keeps
+// resolving to the rig. cfgForTest's city is named "gascity" and it also
+// declares a rig called "gascity", which is exactly that collision.
+func TestResolveBdScopeTargetRigWinsOverSameNamedCity(t *testing.T) {
+	setCwd(t, t.TempDir())
+	cityDir := filepath.Join(t.TempDir(), "city")
+	cfg := &config.City{
+		Workspace: config.Workspace{Name: "gascity"},
+		Rigs: []config.Rig{
+			{Name: "gascity", Path: filepath.Join("rigs", "gascity"), Prefix: "gc"},
+		},
+	}
+	got, err := resolveBdScopeTarget(cfg, cityDir, "gascity", []string{"list"}, false, io.Discard)
+	if err != nil {
+		t.Fatalf("resolveBdScopeTarget(--rig gascity) error = %v", err)
+	}
+	if got.ScopeKind != "rig" {
+		t.Fatalf("resolveBdScopeTarget(--rig gascity) = %#v, want the RIG store: a declared rig must win over the city of the same name", got)
+	}
+}

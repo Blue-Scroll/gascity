@@ -678,7 +678,16 @@ func resolveBdScopeTarget(cfg *config.City, cityPath, rigName string, args []str
 	if rigName != "" {
 		rig, ok := rigByName(cfg, rigName)
 		if !ok {
-			return execStoreTarget{}, fmt.Errorf("rig %q not found", rigName)
+			// `gc rig list` prints the HQ as a rig, under the city's own
+			// name. That name is not in cfg.Rigs, so rigByName misses it and
+			// --rig used to dead-end on the ONE store that holds every
+			// session, agent and mail bead. Accept the name the listing
+			// shows, so what you read is what you can type. A real rig of the
+			// same name still wins: rigByName is asked first.
+			if bdNamesCityScope(cfg, cityPath, rigName) {
+				return bdCityScopeTarget(cityPath, cfg), nil
+			}
+			return execStoreTarget{}, fmt.Errorf("rig %q not found%s", rigName, bdCityScopeHint(cfg, cityPath))
 		}
 		if strings.TrimSpace(rig.Path) == "" {
 			return execStoreTarget{}, fmt.Errorf("rig %q is declared but has no path binding — run `gc rig add <dir> --name %s` to bind it before scoping bd commands", rig.Name, rig.Name)
@@ -818,4 +827,30 @@ func bdCityScopeTarget(cityPath string, cfg *config.City) execStoreTarget {
 		ScopeKind: "city",
 		Prefix:    config.EffectiveHQPrefix(cfg),
 	}
+}
+
+// bdNamesCityScope reports whether name addresses the city (HQ) store.
+//
+// It accepts the city name only, never the HQ bead prefix. --rig takes names
+// and not prefixes for every other store (`--rig vn` does not reach the
+// vessel-network rig), so taking "hq" here would make the HQ the one store
+// addressed by a rule no other store follows. bdCityScopeHint teaches the
+// prefix instead of accepting it.
+func bdNamesCityScope(cfg *config.City, cityPath, name string) bool {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return false
+	}
+	return strings.EqualFold(name, strings.TrimSpace(loadedCityName(cfg, cityPath)))
+}
+
+// bdCityScopeHint names the city store on a --rig miss. Session, agent and
+// mail beads live only there, so an agent hunting one from a rig gets the
+// working command instead of a dead end.
+func bdCityScopeHint(cfg *config.City, cityPath string) string {
+	cityName := strings.TrimSpace(loadedCityName(cfg, cityPath))
+	if cityName == "" {
+		return "; for the city (HQ) store use --city"
+	}
+	return fmt.Sprintf("; for the city (HQ) store use --rig %s or --city", cityName)
 }
