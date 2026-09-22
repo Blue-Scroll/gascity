@@ -419,6 +419,11 @@ type asyncStartTracker struct {
 	wg               sync.WaitGroup
 	stopping         bool
 	drainAckStopKeys sync.Map
+	// drainAckStopSkips remembers, per drain-ack stop key, the last reason a
+	// fenced stop was skipped. The finalizer re-queues a stop-pending session
+	// every tick, so without it the same skip line prints forever
+	// (vn-ard8cvj). A new reason (the name changed hands again) prints again.
+	drainAckStopSkips sync.Map
 	// startsInFlight counts, per session bead ID, the async starts whose
 	// goroutine is still running in THIS process. reapStaleSessionBeads reads
 	// it so a start that outlives its grace window is not closed out from
@@ -512,6 +517,25 @@ func (t *asyncStartTracker) startDrainAckStop(key string) (func(), bool) {
 		t.drainAckStopKeys.Delete(key)
 		done()
 	}, true
+}
+
+// firstDrainAckStopSkip reports whether this skip reason is new for key, and
+// records it. A nil tracker has no memory, so every skip is new.
+func (t *asyncStartTracker) firstDrainAckStopSkip(key, reason string) bool {
+	if t == nil {
+		return true
+	}
+	prev, loaded := t.drainAckStopSkips.Swap(key, reason)
+	return !loaded || prev != reason
+}
+
+// forgetDrainAckStopSkip drops the remembered skip for key once a stop for it
+// goes ahead, so a later skip for the same key is reported again.
+func (t *asyncStartTracker) forgetDrainAckStopSkip(key string) {
+	if t == nil {
+		return
+	}
+	t.drainAckStopSkips.Delete(key)
 }
 
 func (t *asyncStartTracker) wait(timeout time.Duration) bool {
