@@ -123,6 +123,7 @@ type CityRuntime struct {
 	it                      idleTracker
 	mat                     maxSessionAgeTracker
 	adt                     assignedWorkDeferTracker
+	frg                     *freshReassignGate
 	wg                      wispGC
 	od                      orderDispatcher
 	retiredOrderDispatchers []orderDispatcher
@@ -429,6 +430,7 @@ func newCityRuntime(p CityRuntimeParams) (*CityRuntime, error) {
 		it:                      it,
 		mat:                     mat,
 		adt:                     adt,
+		frg:                     newFreshReassignGate(),
 		wg:                      wg,
 		od:                      od,
 		orderSet:                orderSnapshot.Orders,
@@ -2598,6 +2600,7 @@ func (cr *CityRuntime) beadReconcileTick(ctx context.Context, result DesiredStat
 		withAsyncDrainAckStopTracker(&cr.asyncStops),
 		withMaxSessionAgeTracker(cr.mat),
 		withAssignedWorkDeferTracker(cr.adt),
+		withFreshReassignGate(cr.frg),
 		withReadyAssignedFlags(readyAssignedFlagsForBeads(result.ReadyAssigned, awakeAssignedWorkBeads, awakeAssignedStoreRefs)),
 	}
 	if bootReconcile {

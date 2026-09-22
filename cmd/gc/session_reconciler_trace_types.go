@@ -188,6 +188,7 @@ const (
 	TraceReasonPendingCreateHealed           TraceReasonCode = "pending_create_healed"
 	TraceReasonAssignedWork                  TraceReasonCode = "assigned_work"
 	TraceReasonFreshCycle                    TraceReasonCode = "fresh_cycle"
+	TraceReasonFreshCycleUnproven            TraceReasonCode = "fresh_cycle_unproven"
 	TraceReasonScaleCheck                    TraceReasonCode = "scale_check"
 	TraceReasonStart                         TraceReasonCode = "start"
 

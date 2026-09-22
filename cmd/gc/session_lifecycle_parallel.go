@@ -300,6 +300,7 @@ type startExecutionOptions struct {
 	asyncStopTracker               *asyncStartTracker
 	maxSessionAgeTr                maxSessionAgeTracker
 	assignedWorkDeferTr            assignedWorkDeferTracker
+	freshReassignGate              *freshReassignGate
 	workDirResolver                taskWorkDirResolver
 	stabilityWaiter                startStabilityWaiter
 	sessionStaleKeyDetectionWaiter sessionpkg.StaleKeyDetectionWaiter
@@ -364,6 +365,16 @@ func withMaxSessionAgeTracker(tr maxSessionAgeTracker) startExecutionOption {
 func withAssignedWorkDeferTracker(tr assignedWorkDeferTracker) startExecutionOption {
 	return func(opts *startExecutionOptions) {
 		opts.assignedWorkDeferTr = tr
+	}
+}
+
+// withFreshReassignGate installs the memory the fresh-mode reassign check
+// keeps between ticks. Nil still refuses unproven kills, but it can never
+// confirm a bead that is missing two ticks in a row, so a burned wisp does
+// not cycle its session.
+func withFreshReassignGate(gate *freshReassignGate) startExecutionOption {
+	return func(opts *startExecutionOptions) {
+		opts.freshReassignGate = gate
 	}
 }
 

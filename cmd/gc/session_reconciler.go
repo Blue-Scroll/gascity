@@ -1503,6 +1503,7 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 	}
 	maxAgeTr := reconcileOpts.maxSessionAgeTr
 	assignedWorkDeferTr := reconcileOpts.assignedWorkDeferTr
+	freshGate := reconcileOpts.freshReassignGate
 	asyncStopTracker := reconcileOpts.asyncStopTracker
 	recordPhase := func(site TraceSiteCode, name string, start time.Time, fields map[string]any) {
 		if trace != nil {
@@ -3764,20 +3765,34 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 			// restart-handoff machinery as `gc runtime request-restart`.
 			// See #1893 (controller: alive on_demand session ignores
 			// bd update --assignee).
+			//
+			// A divergence is only a suspicion. The cycle function reads the
+			// recorded bead itself and refuses unless it has really left the
+			// session (vn-9y7tkv1).
+			refusedFreshCycle := false
 			if decision.RequiresFreshCycle && info.WakeMode == "fresh" {
-				if ran, fold := cycleAliveSessionForFreshReassign(infoByID[target.info.ID], target.tp, sp, store, cfg, cb, name, decision.AssignedWorkBeadID, clk.Now(), stdout, stderr, trace); ran {
+				outcome, fold := cycleAliveSessionForFreshReassign(cityPath, infoByID[target.info.ID], target.tp, sp, store, rigStores, cfg, cb, freshGate, name, decision.AssignedWorkBeadID, clk.Now(), stdout, stderr, trace)
+				if outcome == freshCycleRan {
 					if fold != nil {
 						tick.apply(target.info.ID, fold)
 					}
 					continue
 				}
+				refusedFreshCycle = outcome == freshCycleRefused
+			} else {
+				freshGate.forget(name)
 			}
 			// Stamp currently_processing_bead_id so the next divergence
 			// check has a baseline. Backfills legacy sessions that were
 			// already alive before this metadata existed and refreshes the
 			// record after the agent picks up its next bead in resume mode.
-			if fold := recordCurrentBeadIDOnWake(target.info, sessFront, decision.AssignedWorkBeadID, stderr); fold != nil {
-				tick.apply(target.info.ID, fold)
+			// Skipped after a refused fresh cycle: the session still holds its
+			// recorded bead, and stamping the fallback would make the record
+			// name a bead the session is not working on.
+			if !refusedFreshCycle {
+				if fold := recordCurrentBeadIDOnWake(target.info, sessFront, decision.AssignedWorkBeadID, stderr); fold != nil {
+					tick.apply(target.info.ID, fold)
+				}
 			}
 			// Session is correctly awake. Cancel any non-drift drain
 			// (handles scale-back-up: agent returns to desired set while draining).
