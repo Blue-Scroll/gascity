@@ -720,26 +720,82 @@ func waitForSession(sp runtime.Provider, sessionName string, timeout time.Durati
 	return fmt.Errorf("session %q did not start within %s (bead %s may be stuck in creating state — check controller logs)", sessionName, timeout, beadID)
 }
 
+// sessionListRequest is everything "gc session list" was asked for. It is a
+// struct, not a positional argument list, because the read path now has to
+// carry a closed-history bound alongside two filters and two output flags, and
+// a bare `cmdSessionList("", "", true, 0, ...)` call reads as nothing at all.
+type sessionListRequest struct {
+	// State is the --state filter, passed through to sessionMatchesFiltersInfo
+	// verbatim ("", "active", "closed", "all", or a comma list).
+	State string
+	// Template is the --template filter.
+	Template string
+	// JSON selects the machine-readable output.
+	JSON bool
+	// ClosedLimit bounds the closed leg of the read. Closed session history
+	// grows without bound (hundreds of pool sessions a day), so a listing that
+	// includes it is always capped. Zero means defaultSessionListClosedLimit.
+	// It never bounds the open leg: open sessions are capped by the pool size
+	// already, and truncating them would hide a live session.
+	ClosedLimit int
+}
+
+// wantsClosed reports whether this request asks for closed session history.
+// It is the one place that reading rule lives: the --state filter is a comma
+// list, and either "closed" or "all" in it pulls history into the answer.
+func (r sessionListRequest) wantsClosed() bool {
+	for _, sf := range strings.Split(r.State, ",") {
+		switch strings.TrimSpace(sf) {
+		case "closed", "all":
+			return true
+		}
+	}
+	return false
+}
+
+// closedLimitOrDefault is the effective bound on the closed leg.
+func (r sessionListRequest) closedLimitOrDefault() int {
+	if r.ClosedLimit > 0 {
+		return r.ClosedLimit
+	}
+	return defaultSessionListClosedLimit
+}
+
+// defaultSessionListClosedLimit caps the closed leg when --limit is not given.
+// Closed session beads are never pruned on the read path, so an unbounded
+// history read would scan every session the town has ever run.
+const defaultSessionListClosedLimit = 200
+
 // newSessionListCmd creates the "gc session list" command.
 func newSessionListCmd(stdout, stderr io.Writer) *cobra.Command {
-	var stateFilter string
-	var templateFilter string
-	var jsonOutput bool
+	var req sessionListRequest
 	cmd := &cobra.Command{
 		Use:   "list",
 		Short: "List chat sessions",
-		Long:  `List all chat sessions. By default shows active and suspended sessions.`,
-		Args:  cobra.NoArgs,
+		Long: `List all chat sessions. By default shows active and suspended sessions.
+
+--state closed (or --state all) reads closed session history from the bead
+store, newest first, bounded by --limit. Closed rows carry the drain record:
+the REASON cell says when the controller asked a session to stop, and --json
+carries the whole record (drain_reason, drain_initiator, drain_requested_at,
+drain_canceled_at, drain_cancel_count).
+
+To see every drain the controller began, and which of them it took back:
+
+  gc session list --state closed --json |
+    jq '[.sessions[] | select(.drain_initiator == "reconciler")]'`,
+		Args: cobra.NoArgs,
 		RunE: func(_ *cobra.Command, _ []string) error {
-			if cmdSessionList(stateFilter, templateFilter, jsonOutput, stdout, stderr) != 0 {
+			if cmdSessionList(req, stdout, stderr) != 0 {
 				return errExit
 			}
 			return nil
 		},
 	}
-	cmd.Flags().StringVar(&stateFilter, "state", "", `filter by state: "active", "suspended", "closed", "all"`)
-	cmd.Flags().StringVar(&templateFilter, "template", "", "filter by template name")
-	cmd.Flags().BoolVar(&jsonOutput, "json", false, "JSON output")
+	cmd.Flags().StringVar(&req.State, "state", "", `filter by state: "active", "suspended", "closed", "all"`)
+	cmd.Flags().StringVar(&req.Template, "template", "", "filter by template name")
+	cmd.Flags().BoolVar(&req.JSON, "json", false, "JSON output")
+	cmd.Flags().IntVar(&req.ClosedLimit, "limit", 0, "max closed sessions to read with --state closed/all (default 200); does not bound open sessions")
 	return cmd
 }
 
@@ -757,16 +813,16 @@ var sessionListAPIClient = func(cityPath string) (*api.Client, string) {
 // routeSessionList dispatches `session list` to the supervisor API when a
 // controller is up; otherwise falls back to the local iterator. Emits
 // exactly one route=... log line per exit path (gated on GC_DEBUG).
-func routeSessionList(_ string, stateFilter, templateFilter string, c *api.Client, nilReason string, jsonOutput bool, stdout, stderr io.Writer) int {
+func routeSessionList(_ string, req sessionListRequest, c *api.Client, nilReason string, stdout, stderr io.Writer) int {
 	var cr api.CachedRead[[]api.SessionView]
 	return routeRead(c, "session list", nilReason, stderr,
 		func() error {
 			var err error
-			cr, err = c.ListSessions(stateFilter, templateFilter, false)
+			cr, err = c.ListSessions(req.State, req.Template, false)
 			return err
 		},
-		func() int { return renderSessionListFromAPI(cr, jsonOutput, stdout) },
-		func() int { return doSessionListFallback(stateFilter, templateFilter, jsonOutput, stdout, stderr) },
+		func() int { return renderSessionListFromAPI(cr, req.JSON, stdout) },
+		func() int { return doSessionListFallback(req, stdout, stderr) },
 	)
 }
 
@@ -916,9 +972,20 @@ func sessionViewLastActive(lastActive string) string {
 // cmdSessionList is the CLI entry point for "gc session list". It routes
 // through the supervisor API when a controller is up and falls back to the
 // local iterator otherwise.
-func cmdSessionList(stateFilter, templateFilter string, jsonOutput bool, stdout, stderr io.Writer) int {
+func cmdSessionList(req sessionListRequest, stdout, stderr io.Writer) int {
+	// Closed history never goes through the controller. The supervisor API
+	// serves the live session set it holds in memory, so a closed session is
+	// not merely missing from that answer, it can never be in it: the API
+	// would return 0 rows for --state closed while the store holds thousands.
+	// The bead store is the only thing that remembers a session that ended, so
+	// a request for history takes the store path directly (hq-qufuy's drain
+	// record is written there, and vn-erdzkzw is the cost of it being
+	// unreadable).
+	if req.wantsClosed() {
+		return doSessionListFallback(req, stdout, stderr)
+	}
 	return routeReadCmd("session list", stderr, sessionListAPIClient, func(cityPath string, c *api.Client, nilReason string) int {
-		return routeSessionList(cityPath, stateFilter, templateFilter, c, nilReason, jsonOutput, stdout, stderr)
+		return routeSessionList(cityPath, req, c, nilReason, stdout, stderr)
 	})
 }
 
@@ -940,7 +1007,8 @@ func sortSessionsCreatedDesc(sessions []session.Info) {
 }
 
 // doSessionListFallback is the direct-bd path for "gc session list".
-func doSessionListFallback(stateFilter, templateFilter string, jsonOutput bool, stdout, stderr io.Writer) int {
+func doSessionListFallback(req sessionListRequest, stdout, stderr io.Writer) int {
+	stateFilter, templateFilter, jsonOutput := req.State, req.Template, req.JSON
 	storeStderr := stderr
 	if jsonOutput {
 		storeStderr = io.Discard
@@ -1010,21 +1078,53 @@ func doSessionListFallback(stateFilter, templateFilter string, jsonOutput bool, 
 		fmt.Fprintf(stderr, "gc session list: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
 	}
-	sessions := catalog.ListFromInfos(sessionBeads.OpenInfos(), stateFilter, templateFilter)
+	// The listing feed. The snapshot deliberately drops closed rows (it is the
+	// reconciler's hot path and closed history grows without bound), so asking
+	// it for a closed session can only ever answer "none" — that was the bug in
+	// vn-erdzkzw, where --state closed documented a capability its source set
+	// could not provide. When history is asked for, the closed leg is read
+	// separately and appended here.
+	feed := sessionBeads.OpenInfos()
+	if req.wantsClosed() {
+		closed, err := loadClosedSessionInfos(sessStore, len(feed), req.closedLimitOrDefault())
+		if err != nil {
+			// The warning goes to the REAL stderr, never storeStderr, which is
+			// io.Discard on the --json path. stdout stays clean JSON either
+			// way, so a jq pipeline is unaffected and a person still sees it.
+			//
+			// This is the whole shape of vn-erdzkzw: a history question that
+			// could not be answered must not come back looking like "no
+			// history". So a read that returned NOTHING is an error, not a
+			// short list. A partial read keeps its rows and warns, because
+			// some history beats none.
+			fmt.Fprintf(stderr, "gc session list: closed session history read failed: %v\n", err) //nolint:errcheck // best-effort stderr
+			if len(closed) == 0 {
+				if jsonOutput {
+					return writeJSONError(stdout, stderr, "closed_history_failed", fmt.Sprintf("gc session list: closed session history read failed: %v", err), 1)
+				}
+				return 1
+			}
+		}
+		feed = append(feed, closed...)
+	}
+	sessions := catalog.ListFromInfos(feed, stateFilter, templateFilter)
 	sortSessionsCreatedDesc(sessions)
 
 	if jsonOutput {
 		return writeSessionListJSON(sessions, stateFilter, templateFilter, stdout, stderr)
 	}
 
-	// Build the per-session reason-projection index from the one snapshot (no
-	// duplicate query). WI-6 R5: the whole reason projection — the wake-reason
-	// classifiers AND LifecycleDisplayReasonWithLivenessInfo — now reads the typed
-	// Info snapshot (infoIndex, from OpenInfos), so the raw bead index is gone
+	// Build the per-session reason-projection index from the feed the listing
+	// was built from (no duplicate query). WI-6 R5: the whole reason projection
+	// — the wake-reason classifiers AND LifecycleDisplayReasonWithLivenessInfo —
+	// reads the typed Info snapshot (infoIndex), so the raw bead index is gone
 	// (Info.SessionCircuitState carries the last field the display reason needed).
-	openInfos := sessionBeads.OpenInfos()
-	infoIndex := make(map[string]session.Info, len(openInfos))
-	for _, in := range openInfos {
+	//
+	// It is the FEED, not OpenInfos: a closed row has to reach sessionReason
+	// with its drain record intact, or every closed row's REASON cell would
+	// read "-" for the one fact it was listed to show.
+	infoIndex := make(map[string]session.Info, len(feed))
+	for _, in := range feed {
 		infoIndex[in.ID] = in
 	}
 
@@ -1114,6 +1214,26 @@ type sessionListJSONRow struct {
 	LastNudgeDeliveredAt *time.Time `json:"last_nudge_delivered_at,omitempty"`
 	Attached             bool       `json:"attached"`
 	Closed               bool       `json:"closed"`
+
+	// The drain record, verbatim from the session bead (see the drain record
+	// keys in internal/session/lifecycle_transition.go). It says whether the
+	// controller asked this session to stop, and whether it then took that
+	// request back. It is here, on the CLI's own JSON shape, and NOT on the
+	// HTTP SessionView: the record lives on a closed bead, and the supervisor
+	// API only ever serves live sessions.
+	//
+	// DrainInitiator has a reading rule that matters. "reconciler" means the
+	// controller asked. EMPTY means either the agent stopped itself OR the
+	// session predates the record, and nothing can tell those two apart — do
+	// not read an empty initiator as "the agent chose to stop".
+	//
+	// DrainCancelCount above zero is the controller admitting it asked a
+	// working agent to stop and then took it back.
+	DrainReason      string `json:"drain_reason,omitempty"`
+	DrainInitiator   string `json:"drain_initiator,omitempty"`
+	DrainRequestedAt string `json:"drain_requested_at,omitempty"`
+	DrainCanceledAt  string `json:"drain_canceled_at,omitempty"`
+	DrainCancelCount string `json:"drain_cancel_count,omitempty"`
 }
 
 type sessionListJSON struct {
@@ -1208,6 +1328,12 @@ func sessionListJSONRows(sessions []session.Info) []sessionListJSONRow {
 			CreatedAt:     s.CreatedAt,
 			LastActive:    s.LastActive,
 			Attached:      s.Attached,
+
+			DrainReason:      s.DrainReasonMetadata,
+			DrainInitiator:   s.DrainInitiatorMetadata,
+			DrainRequestedAt: s.DrainRequestedAtMetadata,
+			DrainCanceledAt:  s.DrainCanceledAtMetadata,
+			DrainCancelCount: s.DrainCancelCountMetadata,
 		}
 		if !s.LastNudgeDeliveredAt.IsZero() {
 			stamp := s.LastNudgeDeliveredAt.UTC()
@@ -1367,13 +1493,45 @@ const (
 	circuitOpenReason  = session.LifecycleReasonCircuitOpen
 )
 
+// closedSessionDrainReason renders a closed session's REASON cell from its
+// drain record. It answers the question vn-erdzkzw was filed for: which
+// sessions did the controller ask to stop, and which of those did it take back.
+//
+// It says ONLY what the record proves. An empty drain_initiator means either
+// the agent stopped itself or the bead predates the record, and those two are
+// not distinguishable, so an empty initiator renders "-" rather than guessing.
+// Guessing is the exact mistake hq-qufuy had to undo: the old close reason said
+// "pool slot retired by reconciler" for every drain, including agents that
+// finished their work, and that sentence was then quoted back as evidence.
+//
+// --json carries the whole record for anything that needs to count.
+func closedSessionDrainReason(info session.Info) string {
+	if strings.TrimSpace(info.DrainInitiatorMetadata) != session.DrainInitiatorReconciler {
+		return "-"
+	}
+	reason := "drain=controller"
+	if code := strings.TrimSpace(info.DrainReasonMetadata); code != "" {
+		reason += ":" + code
+	}
+	// A take-back is the controller admitting it asked a working agent to stop.
+	// It is the whole point of the record, so it is never abbreviated away.
+	if n, err := strconv.Atoi(strings.TrimSpace(info.DrainCancelCountMetadata)); err == nil && n > 0 {
+		reason += fmt.Sprintf(",take-backs=%d", n)
+	}
+	return reason
+}
+
 // sessionReason computes the REASON column for a session in gc session list.
 // For awake sessions, shows wake reasons (e.g., "config", "attached").
 // For asleep sessions, shows the sleep reason (e.g., "user-hold", "quarantine").
-// For closed sessions, shows "-".
+// For closed sessions, shows the drain record (closedSessionDrainReason), or
+// "-" when there is none.
 func sessionReason(s session.Info, infoIndex map[string]session.Info, cfg *config.City, sp runtime.Provider, poolDesired map[string]int, readyWaitSet map[string]bool) string {
 	if s.State == "" {
-		return "-" // closed
+		// Closed. The wake-reason projection below is about why a LIVE session
+		// is awake or asleep, so none of it applies. What a closed row can
+		// still say is why it was asked to stop.
+		return closedSessionDrainReason(infoIndex[s.ID])
 	}
 
 	// info is the typed reason source of truth — the full snapshot Info projection

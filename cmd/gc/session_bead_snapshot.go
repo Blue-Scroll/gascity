@@ -14,8 +14,13 @@ import (
 // sessionBeadSnapshot caches active session-bead state for a single reconcile
 // cycle. Closed-session history is intentionally not loaded here: the
 // reconciler calls this several times per tick, and closed history grows
-// without bound. Callers that need a closed record must fetch that one ID
-// explicitly.
+// without bound.
+//
+// So this snapshot can never answer a question about a session that ended.
+// Filtering it for a closed row returns "none" no matter what the store holds,
+// which is how "gc session list --state closed" came to answer 0 rows forever
+// (vn-erdzkzw). Read closed rows with loadClosedSessionInfos, which is bounded,
+// or fetch one known ID explicitly.
 //
 // loadErr captures a non-fatal load failure (timeout, list error) so callers
 // can distinguish "snapshot loaded clean, the bead simply isn't present" from
@@ -97,8 +102,8 @@ func loadSessionBeadSnapshot(store beads.Store) (*sessionBeadSnapshot, error) {
 	// metadata, which Info drops) and carried as a field.
 	//
 	// Closed history is intentionally not loaded here — the reconciler calls this
-	// several times per tick and closed history grows without bound. Callers that need
-	// a closed record must fetch that one ID explicitly.
+	// several times per tick and closed history grows without bound. Callers that
+	// need closed rows use loadClosedSessionInfos (bounded), or fetch one known ID.
 	rows, fingerprint, err := sessionFrontDoor(store).ListAllForReconcileWithFingerprint(sessionpkg.ListAllOptions{})
 	if err != nil {
 		return nil, err
@@ -106,6 +111,46 @@ func loadSessionBeadSnapshot(store beads.Store) (*sessionBeadSnapshot, error) {
 	snap := newSessionBeadSnapshotFromReconcileRows(rows)
 	snap.fingerprint = fingerprint
 	return snap, nil
+}
+
+// loadClosedSessionInfos reads closed session beads, newest first. It is the
+// one supported way to see a session that has ended.
+//
+// It exists because loadSessionBeadSnapshot above deliberately drops closed
+// rows, which is right for the reconciler and wrong for anyone asking what
+// happened. Before this, "gc session list --state closed" filtered a set that
+// closed rows can never be in, so it answered 0 rows however many closed
+// sessions the store held, and the drain record hq-qufuy writes onto a session
+// bead was reachable only by guessing the bead id (vn-erdzkzw).
+//
+// limit bounds the closed rows returned. openCount is how many open session
+// beads the caller already holds, and it is added to the store-side limit for
+// one reason: the union is sorted newest-first across BOTH states, so the
+// newest (openCount + limit) session beads must contain the newest `limit`
+// closed ones — at most openCount of them can be open. Without that headroom a
+// town with a full pool would return almost no history.
+func loadClosedSessionInfos(store beads.Store, openCount, limit int) ([]sessionpkg.Info, error) {
+	if store == nil || limit <= 0 {
+		return nil, nil
+	}
+	infos, err := sessionFrontDoor(store).ListAll(sessionpkg.ListAllOptions{
+		IncludeClosed: true,
+		Sort:          beads.SortCreatedDesc,
+		Limit:         openCount + limit,
+	})
+	// A partial result still carries rows, so keep them and return the error
+	// too: the caller reports the degradation and shows what it did get.
+	closed := make([]sessionpkg.Info, 0, limit)
+	for _, in := range infos {
+		if !in.Closed {
+			continue
+		}
+		if len(closed) == limit {
+			break
+		}
+		closed = append(closed, in)
+	}
+	return closed, err
 }
 
 // newSessionBeadSnapshotFromInfos builds a snapshot from a typed session.Info feed.

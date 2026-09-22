@@ -1993,7 +1993,7 @@ func TestCmdSessionListJSONNoSessionsReturnsEmptyEnvelope(t *testing.T) {
 	writeNamedSessionCityTOML(t, cityDir)
 
 	var stdout, stderr bytes.Buffer
-	if code := cmdSessionList("", "", true, &stdout, &stderr); code != 0 {
+	if code := cmdSessionList(sessionListRequest{JSON: true}, &stdout, &stderr); code != 0 {
 		t.Fatalf("cmdSessionList(--json) = %d, want 0; stderr=%s", code, stderr.String())
 	}
 	if stderr.Len() != 0 {
@@ -2150,7 +2150,7 @@ func TestCmdSessionList_RendersLastNudgeColumn(t *testing.T) {
 	}
 
 	var stdout, stderr bytes.Buffer
-	if code := cmdSessionList("", "", false, &stdout, &stderr); code != 0 {
+	if code := cmdSessionList(sessionListRequest{}, &stdout, &stderr); code != 0 {
 		t.Fatalf("cmdSessionList() = %d, want 0; stderr=%s", code, stderr.String())
 	}
 
@@ -2230,7 +2230,7 @@ func TestCmdSessionListJSONOmitZeroLastNudgeDeliveredAt(t *testing.T) {
 	}
 
 	var stdout, stderr bytes.Buffer
-	if code := cmdSessionList("", "", true, &stdout, &stderr); code != 0 {
+	if code := cmdSessionList(sessionListRequest{JSON: true}, &stdout, &stderr); code != 0 {
 		t.Fatalf("cmdSessionList(--json) = %d, want 0; stderr=%s", code, stderr.String())
 	}
 	if strings.Contains(stdout.String(), `"last_nudge_delivered_at": "0001-01-01`) {
@@ -3275,7 +3275,7 @@ func TestRouteSessionList_SixRowMatrix(t *testing.T) {
 			}
 
 			var stdout, stderr bytes.Buffer
-			code := routeSessionList(cityPath, "", "", c, tc.nilReason, false, &stdout, &stderr)
+			code := routeSessionList(cityPath, sessionListRequest{JSON: false}, c, tc.nilReason, &stdout, &stderr)
 
 			if code != tc.wantExit {
 				t.Fatalf("exit = %d, want %d; stderr=%q stdout=%q", code, tc.wantExit, stderr.String(), stdout.String())
@@ -3318,7 +3318,7 @@ func TestRouteSessionList_APIJSONIncludesCacheAge(t *testing.T) {
 	c := api.NewCityScopedClient(srv.URL, "test-city")
 
 	var stdout, stderr bytes.Buffer
-	if code := routeSessionList(cityPath, "", "", c, "", true, &stdout, &stderr); code != 0 {
+	if code := routeSessionList(cityPath, sessionListRequest{JSON: true}, c, "", &stdout, &stderr); code != 0 {
 		t.Fatalf("exit = %d, stderr=%q", code, stderr.String())
 	}
 	var out map[string]any
@@ -3345,7 +3345,7 @@ func TestRouteSessionList_APIJSONIncludesCacheAge(t *testing.T) {
 	// fails; that itself proves the envelope is not present.
 	stdout.Reset()
 	stderr.Reset()
-	if code := routeSessionList(cityPath, "", "", nil, "controller-down", true, &stdout, &stderr); code != 0 {
+	if code := routeSessionList(cityPath, sessionListRequest{JSON: true}, nil, "controller-down", &stdout, &stderr); code != 0 {
 		t.Fatalf("fallback exit = %d, stderr=%q", code, stderr.String())
 	}
 	out = nil
@@ -3384,7 +3384,7 @@ func TestRouteSessionList_StaleBannerOver30s(t *testing.T) {
 	c := api.NewCityScopedClient(srv.URL, "test-city")
 
 	var stdout, stderr bytes.Buffer
-	if code := routeSessionList(cityPath, "", "", c, "", false, &stdout, &stderr); code != 0 {
+	if code := routeSessionList(cityPath, sessionListRequest{JSON: false}, c, "", &stdout, &stderr); code != 0 {
 		t.Fatalf("exit = %d, stderr=%q", code, stderr.String())
 	}
 	if !strings.Contains(stdout.String(), "cache age: 45s") {
