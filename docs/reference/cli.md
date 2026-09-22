@@ -4038,6 +4038,17 @@ gc session kill <session-id-or-alias> [flags]
 
 List all chat sessions. By default shows active and suspended sessions.
 
+--state closed (or --state all) reads closed session history from the bead
+store, newest first, bounded by --limit. Closed rows carry the drain record:
+the REASON cell says when the controller asked a session to stop, and --json
+carries the whole record (drain_reason, drain_initiator, drain_requested_at,
+drain_canceled_at, drain_cancel_count).
+
+To see every drain the controller began, and which of them it took back:
+
+  gc session list --state closed --json |
+    jq '[.sessions[] | select(.drain_initiator == "reconciler")]'
+
 ```
 gc session list [flags]
 ```
@@ -4045,6 +4056,7 @@ gc session list [flags]
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
 | `--json` | bool |  | JSON output |
+| `--limit` | int |  | max closed sessions to read with --state closed/all (default 200); does not bound open sessions |
 | `--state` | string |  | filter by state: "active", "suspended", "closed", "all" |
 | `--template` | string |  | filter by template name |
 
