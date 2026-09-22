@@ -55,6 +55,10 @@ jobs:
         run: go test ./internal/orders/ -run 'TestParseScope|TestValidateRejectsUnknownScope|TestValidateAcceptsCityAndRigScope|TestParseEnv' -count=1 -v
       - name: Unit tests — scale from zero (#2819)
         run: go test ./cmd/gc/ -run 'TestBuildDesiredState_ScaleFromZero' -count=1 -v
+      - name: Unit tests, a fresh pool seat survives its own claim (vn-n5abuk0)
+        # The chaos tests are here because they pull a seat out of the desired
+        # set and expect a drain, so they are the ones the spawn grace can break.
+        run: go test ./cmd/gc/ -run 'TestPoolSpawnGrace|TestPoolSeatInSpawnGrace|TestSessionLifecycleChaosPendingInteraction' -count=1 -v
       - name: Unit tests, worktree spawn guard and pool-name identity (vn-rm9u8g)
         run: |
           go test ./internal/workdir/ -run 'TestValidateAncestorWorktreesNotStale|TestValidateNotNestedInSessionWorktree|TestValidateSpawnTarget' -count=1 -v

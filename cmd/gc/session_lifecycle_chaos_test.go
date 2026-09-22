@@ -198,6 +198,7 @@ func TestSessionLifecycleChaosPendingInteractionDoesNotOverrideOrphanDrain(t *te
 	h.assertCreatingIntent()
 	h.reconcileTick()
 	h.assertStarted()
+	h.ageSeatPastSpawnGrace()
 
 	h.setDesired(false)
 	h.env.sp.SetPendingInteraction(h.sessionName, &runtime.PendingInteraction{
@@ -622,6 +623,7 @@ func TestSessionLifecycleChaosPendingInteractionPreservesNonCancelableDrains(t *
 			h.assertCreatingIntent()
 			h.reconcileTick()
 			h.assertStarted()
+			h.ageSeatPastSpawnGrace()
 
 			tc.setup(h)
 			h.record("start non-cancelable drain=%s", tc.name)
@@ -847,6 +849,7 @@ func TestSessionLifecycleChaosPendingInteractionRespectsWakeBlockers(t *testing.
 			h.assertCreatingIntent()
 			h.reconcileTick()
 			h.assertStarted()
+			h.ageSeatPastSpawnGrace()
 
 			h.setDesired(false)
 			if err := h.env.store.SetMetadataBatch(h.sessionID, tc.meta); err != nil {
@@ -1215,6 +1218,15 @@ func (h *sessionChaosHarness) advanceClock() {
 	d := durations[h.rng.Intn(len(durations))]
 	h.env.clk.Time = h.env.clk.Time.Add(d)
 	h.record("clock += %s now=%s", d, h.env.clk.Now().UTC().Format(time.RFC3339))
+}
+
+// ageSeatPastSpawnGrace moves the clock past poolSpawnGrace. A pool seat
+// younger than that is not retired on a demand reading (vn-n5abuk0), so a test
+// about what happens AFTER a seat leaves the desired set must age it first, or
+// it is testing the grace instead.
+func (h *sessionChaosHarness) ageSeatPastSpawnGrace() {
+	h.env.clk.Time = h.env.clk.Time.Add(poolSpawnGrace)
+	h.record("clock += %s (past the spawn grace) now=%s", poolSpawnGrace, h.env.clk.Now().UTC().Format(time.RFC3339))
 }
 
 func (h *sessionChaosHarness) injectProviderExit() {
