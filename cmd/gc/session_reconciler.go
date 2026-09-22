@@ -2107,6 +2107,16 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 						fmt.Fprintf(stdout, "Skipping drain for '%s': live assigned work found\n", name) //nolint:errcheck
 						continue
 					}
+					// A pool seat that left the desired set while its pool still
+					// exists is a scale-down, which is a demand reading. A seat
+					// that young is most likely mid-claim, and its own claim is
+					// what dropped the demand (vn-n5abuk0). A suspended or removed
+					// pool fails the grace check, so it still drains now.
+					if reason == "orphaned" {
+						if deferPoolSeatRetireForSpawnGrace(infoPostHeal, cfg, clk, trace, TraceSiteReconcilerOrphaned, reason, name, stdout) {
+							continue
+						}
+					}
 					// #3630: a LIVE named session reaches this drain only because
 					// its configured spec is absent this tick (preserve did not fire
 					// above) and it has no live assigned work. A namedSessionSpecs
@@ -3732,6 +3742,16 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 				reason = "idle"
 			default:
 				reason = "no-wake-reason"
+			}
+			// no-wake-reason on a live pool seat means demand read 0 this tick.
+			// A freshly spawned seat's own claim reads exactly that way, so the
+			// seat keeps its slot until poolSpawnGrace has passed (vn-n5abuk0).
+			// Every other reason (a sleep intent, idle) is the session's own
+			// state, not a demand reading, and is honored at once.
+			if reason == "no-wake-reason" {
+				if deferPoolSeatRetireForSpawnGrace(info, cfg, clk, trace, TraceSiteReconcilerDrainDecision, reason, name, stdout) {
+					continue
+				}
 			}
 			if reason != "idle" {
 				clearCompletedIdleProbe(target.info.ID, dt)
