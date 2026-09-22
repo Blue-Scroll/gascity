@@ -79,6 +79,15 @@ city (HQ) store. An explicit --city is a true scope override: it forces the
 city store and disables rig auto-detection (GC_RIG, cwd, bead prefix), so a
 deliberate city-scoped query is never silently downgraded to a rig store.
 
+--rig also takes the city's own name, the name "gc rig list" prints for the
+HQ, because that store is where session, agent and mail beads live and it is
+never a rig. Rig stores hold none of them. So "gc bd list --type session" run
+from a rig reads a store with zero session beads and returns nothing, while
+"gc bd show <hq-id>" works from the same place: a bead id in the args
+auto-detects the city store, and a list has no id to detect. Pin the scope
+when you query by type rather than by id. --rig takes names and not prefixes,
+so use the city name, not the HQ bead prefix.
+
 On a city that serves a coordination class from its own [storage] binding,
 a by-id read or write of a bead that binding owns is answered in process
 from the binding, not by bd against a work store that does not hold it.
@@ -113,6 +122,7 @@ auto-export behavior, invoke bd directly.`,
   gc bd show my-project-abc          # auto-detects rig from bead prefix
   gc bd list --rig my-project -s open
   gc bd --city /path/to/city list    # pins the city (HQ) store, no rig auto-detect
+  gc bd --rig my-city list --type session   # session beads: city store, by its name
   gc bd heartbeat my-project-abc     # refresh the claim lease you hold
   gc bd release-if-current my-project-abc worker-1`,
 		DisableFlagParsing: true,
