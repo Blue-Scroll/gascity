@@ -121,6 +121,14 @@ var infoKeyCodec = []infoKeySpec{
 	{PrimingAttemptedAtMetadataKey, func(i *Info, v string) { i.PrimingAttemptedAtMetadata = v }},
 	{PromptHashMetadataKey, func(i *Info, v string) { i.PromptHashMetadata = v }},
 
+	// drain record (verbatim). Why the controller asked this session to stop,
+	// and whether it then took the request back.
+	{DrainReasonMetadataKey, func(i *Info, v string) { i.DrainReasonMetadata = v }},
+	{DrainInitiatorMetadataKey, func(i *Info, v string) { i.DrainInitiatorMetadata = v }},
+	{DrainRequestedAtMetadataKey, func(i *Info, v string) { i.DrainRequestedAtMetadata = v }},
+	{DrainCanceledAtMetadataKey, func(i *Info, v string) { i.DrainCanceledAtMetadata = v }},
+	{DrainCancelCountMetadataKey, func(i *Info, v string) { i.DrainCancelCountMetadata = v }},
+
 	{MCPIdentityMetadataKey, func(i *Info, v string) { i.MCPIdentity = v }},
 	{MCPServersSnapshotMetadataKey, func(i *Info, v string) { i.MCPServersSnapshot = v }},
 

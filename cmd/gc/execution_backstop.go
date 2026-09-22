@@ -427,10 +427,11 @@ func (cr *CityRuntime) requestExecutionStalledDrain(sessionBead beads.Bead) erro
 	if cr == nil || cr.sessionDrains == nil {
 		return fmt.Errorf("no drain tracker configured for %q", sessionBead.ID)
 	}
-	info, err := sessionFrontDoor(cr.sessionsBeadStore()).Get(sessionBead.ID)
+	sessFront := sessionFrontDoor(cr.sessionsBeadStore())
+	info, err := sessFront.Get(sessionBead.ID)
 	if err != nil {
 		return fmt.Errorf("reading session %q before draining: %w", sessionBead.ID, err)
 	}
-	beginSessionDrainInfo(info, cr.sp, cr.sessionDrains, executionStalledDrainReason, clock.Real{}, defaultDrainTimeout)
+	beginSessionDrainInfo(info, cr.sp, cr.sessionDrains, executionStalledDrainReason, clock.Real{}, defaultDrainTimeout, sessFront)
 	return nil
 }

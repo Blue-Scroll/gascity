@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"strconv"
 	"time"
 )
 
@@ -373,6 +374,10 @@ func CommitStartedPatch(input CommitStartedPatchInput) MetadataPatch {
 	// already-running runtime leaves the in-flight interval's epoch untouched.
 	if input.StartsAwakeInterval {
 		patch["awake_started_at"] = awakeIntervalStartedAt(input.Now)
+		// A new awake interval is a new story. Blank the last incarnation's
+		// drain record so a reused pool slot cannot be read as this one having
+		// been asked to stop. See the drain record keys below.
+		clearDrainRecord(patch)
 	}
 	// Priming confirmation pair (both-or-neither). Stamped atomically with
 	// started_config_hash so priming inherits its crash semantics and lifetime.
@@ -556,7 +561,13 @@ func CanonicalCloseReason(stateCode string) string {
 	case "orphaned":
 		return "session orphaned: configured agent removed"
 	case "drained":
-		return "session drained: pool slot retired by reconciler"
+		// Deliberately says WHAT happened, not WHY. Both a polecat that
+		// finished its work and called `gc runtime drain-ack`, and a slot the
+		// controller retired out from under a working agent, close with this
+		// same code. The old wording claimed the second for both, and that
+		// wrong sentence was quoted as evidence in hq-qufuy. The why lives in
+		// drain_initiator and drain_reason, which cannot guess.
+		return "session drained: runtime stopped after drain signal"
 	case "failed-create":
 		return "session create failed: aborted before creation_complete"
 	case "stale-session":
@@ -629,4 +640,89 @@ func ReactivatePatch(continuityEligible bool) MetadataPatch {
 		"crash_count":               "0",
 		"archived_at":               "",
 	}
+}
+
+// The drain record: why a session was asked to stop, written where the
+// decision is made so it outlives the controller that made it.
+//
+// Before this record existed, a drain's reason lived in two places that both
+// die: the controller's in-memory drainTracker, and tmux session metadata. The
+// bead learned only that a drain happened (drain_at) and that the agent
+// acknowledged it (state_reason=drain-ack-stop-pending). Measured 2026-09-22 on
+// the live town: 539 pool sessions drained over 36 hours, and every one of them
+// carried an empty sleep_reason, so not one could say why it stopped. That is
+// why hq-qufuy sat open for a month as UNPROVEN. That bead says the reconciler
+// retires a slot out from under a working polecat, and nobody could tell a
+// healthy finish from a wrongful stop after the fact.
+//
+// These keys are plain metadata, so ClosePatch and ArchivePatch leave them
+// alone and they survive onto the closed bead. CommitStartedPatch clears them
+// when a session bead begins a new awake interval, so a reused pool slot never
+// inherits the last incarnation's drain story.
+const (
+	// DrainReasonMetadataKey is the reason code the drain was begun with
+	// ("no-wake-reason", "idle", "config-drift", "orphaned", ...).
+	DrainReasonMetadataKey = "drain_reason"
+	// DrainInitiatorMetadataKey says who asked: the controller or the agent.
+	DrainInitiatorMetadataKey = "drain_initiator"
+	// DrainRequestedAtMetadataKey is when the drain was begun (RFC3339).
+	DrainRequestedAtMetadataKey = "drain_requested_at"
+	// DrainCanceledAtMetadataKey is when a drain was TAKEN BACK because the
+	// session turned out to own assigned work (RFC3339). Its presence is the
+	// system admitting it tried to stop a working agent.
+	DrainCanceledAtMetadataKey = "drain_canceled_at"
+	// DrainCancelCountMetadataKey counts those take-backs over this session
+	// bead's current awake interval.
+	DrainCancelCountMetadataKey = "drain_cancel_count"
+)
+
+// DrainInitiatorReconciler marks a drain the controller asked for. It is the
+// only value ever written, and that is deliberate: the controller is the only
+// actor that can write a city-store bead at drain time. The agent's own drain
+// (the polecat done sequence calling `gc runtime drain-ack`) writes nothing, so
+// read the record this way and no other way:
+//
+//	drain_initiator == "reconciler"  the controller asked this session to stop,
+//	                                 and drain_reason says why.
+//	drain_initiator == ""            either the agent stopped itself, or the
+//	                                 bead's awake interval began before this
+//	                                 record existed. It does NOT mean "the
+//	                                 controller did not ask".
+const DrainInitiatorReconciler = "reconciler"
+
+// BeginDrainRecordPatch records why a drain started.
+//
+// It clears drain_canceled_at because a take-back belongs to the drain it took
+// back, not to this one. It leaves drain_cancel_count alone: that is a tally
+// for the whole awake interval, and CommitStartedPatch resets it.
+func BeginDrainRecordPatch(now time.Time, reason, initiator string) MetadataPatch {
+	return MetadataPatch{
+		DrainReasonMetadataKey:      reason,
+		DrainInitiatorMetadataKey:   initiator,
+		DrainRequestedAtMetadataKey: now.UTC().Format(time.RFC3339),
+		DrainCanceledAtMetadataKey:  "",
+	}
+}
+
+// DrainCanceledPatch records that a drain was taken back after the session was
+// found to own assigned work. priorCount is the tally read off the bead; pass 0
+// when it is absent or unreadable.
+func DrainCanceledPatch(now time.Time, priorCount int) MetadataPatch {
+	if priorCount < 0 {
+		priorCount = 0
+	}
+	return MetadataPatch{
+		DrainCanceledAtMetadataKey:  now.UTC().Format(time.RFC3339),
+		DrainCancelCountMetadataKey: strconv.Itoa(priorCount + 1),
+	}
+}
+
+// clearDrainRecord blanks the drain record in place. A new awake interval is a
+// new story: the previous incarnation's reason must not be read as this one's.
+func clearDrainRecord(patch MetadataPatch) {
+	patch[DrainReasonMetadataKey] = ""
+	patch[DrainInitiatorMetadataKey] = ""
+	patch[DrainRequestedAtMetadataKey] = ""
+	patch[DrainCanceledAtMetadataKey] = ""
+	patch[DrainCancelCountMetadataKey] = ""
 }

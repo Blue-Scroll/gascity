@@ -53,6 +53,8 @@ var allProjectedMetadataKeys = []string{
 	"sleep_policy_adjustment_reason", "config_wake_suppressed",
 	CanonicalInstanceNameMetadata, CanonicalPoolSlotMetadata,
 	PrimedAtMetadataKey, PrimingAttemptedAtMetadataKey, PromptHashMetadataKey,
+	DrainReasonMetadataKey, DrainInitiatorMetadataKey, DrainRequestedAtMetadataKey,
+	DrainCanceledAtMetadataKey, DrainCancelCountMetadataKey,
 }
 
 // oracleBaseBeads returns diverse session beads: a fully-populated open bead, the

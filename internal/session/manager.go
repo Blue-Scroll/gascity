@@ -181,6 +181,18 @@ type Info struct {
 	PrimingAttemptedAtMetadata string // priming_attempted_at (raw RFC3339)
 	PromptHashMetadata         string // prompt_hash (raw sha256 hex)
 
+	// The drain record (verbatim mirrors). It says why this session was asked
+	// to stop and whether the controller then took that request back. The
+	// reconciler loop carries no raw beads, so the take-back tally has to be a
+	// projected field to be read back and incremented. Additive, internal-only
+	// (absent from the HTTP wire). See the drain record keys in
+	// lifecycle_transition.go.
+	DrainReasonMetadata      string // drain_reason (raw reason code)
+	DrainInitiatorMetadata   string // drain_initiator ("reconciler" or "agent")
+	DrainRequestedAtMetadata string // drain_requested_at (raw RFC3339)
+	DrainCanceledAtMetadata  string // drain_canceled_at (raw RFC3339)
+	DrainCancelCountMetadata string // drain_cancel_count (raw integer)
+
 	// MCPIdentity / MCPServersSnapshot mirror the raw mcp_identity and
 	// mcp_servers_snapshot metadata (verbatim). The ACP-transport classifier
 	// treats a non-empty value on either key as evidence the session speaks ACP,

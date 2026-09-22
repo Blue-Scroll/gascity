@@ -258,7 +258,7 @@ func TestAcceptConfigDriftAcrossSessions_CancelsExistingConfigDriftDrain(t *test
 	sp := runtime.NewFake()
 	dt := newDrainTracker()
 	clk := &clock.Fake{Time: time.Unix(100, 0)}
-	if !beginSessionDrainInfo(sessiontest.SeedBead(t, sessionBead), sp, dt, "config-drift", clk, time.Minute) {
+	if !beginSessionDrainInfo(sessiontest.SeedBead(t, sessionBead), sp, dt, "config-drift", clk, time.Minute, nil) {
 		t.Fatal("beginSessionDrainInfo returned false")
 	}
 

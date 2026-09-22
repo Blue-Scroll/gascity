@@ -173,6 +173,12 @@ func validateWorkDir(dir string) error {
 // Without this, a single bad tick can interrupt a working agent mid-tool-call.
 //
 // It reads only session_name, generation, and id — all carried verbatim on Info.
+//
+// sessFront is the session front door the drain record is written through. It
+// is the LAST parameter and it may be nil (tests, and any caller with no store
+// in hand); a nil front door skips the record and changes nothing else. Every
+// drain goes through this one function, so writing the record here is what
+// makes a future drain site unable to forget it.
 func beginSessionDrainInfo(
 	info sessions.Info,
 	_ runtime.Provider, // kept for caller compatibility; interrupt deferred to advanceSessionDrainsWithSessionsTraced
@@ -180,6 +186,7 @@ func beginSessionDrainInfo(
 	reason string,
 	clk clock.Clock,
 	timeout time.Duration,
+	sessFront *sessions.Store,
 ) bool {
 	name := info.SessionNameMetadata
 	if dt.get(info.ID) != nil {
@@ -196,6 +203,7 @@ func beginSessionDrainInfo(
 		reason:     reason,
 		generation: gen,
 	})
+	recordDrainBegun(info, sessFront, reason, clk)
 
 	if os.Getenv("GC_TMUX_TRACE") == "1" {
 		log.Printf("[DRAIN-TRACE] beginSessionDrain session=%s reason=%s", name, reason)
@@ -291,8 +299,15 @@ func cancelSessionDrainForPendingInfo(info sessions.Info, sp runtime.Provider, d
 
 // cancelSessionDrainForAssignedWorkInfo cancels an assigned-work-cancelable drain
 // for the reconciler's Phase-2 drain scan, working off the Info snapshot.
-func cancelSessionDrainForAssignedWorkInfo(info sessions.Info, sp runtime.Provider, dt *drainTracker) bool {
-	return cancelSessionDrainIfInfo(info, sp, dt, assignedWorkDrainReasonCancelable)
+// It takes the front door and the clock so the take-back is recorded on the
+// bead. sessFront may be nil; a nil front door cancels the drain and records
+// nothing.
+func cancelSessionDrainForAssignedWorkInfo(info sessions.Info, sp runtime.Provider, dt *drainTracker, sessFront *sessions.Store, clk clock.Clock) bool {
+	if !cancelSessionDrainIfInfo(info, sp, dt, assignedWorkDrainReasonCancelable) {
+		return false
+	}
+	recordDrainTakenBack(info, sessFront, clk)
+	return true
 }
 
 func assignedWorkDrainReasonCancelable(reason string) bool {
@@ -313,6 +328,43 @@ func cancelSessionConfigDriftDrainInfo(info sessions.Info, sp runtime.Provider, 
 	return cancelSessionDrainIfInfo(info, sp, dt, func(reason string) bool {
 		return reason == "config-drift"
 	})
+}
+
+// recordDrainBegun writes the durable "why" of a drain onto the session bead.
+//
+// Every drain this controller begins is the controller's own decision, so the
+// initiator is always the reconciler here. The agent's own drain (the polecat
+// done sequence calling `gc runtime drain-ack`) never reaches this function --
+// it only sets GC_DRAIN_ACK on the runtime -- so an EMPTY drain_initiator is
+// how that case reads. See DrainInitiatorReconciler for the full reading rule.
+//
+// A failed write is logged and dropped. The record is evidence, never a gate:
+// losing it must not stop a drain the controller has already decided on.
+func recordDrainBegun(info sessions.Info, sessFront *sessions.Store, reason string, clk clock.Clock) {
+	if sessFront == nil || info.ID == "" {
+		return
+	}
+	patch := sessions.BeginDrainRecordPatch(clk.Now(), reason, sessions.DrainInitiatorReconciler)
+	if err := sessFront.ApplyPatch(info.ID, patch); err != nil {
+		log.Printf("session wake: recording drain reason %q for %s: %v", reason, info.ID, err)
+	}
+}
+
+// recordDrainTakenBack stamps a drain the controller took back because the
+// session turned out to own assigned work.
+//
+// This stamp is the whole point of the record. A drain that is begun and then
+// taken back is the controller admitting it asked a working agent to stop, and
+// until now that admission lived only in the controller's memory. A session
+// bead carrying drain_cancel_count > 0 is a measured instance of hq-qufuy.
+func recordDrainTakenBack(info sessions.Info, sessFront *sessions.Store, clk clock.Clock) {
+	if sessFront == nil || info.ID == "" {
+		return
+	}
+	prior, _ := strconv.Atoi(strings.TrimSpace(info.DrainCancelCountMetadata))
+	if err := sessFront.ApplyPatch(info.ID, sessions.DrainCanceledPatch(clk.Now(), prior)); err != nil {
+		log.Printf("session wake: recording drain take-back for %s: %v", info.ID, err)
+	}
 }
 
 // cancelSessionDrainIfInfo is the typed core of the drain-cancel helpers. It
@@ -595,7 +647,7 @@ func advanceSessionDrainsWithSessionsTraced(
 			eval.Reason == "assigned-work" &&
 			containsWakeReason(eval.Reasons, WakeWork) &&
 			assignedWorkDrainReasonCancelable(ds.reason) {
-			if cancelSessionDrainForAssignedWorkInfo(info, sp, dt) {
+			if cancelSessionDrainForAssignedWorkInfo(info, sp, dt, sessFront, clk) {
 				if trace != nil {
 					trace.RecordDecision(TraceSiteDrainCancel, TraceReasonCode(ds.reason), TraceOutcomeCancelAssignedWork, normalizedSessionTemplateInfo(info, cfg), name, nil)
 				}

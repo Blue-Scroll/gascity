@@ -109,7 +109,7 @@ func (h *stalledConvergenceHarness) drainRequester(t *testing.T) func(beads.Bead
 	t.Helper()
 	return func(sessionBead beads.Bead) error {
 		info := sessiontest.SeedBead(t, sessionBead)
-		beginSessionDrainInfo(info, h.env.sp, h.env.dt, executionStalledDrainReason, h.env.clk, defaultDrainTimeout)
+		beginSessionDrainInfo(info, h.env.sp, h.env.dt, executionStalledDrainReason, h.env.clk, defaultDrainTimeout, nil)
 		return nil
 	}
 }
@@ -210,7 +210,7 @@ func TestExecutionStalledDrainConvergesToAReclaimableRow(t *testing.T) {
 func TestExecutionStalledDrainSurvivesTheKeepAliveGuards(t *testing.T) {
 	h := newStalledConvergenceHarness(t)
 	info := sessiontest.SeedBead(t, h.sessionBead(t))
-	beginSessionDrainInfo(info, h.env.sp, h.env.dt, executionStalledDrainReason, h.env.clk, defaultDrainTimeout)
+	beginSessionDrainInfo(info, h.env.sp, h.env.dt, executionStalledDrainReason, h.env.clk, defaultDrainTimeout, nil)
 
 	for _, tt := range []struct {
 		name   string
@@ -218,7 +218,7 @@ func TestExecutionStalledDrainSurvivesTheKeepAliveGuards(t *testing.T) {
 	}{
 		{"wake reasons reappear", func() bool { return cancelSessionDrainInfo(info, h.env.sp, h.env.dt) }},
 		{"pending interaction", func() bool { return cancelSessionDrainForPendingInfo(info, h.env.sp, h.env.dt) }},
-		{"assigned work", func() bool { return cancelSessionDrainForAssignedWorkInfo(info, h.env.sp, h.env.dt) }},
+		{"assigned work", func() bool { return cancelSessionDrainForAssignedWorkInfo(info, h.env.sp, h.env.dt, nil, h.env.clk) }},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			if tt.cancel() {
@@ -237,7 +237,7 @@ func TestExecutionStalledDrainSurvivesTheKeepAliveGuards(t *testing.T) {
 func TestOrdinaryDrainReasonsStayCancelable(t *testing.T) {
 	h := newStalledConvergenceHarness(t)
 	info := sessiontest.SeedBead(t, h.sessionBead(t))
-	beginSessionDrainInfo(info, h.env.sp, h.env.dt, "idle", h.env.clk, defaultDrainTimeout)
+	beginSessionDrainInfo(info, h.env.sp, h.env.dt, "idle", h.env.clk, defaultDrainTimeout, nil)
 
 	if !cancelSessionDrainInfo(info, h.env.sp, h.env.dt) {
 		t.Fatal("an idle drain is no longer cancelable; the non-cancelable reason leaked into the general path")

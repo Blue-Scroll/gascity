@@ -2004,7 +2004,7 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 							hasAssignedWork = true
 						}
 						if providerAlive && hasAssignedWork {
-							if cancelSessionDrainForAssignedWorkInfo(infoPostHeal, sp, dt) ||
+							if cancelSessionDrainForAssignedWorkInfo(infoPostHeal, sp, dt, sessFront, clk) ||
 								cancelRecoveredDrainForAssignedWorkInfo(infoPostHeal, sp, name) {
 								_ = dops.clearDrain(name)
 								template := normalizedSessionTemplateInfo(infoPostHeal, cfg)
@@ -2135,7 +2135,7 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 							continue
 						}
 					}
-					if beginSessionDrainInfo(infoPostHeal, sp, dt, reason, clk, defaultDrainTimeout) {
+					if beginSessionDrainInfo(infoPostHeal, sp, dt, reason, clk, defaultDrainTimeout, sessFront) {
 						if trace != nil {
 							template := normalizedSessionTemplateInfo(infoPostHeal, cfg)
 							if template == "" {
@@ -2339,7 +2339,7 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 							hasAssignedWork = true
 						}
 						if alive && hasAssignedWork &&
-							(cancelSessionDrainForAssignedWorkInfo(infoByID[id], sp, dt) || cancelRecoveredDrainForAssignedWorkInfo(infoByID[id], sp, name)) {
+							(cancelSessionDrainForAssignedWorkInfo(infoByID[id], sp, dt, sessFront, clk) || cancelRecoveredDrainForAssignedWorkInfo(infoByID[id], sp, name)) {
 							_ = dops.clearDrain(name)
 							if trace != nil {
 								trace.RecordDecision(TraceSiteDrainCancel, TraceReasonCode(ackReason), TraceOutcomeCancelAssignedWork, tp.TemplateName, name, nil)
@@ -3010,7 +3010,7 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 							if ddt <= 0 {
 								ddt = defaultDrainTimeout
 							}
-							if beginSessionDrainInfo(infoByID[id], sp, dt, "config-drift", clk, ddt) {
+							if beginSessionDrainInfo(infoByID[id], sp, dt, "config-drift", clk, ddt, sessFront) {
 								fmt.Fprintf(stdout, "Draining session '%s': config-drift\n", name) //nolint:errcheck
 								if trace != nil {
 									trace.RecordDecision(TraceSiteReconcilerConfigDrift, TraceReasonConfigDrift, TraceOutcomeDrain, tp.TemplateName, name, configDriftTracePayload(storedHash, currentHash, driftedFields, nil))
@@ -3746,11 +3746,20 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 					}
 				}
 			}
-			if beginSessionDrainInfo(info, sp, dt, reason, clk, defaultDrainTimeout) {
+			if beginSessionDrainInfo(info, sp, dt, reason, clk, defaultDrainTimeout, sessFront) {
 				fmt.Fprintf(stdout, "Draining session '%s': %s\n", name, reason) //nolint:errcheck
 				if trace != nil {
+					// has_assigned_work is the evidence for this verdict, so it
+					// belongs in the record that states the verdict. Without it a
+					// wrong drain (the session owned work and we asked it to stop
+					// anyway) and a correct one (it had finished) are the same
+					// three words in the trace, which is how hq-qufuy stayed
+					// unprovable for a month.
 					trace.RecordDecision(TraceSiteReconcilerDrainDecision, TraceReasonCode(reason), TraceOutcomeDrain, target.tp.TemplateName, name, traceRecordPayload{
-						"sleep_intent": intent,
+						"sleep_intent":         intent,
+						"has_assigned_work":    decision.HasAssignedWork,
+						"assigned_work_bead":   decision.AssignedWorkBeadID,
+						"currently_processing": info.CurrentlyProcessingBeadID,
 					})
 				}
 			}

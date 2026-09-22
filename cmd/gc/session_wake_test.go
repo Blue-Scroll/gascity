@@ -704,7 +704,7 @@ func TestBeginSessionDrain(t *testing.T) {
 		"generation":   "5",
 	})
 
-	if transitioned := beginSessionDrainInfo(sessiontest.SeedBead(t, session), sp, dt, "idle", clk, 30*time.Second); !transitioned {
+	if transitioned := beginSessionDrainInfo(sessiontest.SeedBead(t, session), sp, dt, "idle", clk, 30*time.Second, nil); !transitioned {
 		t.Fatal("first beginSessionDrain = false, want true (state transition)")
 	}
 
@@ -736,10 +736,10 @@ func TestBeginSessionDrain_AlreadyDraining(t *testing.T) {
 		"generation":   "5",
 	})
 
-	if transitioned := beginSessionDrainInfo(sessiontest.SeedBead(t, session), sp, dt, "idle", clk, 30*time.Second); !transitioned {
+	if transitioned := beginSessionDrainInfo(sessiontest.SeedBead(t, session), sp, dt, "idle", clk, 30*time.Second, nil); !transitioned {
 		t.Fatal("first beginSessionDrain = false, want true (state transition)")
 	}
-	if transitioned := beginSessionDrainInfo(sessiontest.SeedBead(t, session), sp, dt, "config-drift", clk, 60*time.Second); transitioned {
+	if transitioned := beginSessionDrainInfo(sessiontest.SeedBead(t, session), sp, dt, "config-drift", clk, 60*time.Second, nil); transitioned {
 		t.Error("second beginSessionDrain = true, want false (already draining)")
 	}
 
@@ -1025,7 +1025,7 @@ func TestAdvanceSessionDrains_DeferredInterrupt_CanceledBeforeSignal(t *testing.
 	beginSessionDrainInfo(sessiontest.SeedBead(t, makeWakeBead(b.ID, map[string]string{
 		"session_name": "test-session",
 		"generation":   "3",
-	})), sp, dt, "orphaned", clk, 30*time.Second)
+	})), sp, dt, "orphaned", clk, 30*time.Second, nil)
 
 	// No interrupt should have been sent yet.
 	for _, c := range sp.Calls {
@@ -1257,7 +1257,7 @@ func TestAdvanceSessionDrains_DeferredInterrupt_CancelableNoSignal(t *testing.T)
 	beginSessionDrainInfo(sessiontest.SeedBead(t, makeWakeBead(b.ID, map[string]string{
 		"session_name": "test-session",
 		"generation":   "3",
-	})), sp, dt, "no-wake-reason", clk, 30*time.Second)
+	})), sp, dt, "no-wake-reason", clk, 30*time.Second, nil)
 
 	// No interrupt yet.
 	for _, c := range sp.Calls {
