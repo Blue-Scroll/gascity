@@ -125,9 +125,19 @@ func TestQueueDrainAckAsyncStopReportsASkipOnceNotEveryTick(t *testing.T) {
 	target := drainAckStopTarget{SessionID: "gc-1", Name: "worker", Token: "gen4-token", Generation: "4"}
 	for tick := 0; tick < 3; tick++ {
 		queueDrainAckAsyncStop("", beads.NewMemStore(), sp, &config.City{}, target, nil, tracker, &stderr)
-		if !tracker.wait(time.Second) {
+		// Wait for this tick's stop WITHOUT tracker.wait: that one marks the
+		// tracker as shutting down, and every later tick would queue nothing,
+		// so the test would pass with no skip memory at all.
+		done := make(chan struct{})
+		go func() { tracker.wg.Wait(); close(done) }()
+		select {
+		case <-done:
+		case <-time.After(time.Second):
 			t.Fatalf("tick %d: async drain-ack stop did not complete", tick)
 		}
+	}
+	if !strings.Contains(stderr.String(), "skipped") {
+		t.Fatalf("stderr = %q, want one skip line", stderr.String())
 	}
 	if !sp.IsRunning("worker") {
 		t.Fatal("the fence killed a newer-generation replacement")
