@@ -39,6 +39,10 @@ jobs:
         run: go build ./...
       - name: Vet changed package
         run: go vet ./cmd/gc/...
+      - name: docs/reference/cli.md matches gc gen-doc (vn-s9oydtn)
+        # The file says "do not edit" and nothing else here runs this test, so
+        # a changed help string or flag used to merge with a stale page.
+        run: go test ./cmd/gc/ -run 'TestCLIDocsFreshness|TestGenDoc' -count=1 -v
       - name: Unit tests — cross-store work delivery
         run: go test ./cmd/gc/ -run 'TestFilterAssignedWorkBeads|TestAssignedWork|TestFirstStoreWithWork|TestCrossStoreClaimDir|TestRunBDForBead|TestGateOpenWorkBounded|TestCrossStorePipeline' -count=1 -v
       - name: Unit tests — cross-store reachability predicate + fail-loud guard

@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -9,7 +10,6 @@ import (
 	"testing"
 
 	"github.com/gastownhall/gascity/internal/docgen"
-	"github.com/spf13/cobra"
 )
 
 func TestGenDocProducesMarkdown(t *testing.T) {
@@ -110,11 +110,27 @@ func TestGenDocImportAddExamplesAvoidRejectedSourceRefs(t *testing.T) {
 	}
 }
 
-// TestCLIDocsFreshness verifies every non-hidden command in the live cobra
-// tree has a section in docs/reference/cli.md. Catches "added or renamed a
-// command without running go run ./cmd/genschema". Avoids strict byte-equal
-// comparison because cobra lazily registers `completion`/`help` only on
-// Execute, which the in-test render path does not trigger.
+// TestCLIDocsFreshness byte-compares docs/reference/cli.md against a freshly
+// rendered copy. The file says "Auto-generated, do not edit", and this test is
+// what makes that true: ANY drift goes red, whether it is a new command, a
+// changed Long string, a new flag, or a hand edit.
+//
+// It used to check only that every command had a section, plus a hand-written
+// list of seven sections. So a changed help string on any of the other 240
+// commands was invisible, and docs/reference/cli.md drifted anyway (vn-dnv2cm2).
+//
+// It runs the real `gc gen-doc` through Execute rather than calling the
+// renderer. Execute changes the tree before gen-doc walks it: it adds the
+// `completion` and `help` commands, and it merges the root's persistent flags,
+// which is what turns the root's synopsis into `gc [flags]`. A render that skips
+// Execute misses all three and can never match the file (measured on
+// vn-s9oydtn). Running the command itself means this test cannot drift from
+// the generator.
+//
+// rootCommandOptions{} leaves pack discovery off, so the tree is the same on
+// every machine. A doc regenerated from inside a city does go red here, which
+// is correct: such a page carries that city's pack commands, and no other
+// machine has them.
 func TestCLIDocsFreshness(t *testing.T) {
 	_, thisFile, _, ok := runtime.Caller(0)
 	if !ok {
@@ -125,59 +141,89 @@ func TestCLIDocsFreshness(t *testing.T) {
 	committedPath := filepath.Join(repoRoot, "docs", "reference", "cli.md")
 	committed, err := os.ReadFile(committedPath)
 	if err != nil {
-		t.Fatalf("reading %s: %v\nRun: go run ./cmd/genschema", committedPath, err)
+		t.Fatalf("reading %s: %v\nRun: go run ./cmd/gc gen-doc", committedPath, err)
 	}
-	doc := string(committed)
 
-	var buf bytes.Buffer
-	root := newRootCmd(&buf, &buf)
+	// gen-doc refuses to run without a go.mod in the working directory, and it
+	// writes docs/reference/cli.md under it. A scratch directory with an empty
+	// go.mod keeps the real file untouched.
+	scratch := t.TempDir()
+	if err := os.WriteFile(filepath.Join(scratch, "go.mod"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(scratch)
 
-	var missing []string
-	var walk func(cmd *cobra.Command)
-	walk = func(cmd *cobra.Command) {
-		if cmd.Hidden || cmd.Annotations["gc.docgen.skip"] == "true" {
-			return
+	var stderr bytes.Buffer
+	root := newRootCmdWithOptions(io.Discard, &stderr, rootCommandOptions{})
+	root.SetArgs([]string{"gen-doc"})
+	if err := root.Execute(); err != nil {
+		t.Fatalf("gc gen-doc: %v\n%s", err, stderr.String())
+	}
+	generated, err := os.ReadFile(filepath.Join(scratch, "docs", "reference", "cli.md"))
+	if err != nil {
+		t.Fatalf("reading the generated doc: %v", err)
+	}
+
+	want := string(generated)
+	got := string(committed)
+	if got == want {
+		return
+	}
+
+	line, section, gotLine, wantLine := firstCLIDocDifference(got, want)
+	t.Errorf("docs/reference/cli.md is stale. Run: go run ./cmd/gc gen-doc\n"+
+		"First difference at line %d, in section %q:\n  committed: %q\n  generated: %q",
+		line, section, gotLine, wantLine)
+}
+
+// firstCLIDocDifference finds the first line where the committed file and the
+// freshly rendered one disagree. It returns the 1-based line number, the
+// section that line sits in, and both lines. A line past the end of one side
+// reads as an empty string, so a file that is only shorter still names the
+// place it stops.
+func firstCLIDocDifference(got, want string) (line int, section, gotLine, wantLine string) {
+	gotLines := strings.Split(got, "\n")
+	wantLines := strings.Split(want, "\n")
+
+	at := func(lines []string, i int) string {
+		if i < len(lines) {
+			return lines[i]
 		}
-		heading := "## " + cmd.CommandPath() + "\n"
-		if !strings.Contains(doc, heading) {
-			missing = append(missing, cmd.CommandPath())
-		}
-		for _, c := range cmd.Commands() {
-			walk(c)
-		}
-	}
-	walk(root)
-
-	if len(missing) > 0 {
-		t.Errorf("docs/reference/cli.md is stale — missing sections for %d commands. Run: go run ./cmd/gc gen-doc\nMissing: %v", len(missing), missing)
+		return ""
 	}
 
-	var live bytes.Buffer
-	if err := docgen.RenderCLIMarkdown(&live, root); err != nil {
-		t.Fatalf("RenderCLIMarkdown: %v", err)
+	longest := len(gotLines)
+	if len(wantLines) > longest {
+		longest = len(wantLines)
 	}
-	var staleSections []string
-	for _, command := range []string{
-		"gc mail inbox",
-		"gc mail read",
-		"gc mail peek",
-		"gc mail thread",
-		"gc mail count",
-		"gc trace status",
-		"gc trace show",
-	} {
-		committedSection, ok := cliDocSection(doc, command)
-		if !ok {
+	for i := range longest {
+		g, w := at(gotLines, i), at(wantLines, i)
+		if g == w {
 			continue
 		}
-		liveSection, ok := cliDocSection(live.String(), command)
-		if !ok || committedSection != liveSection {
-			staleSections = append(staleSections, command)
+		// Name the section from whichever side has a heading here. A section the
+		// committed file is missing shows up as a heading on the generated side.
+		names := gotLines
+		if strings.HasPrefix(w, "## ") && !strings.HasPrefix(g, "## ") {
+			names = wantLines
+		}
+		return i + 1, cliDocSectionAt(names, i), g, w
+	}
+	return 0, "", "", ""
+}
+
+// cliDocSectionAt names the nearest "## " heading at or above line i. A
+// difference in the frontmatter, before any heading, belongs to no section.
+func cliDocSectionAt(lines []string, i int) string {
+	if i >= len(lines) {
+		i = len(lines) - 1
+	}
+	for ; i >= 0; i-- {
+		if strings.HasPrefix(lines[i], "## ") {
+			return strings.TrimPrefix(lines[i], "## ")
 		}
 	}
-	if len(staleSections) > 0 {
-		t.Errorf("docs/reference/cli.md has stale command sections. Run: go run ./cmd/gc gen-doc\nStale: %v", staleSections)
-	}
+	return "(before the first section)"
 }
 
 func cliDocSection(doc, command string) (string, bool) {
