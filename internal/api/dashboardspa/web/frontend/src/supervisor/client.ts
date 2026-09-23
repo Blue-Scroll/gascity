@@ -29,6 +29,7 @@ import {
   replyMail as postSupervisorMailReply,
   respondSession as postSupervisorSessionRespond,
   sendMail as postSupervisorMail,
+  sendSessionMessage as postSupervisorSessionMessage,
 } from 'gas-city-dashboard-shared/gc-supervisor';
 import type {
   Bead,
@@ -166,6 +167,24 @@ export interface SupervisorApi {
     sessionId: string,
     format?: SessionTranscriptFormat,
   ): Promise<SessionTranscriptGetResponse>;
+  /**
+   * A page of a session transcript. `before` walks backwards from a stable
+   * entry id, which is what lets a long session be read a window at a time
+   * instead of held whole in the browser.
+   */
+  sessionTranscriptPage(
+    cityName: string,
+    sessionId: string,
+    query: {
+      format?: SessionTranscriptFormat;
+      tail?: string;
+      before?: string;
+      after?: string;
+      include_thinking?: boolean;
+    },
+  ): Promise<SessionTranscriptGetResponse>;
+  /** Send a message to a running session, as the operator. */
+  sendSessionMessage(cityName: string, sessionId: string, message: string): Promise<unknown>;
   workflowRun(
     cityName: string,
     workflowId: string,
@@ -508,6 +527,27 @@ export function createSupervisorApi(options: CreateSupervisorApiOptions = {}): S
           body,
         }) as Promise<SupervisorResult<RespondSessionResponse>>,
         'gc supervisor session respond response was empty',
+      );
+    },
+    sessionTranscriptPage(cityName, sessionId, query) {
+      return unwrapSupervisorResult<SessionTranscriptGetResponse>(
+        getV0CityByCityNameSessionByIdTranscript({
+          client,
+          path: { cityName, id: sessionId },
+          query,
+        }) as Promise<SupervisorResult<SessionTranscriptGetResponse>>,
+        'gc supervisor transcript response was empty',
+      );
+    },
+    sendSessionMessage(cityName, sessionId, message) {
+      return unwrapSupervisorResult<unknown>(
+        postSupervisorSessionMessage({
+          client,
+          path: { cityName, id: sessionId },
+          headers: GC_MUTATION_HEADERS,
+          body: { message },
+        }) as Promise<SupervisorResult<unknown>>,
+        'gc supervisor session message response was empty',
       );
     },
     sessionTranscript(cityName, sessionId, format) {

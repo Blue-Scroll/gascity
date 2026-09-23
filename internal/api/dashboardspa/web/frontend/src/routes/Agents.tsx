@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
-import { terminalEnabled, terminalRoute } from '../lib/terminal';
+import { sessionRoute } from '../lib/sessionLink';
 import {
   GC_EVENT_PREFIX,
   effectiveContextPct,
@@ -291,11 +291,12 @@ export function AgentsPage() {
             ? `${r.name} — configured but not running; detail will show no live session`
             : `Open drilldown for ${r.name}`;
           const linkColor = orphan ? 'text-fg-muted' : 'text-fg';
-          // A terminal into this agent's own pane, when the deployment serves
-          // one. Rendered next to the name so it is reachable from the roster
-          // without opening the drilldown first.
+          // The live session, reachable straight from the roster. The id is
+          // what every session endpoint takes; the roster only carries the tmux
+          // name, so it is resolved through the sessions list.
           const tmuxSession = r.session?.name ?? '';
-          const showTerminal = tmuxSession !== '' && terminalEnabled();
+          const sessionId = tmuxSession ? (sessionsById.get(tmuxSession) ?? '') : '';
+          const showSession = sessionId !== '';
           return (
             <div className="min-w-0">
               <Link
@@ -307,16 +308,16 @@ export function AgentsPage() {
               >
                 {agentRowLabel(r)}
               </Link>
-              {(secondary || showTerminal) && (
+              {(secondary || showSession) && (
                 <div className="text-label uppercase tracking-wider text-fg-faint mt-1 flex items-center gap-2 min-w-0">
                   {secondary && <span className="truncate">{secondary}</span>}
-                  {showTerminal && (
+                  {showSession && (
                     <Link
-                      to={terminalRoute(tmuxSession, '/agents')}
+                      to={sessionRoute(sessionId, '/agents', agentRowLabel(r))}
                       className="shrink-0 text-fg-muted hover:text-accent focus-mark"
-                      title={`Open a terminal on ${tmuxSession}`}
+                      title={`Open the live session for ${r.name}`}
                     >
-                      terminal
+                      session
                     </Link>
                   )}
                 </div>
@@ -460,7 +461,7 @@ export function AgentsPage() {
         className: 'w-80',
       },
     ],
-    [handlePendingResponse, now, pendingByAgent, readOnly, responding],
+    [handlePendingResponse, now, pendingByAgent, readOnly, responding, sessionsById],
   );
 
   return (

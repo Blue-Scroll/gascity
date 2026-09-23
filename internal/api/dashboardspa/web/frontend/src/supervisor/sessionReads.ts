@@ -55,6 +55,46 @@ export async function fetchStructuredTranscript(
   return structuredTranscriptOrNull(transcript);
 }
 
+/**
+ * One window of a session's structured transcript. `before` is a message id;
+ * the server returns the entries immediately before it, which is how the
+ * session view pages backwards without ever holding the whole log.
+ */
+export async function fetchStructuredTranscriptPage(
+  sessionId: string,
+  opts: { before?: string; tail?: string; includeThinking?: boolean } = {},
+): Promise<{
+  event: SessionStreamStructuredMessageEvent | null;
+  hasOlder: boolean;
+  totalCount: number;
+}> {
+  const transcript = await supervisorApi().sessionTranscriptPage(
+    activeCityOrThrow('fetch structured session transcript page'),
+    sessionId,
+    {
+      format: 'structured',
+      tail: opts.tail ?? '0',
+      ...(opts.before ? { before: opts.before } : {}),
+      ...(opts.includeThinking ? { include_thinking: true } : {}),
+    },
+  );
+  const pagination = (transcript as { pagination?: { has_older_messages?: boolean; total_message_count?: number } })
+    .pagination;
+  return {
+    event: structuredTranscriptOrNull(transcript),
+    hasOlder: pagination?.has_older_messages ?? false,
+    totalCount: pagination?.total_message_count ?? 0,
+  };
+}
+
+export async function sendMessageToSession(sessionId: string, message: string): Promise<void> {
+  await supervisorApi().sendSessionMessage(
+    activeCityOrThrow('send a message to a session'),
+    sessionId,
+    message,
+  );
+}
+
 export function structuredTranscriptOrNull(
   transcript: SessionTranscriptGetResponse,
 ): SessionStreamStructuredMessageEvent | null {
