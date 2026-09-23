@@ -348,3 +348,18 @@
     -webkit-overflow-scrolling: touch;
   }
 }
+
+/* ── No zoom when the keyboard opens ──────────────────────────────────────────
+   iOS Safari zooms the page whenever a focused field's text is under 16px, and
+   the body step here is 15px. Rather than lock the viewport scale — which takes
+   pinch-zoom away from everyone — give fields the 16px iOS wants, but only on a
+   touch device, so the typographic scale is untouched with a mouse. */
+@media (pointer: coarse) {
+  input,
+  select,
+  textarea {
+    /* Beats the typographic utility on the element: this is a platform
+       workaround, not a design choice, and losing it means the page zooms. */
+    font-size: 16px !important;
+  }
+}

@@ -313,32 +313,36 @@ export function Composer({
           {(model ?? 'model').replace(/^claude-/, '').slice(0, 9)}
           {effort !== 'normal' ? ` · ${effortLabel}` : ''}
         </button>
-        {running ? (
+        {/* Stop is its own control, not a replacement for send: it is drawn as
+            a square in a ring so it reads as "stop", and it only appears while
+            there is a run to stop. Send keeps its arrow either way. */}
+        {running && (
           <button
             type="button"
             aria-label="Stop the current run"
+            title="Interrupt the run with whatever is typed"
             onMouseDown={keepFocus}
             className={`${icon} text-warn`}
             onClick={() => void act('interrupt')}
           >
-            <svg viewBox="0 0 24 24" className="h-5 w-5" fill="currentColor" aria-hidden="true">
-              <rect x="6" y="6" width="12" height="12" rx="2" />
-            </svg>
-          </button>
-        ) : (
-          <button
-            type="button"
-            aria-label="Send"
-            onMouseDown={keepFocus}
-            className={`${icon} ${sendable ? 'text-fg' : 'text-fg-faint'}`}
-            onClick={() => void act('send')}
-            disabled={busy || !sendable}
-          >
-            <svg viewBox="0 0 24 24" className="h-6 w-6" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-              <path d="M12 19V5M5 12l7-7 7 7" />
+            <svg viewBox="0 0 24 24" className="h-6 w-6" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
+              <circle cx="12" cy="12" r="9" />
+              <rect x="9" y="9" width="6" height="6" rx="1" fill="currentColor" stroke="none" />
             </svg>
           </button>
         )}
+        <button
+          type="button"
+          aria-label="Send"
+          onMouseDown={keepFocus}
+          className={`${icon} ${sendable ? 'text-fg' : 'text-fg-faint'}`}
+          onClick={() => void act('send')}
+          disabled={busy || !sendable}
+        >
+          <svg viewBox="0 0 24 24" className="h-6 w-6" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+            <path d="M12 19V5M5 12l7-7 7 7" />
+          </svg>
+        </button>
       </div>
     </div>
   );
