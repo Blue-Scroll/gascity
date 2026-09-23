@@ -5,7 +5,8 @@ import {
   type SessionStructuredMessage,
 } from 'gas-city-dashboard-shared';
 import { PendingInteractionView } from '../components/structured/StructuredTranscript';
-import { MessageCard } from '../components/session/MessageCard';
+import { MessageCard, resultText, type ToolCall } from '../components/session/MessageCard';
+import { ToolSheet } from '../components/session/ToolSheet';
 import { useStructuredSessionStream } from '../hooks/useStructuredSessionStream';
 import {
   fetchStructuredTranscriptPage,
@@ -31,17 +32,19 @@ const OLDER_WINDOW = 400; // messages held above the live tail before the oldest
 const NEAR_TOP = 320; // px from the top that triggers the next page
 const NEAR_BOTTOM = 48; // px from the bottom that still counts as "live"
 
-function messageText(m: SessionStructuredMessage): string {
-  return (m.blocks ?? [])
-    .map((b) => {
-      if (b.type === 'text') return b.text ?? '';
-      if (b.type === 'tool_use') return `[${b.name}]`;
-      if (b.type === 'tool_result') return typeof b.content === 'string' ? b.content : '';
-      return '';
-    })
-    .filter(Boolean)
-    .join('\n\n')
-    .trim();
+// A tool's output arrives as its own block in a later message, keyed by the id
+// of the call that made it. Pairing them here is what lets a call show its
+// output without the feed carrying both.
+function resultsByCall(messages: SessionStructuredMessage[]): Map<string, string> {
+  const map = new Map<string, string>();
+  for (const m of messages) {
+    for (const b of m.blocks ?? []) {
+      if (b.type !== 'tool_result') continue;
+      const id = (b as { tool_call_id?: string }).tool_call_id;
+      if (id) map.set(id, resultText(b));
+    }
+  }
+  return map;
 }
 
 export function SessionPage() {
@@ -63,6 +66,7 @@ export function SessionPage() {
   // snaps shut when they return to the tail.
   const [revealed, setRevealed] = useState(LIVE_TAIL);
   const [toast, setToast] = useState('');
+  const [tool, setTool] = useState<ToolCall | null>(null);
   // On a phone the software keyboard covers the bottom of a fixed layout. The
   // visual viewport is the only thing that knows how much room is really left,
   // so the shell is sized from it and the tail stays visible while typing.
@@ -74,6 +78,7 @@ export function SessionPage() {
   const live = allLive.slice(-revealed);
   const moreInSegment = allLive.length > live.length;
   const liveMessages = live.flatMap((i) => (i.kind === 'message' ? [i.message] : []));
+  const results = resultsByCall([...older, ...liveMessages]);
   const oldestLiveId = liveMessages[0]?.id;
   const seen = new Set(liveMessages.map((m) => m.id));
 
@@ -171,10 +176,10 @@ export function SessionPage() {
     if (el) el.scrollTop = el.scrollHeight;
   };
 
-  const copyMessage = async (m: SessionStructuredMessage) => {
+  const copy = async (text: string, what: string) => {
     try {
-      await navigator.clipboard.writeText(messageText(m));
-      flash('copied');
+      await navigator.clipboard.writeText(text);
+      flash(`${what} copied`);
     } catch {
       flash('clipboard blocked');
     }
@@ -234,11 +239,16 @@ export function SessionPage() {
           {older
             .filter((m) => !seen.has(m.id))
             .map((m) => (
-              <MessageCard key={`o-${m.id}`} message={m} onCopy={copyMessage} />
+              <MessageCard key={`o-${m.id}`} message={m} onCopy={copy} onOpenTool={setTool} />
             ))}
           {live.map((item) =>
             item.kind === 'message' ? (
-              <MessageCard key={`m-${item.message.id}`} message={item.message} onCopy={copyMessage} />
+              <MessageCard
+                key={`m-${item.message.id}`}
+                message={item.message}
+                onCopy={copy}
+                onOpenTool={setTool}
+              />
             ) : (
               <div key={`p-${item.pending.request_id}`}>
                 <PendingInteractionView pending={item.pending} />
@@ -275,6 +285,16 @@ export function SessionPage() {
             Jump to live ↓
           </button>
         </div>
+      )}
+
+      {tool && (
+        <ToolSheet
+          name={tool.name}
+          command={tool.command}
+          output={results.get(tool.id) ?? null}
+          onClose={() => setTool(null)}
+          onCopy={copy}
+        />
       )}
 
       {!readOnly && (
