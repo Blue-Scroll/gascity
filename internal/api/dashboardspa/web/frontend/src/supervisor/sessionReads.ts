@@ -95,6 +95,20 @@ export async function sendMessageToSession(sessionId: string, message: string): 
   );
 }
 
+/**
+ * Cut the current run short. gc's only interrupt is a submit that replaces the
+ * run's remaining work with a message, so an empty one is refused by the API;
+ * the caller passes whatever the operator had typed, or a plain stop.
+ */
+export async function interruptSession(sessionId: string, message: string): Promise<void> {
+  await supervisorApi().submitSession(
+    activeCityOrThrow('interrupt a session'),
+    sessionId,
+    message.trim() === '' ? 'stop' : message,
+    'interrupt_now',
+  );
+}
+
 export function structuredTranscriptOrNull(
   transcript: SessionTranscriptGetResponse,
 ): SessionStreamStructuredMessageEvent | null {

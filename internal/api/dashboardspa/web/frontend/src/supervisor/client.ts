@@ -30,6 +30,7 @@ import {
   respondSession as postSupervisorSessionRespond,
   sendMail as postSupervisorMail,
   sendSessionMessage as postSupervisorSessionMessage,
+  submitSession as postSupervisorSessionSubmit,
 } from 'gas-city-dashboard-shared/gc-supervisor';
 import type {
   Bead,
@@ -185,6 +186,17 @@ export interface SupervisorApi {
   ): Promise<SessionTranscriptGetResponse>;
   /** Send a message to a running session, as the operator. */
   sendSessionMessage(cityName: string, sessionId: string, message: string): Promise<unknown>;
+  /**
+   * Submit with an intent. `interrupt_now` cuts the current run short and
+   * delivers this message in its place, which is the only interrupt the API
+   * offers: it requires a message, so a bare "stop" is still a message.
+   */
+  submitSession(
+    cityName: string,
+    sessionId: string,
+    message: string,
+    intent?: 'default' | 'follow_up' | 'interrupt_now',
+  ): Promise<unknown>;
   workflowRun(
     cityName: string,
     workflowId: string,
@@ -537,6 +549,17 @@ export function createSupervisorApi(options: CreateSupervisorApiOptions = {}): S
           query,
         }) as Promise<SupervisorResult<SessionTranscriptGetResponse>>,
         'gc supervisor transcript response was empty',
+      );
+    },
+    submitSession(cityName, sessionId, message, intent) {
+      return unwrapSupervisorResult<unknown>(
+        postSupervisorSessionSubmit({
+          client,
+          path: { cityName, id: sessionId },
+          headers: GC_MUTATION_HEADERS,
+          body: { message, ...(intent ? { intent } : {}) },
+        }) as Promise<SupervisorResult<unknown>>,
+        'gc supervisor session submit response was empty',
       );
     },
     sendSessionMessage(cityName, sessionId, message) {

@@ -7,7 +7,11 @@ import {
 import { PendingInteractionView } from '../components/structured/StructuredTranscript';
 import { MessageCard } from '../components/session/MessageCard';
 import { useStructuredSessionStream } from '../hooks/useStructuredSessionStream';
-import { fetchStructuredTranscriptPage, sendMessageToSession } from '../supervisor/sessionReads';
+import {
+  fetchStructuredTranscriptPage,
+  interruptSession,
+  sendMessageToSession,
+} from '../supervisor/sessionReads';
 import { useReadOnly } from '../contexts/ReadOnlyContext';
 import { Composer } from '../components/session/Composer';
 
@@ -57,9 +61,13 @@ export function SessionPage() {
   // JSON does — so the DOM is a window that grows as the operator reads back and
   // snaps shut when they return to the tail.
   const [revealed, setRevealed] = useState(LIVE_TAIL);
-  const [composerOpen, setComposerOpen] = useState(false);
   const [toast, setToast] = useState('');
+  // On a phone the software keyboard covers the bottom of a fixed layout. The
+  // visual viewport is the only thing that knows how much room is really left,
+  // so the shell is sized from it and the tail stays visible while typing.
+  const [viewport, setViewport] = useState<{ height: number; top: number } | null>(null);
   const keepScroll = useRef<number | null>(null);
+  const atLiveRef = useRef(true);
 
   const allLive = state.status === 'ready' ? state.result.items : [];
   const live = allLive.slice(-revealed);
@@ -67,6 +75,24 @@ export function SessionPage() {
   const liveMessages = live.flatMap((i) => (i.kind === 'message' ? [i.message] : []));
   const oldestLiveId = liveMessages[0]?.id;
   const seen = new Set(liveMessages.map((m) => m.id));
+
+  useEffect(() => {
+    const vv = window.visualViewport;
+    if (!vv) return;
+    const sync = () => {
+      setViewport({ height: vv.height, top: vv.offsetTop });
+      // Keep the newest message in view as the keyboard opens and closes.
+      const el = scroller.current;
+      if (el && atLiveRef.current) el.scrollTop = el.scrollHeight;
+    };
+    sync();
+    vv.addEventListener('resize', sync);
+    vv.addEventListener('scroll', sync);
+    return () => {
+      vv.removeEventListener('resize', sync);
+      vv.removeEventListener('scroll', sync);
+    };
+  }, []);
 
   const flash = useCallback((m: string) => {
     setToast(m);
@@ -122,6 +148,7 @@ export function SessionPage() {
     if (!el) return;
     const bottom = el.scrollHeight - el.scrollTop - el.clientHeight;
     const nowLive = bottom <= NEAR_BOTTOM;
+    atLiveRef.current = nowLive;
     setAtLive(nowLive);
     // Back at the tail: the pages read on the way up are no longer on screen,
     // so drop them rather than grow the document for the rest of the session.
@@ -138,6 +165,7 @@ export function SessionPage() {
     setHasOlder(true);
     setRevealed(LIVE_TAIL);
     setAtLive(true);
+    atLiveRef.current = true;
     const el = scroller.current;
     if (el) el.scrollTop = el.scrollHeight;
   };
@@ -153,20 +181,41 @@ export function SessionPage() {
 
   const send = async (text: string) => {
     await sendMessageToSession(id, text);
-    setComposerOpen(false);
     toLive();
     flash('sent');
   };
+
+  const interrupt = async (text: string) => {
+    await interruptSession(id, text);
+    toLive();
+    flash('interrupted');
+  };
+
+  // What the agent is doing, and on what. Both come from the stream, so the
+  // composer can offer Stop only while there is something to stop.
+  const running = state.status === 'ready' && state.result.activity === 'in-turn';
+  const model =
+    [...liveMessages]
+      .reverse()
+      .map((m) => (m as { model?: string }).model)
+      .find((v) => typeof v === 'string' && v !== '') ?? null;
 
   const pill =
     'pointer-events-auto rounded-full border border-rule bg-surface/90 backdrop-blur px-3 min-h-11 inline-flex items-center gap-1 text-label uppercase tracking-wider text-fg-muted shadow-sm focus-mark';
 
   return (
-    <div className="fixed inset-0 z-50 flex flex-col bg-surface">
+    <div
+      className="fixed inset-x-0 z-50 flex flex-col bg-surface"
+      style={
+        viewport
+          ? { top: viewport.top, height: viewport.height }
+          : { top: 0, height: '100dvh' }
+      }
+    >
       <div
         ref={scroller}
         onScroll={onScroll}
-        className="flex-1 overflow-y-auto overscroll-contain px-3 pb-28"
+        className="min-h-0 flex-1 overflow-y-auto overscroll-contain px-3 pb-3"
         style={{ paddingTop: 'calc(env(safe-area-inset-top) + 4.25rem)' }}
       >
         {(hasOlder || moreInSegment) && (
@@ -218,24 +267,26 @@ export function SessionPage() {
         )}
       </div>
 
-      <div
-        className="pointer-events-none absolute inset-x-0 bottom-0 flex items-center justify-end gap-2 px-3 pb-3"
-        style={{ paddingBottom: 'calc(env(safe-area-inset-bottom) + 0.75rem)' }}
-      >
-        {!atLive && (
-          <button type="button" onClick={toLive} className={`${pill} mr-auto`}>
+      {/* Above the composer, not over it, so it is reachable with the keyboard up. */}
+      {!atLive && (
+        <div className="pointer-events-none absolute inset-x-0 bottom-16 flex justify-center">
+          <button type="button" onClick={toLive} className={pill}>
             Jump to live ↓
           </button>
-        )}
-        {!readOnly && (
-          <button type="button" onClick={() => setComposerOpen(true)} className={pill}>
-            Message
-          </button>
-        )}
-      </div>
+        </div>
+      )}
 
-      {composerOpen && (
-        <Composer sessionId={id} onSend={send} onClose={() => setComposerOpen(false)} onNotice={flash} />
+      {!readOnly && (
+        <div style={{ paddingBottom: 'env(safe-area-inset-bottom)' }}>
+          <Composer
+            sessionId={id}
+            running={running}
+            model={model}
+            onSend={send}
+            onInterrupt={interrupt}
+            onNotice={flash}
+          />
+        </div>
       )}
     </div>
   );
