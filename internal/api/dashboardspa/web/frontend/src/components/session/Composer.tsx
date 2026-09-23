@@ -31,12 +31,17 @@ const EFFORT: ReadonlyArray<{ id: string; label: string; phrase: string }> = [
 
 const UPLOAD_URL = '/upload';
 
+// An attachment is held in the browser until the message is actually sent.
+// Nothing reaches the machine's disk for a file that is attached and then
+// removed, or typed alongside and then abandoned.
 interface Attachment {
   key: string;
   name: string;
-  path: string;
+  file: File;
   preview: string | null; // object URL, images only
 }
+
+let attachSeq = 0;
 
 export function Composer({
   sessionId,
@@ -77,63 +82,62 @@ export function Composer({
       return list.filter((a) => a.key !== key);
     });
 
-  // Attachments: the bytes are written beside the city and the message carries
-  // their paths, which is how a coding agent takes a file anyway. Any type —
-  // the agent decides what it can read, not us.
-  const upload = async (files: File[]) => {
+  // Picking or pasting only stages the file in the browser.
+  const stage = (files: File[]) => {
     if (files.length === 0) return;
-    setBusy(true);
-    try {
-      for (const f of files) {
-        const body = new FormData();
-        body.append('file', f, f.name);
-        body.append('session', sessionId);
-        const res = await fetch(UPLOAD_URL, {
-          method: 'POST',
-          body,
-          headers: { 'X-GC-Request': '1' },
-        });
-        if (res.status === 404) {
-          onNotice('attachments are not set up on this machine');
-          return;
-        }
-        if (!res.ok) {
-          onNotice(`${f.name}: attachment failed (${res.status})`);
-          continue;
-        }
-        const out = (await res.json()) as { path?: string; name?: string };
-        if (!out.path) {
-          onNotice(`${f.name}: attachment failed`);
-          continue;
-        }
-        setAttachments((list) => [
-          ...list,
-          {
-            key: out.path as string,
-            name: out.name ?? f.name,
-            path: out.path as string,
-            preview: f.type.startsWith('image/') ? URL.createObjectURL(f) : null,
-          },
-        ]);
+    setAttachments((list) => [
+      ...list,
+      ...files.map((f) => ({
+        key: `a${(attachSeq += 1)}`,
+        name: f.name || 'file',
+        file: f,
+        preview: f.type.startsWith('image/') ? URL.createObjectURL(f) : null,
+      })),
+    ]);
+    box.current?.focus();
+  };
+
+  // The write happens here, at send, and only for what is still attached. An
+  // agent reads a file from the filesystem by path, so the bytes have to land
+  // somewhere it can see; they land in a swept directory with a short life
+  // rather than a permanent one.
+  const writeAttachments = async (list: Attachment[]): Promise<string[] | null> => {
+    const paths: string[] = [];
+    for (const a of list) {
+      const body = new FormData();
+      body.append('file', a.file, a.name);
+      body.append('session', sessionId);
+      const res = await fetch(UPLOAD_URL, { method: 'POST', body, headers: { 'X-GC-Request': '1' } });
+      if (res.status === 404) {
+        onNotice('attachments are not set up on this machine');
+        return null;
       }
-    } catch {
-      onNotice('attachment failed');
-    } finally {
-      setBusy(false);
-      box.current?.focus();
+      if (!res.ok) {
+        onNotice(`${a.name}: attachment failed (${res.status})`);
+        return null;
+      }
+      const out = (await res.json()) as { path?: string };
+      if (!out.path) {
+        onNotice(`${a.name}: attachment failed`);
+        return null;
+      }
+      paths.push(out.path);
     }
+    return paths;
   };
 
   const act = async (kind: 'send' | 'interrupt') => {
     if (busy) return;
     const typed = text.trim();
     const phrase = EFFORT.find((e) => e.id === effort)?.phrase ?? '';
-    // Paths go in as their own lines so the agent reads them as files, and the
-    // effort word rides at the end where Claude Code looks for it.
-    const body = [typed, ...attachments.map((a) => a.path), phrase].filter(Boolean).join('\n');
-    if (kind === 'send' && !body) return;
+    if (kind === 'send' && !typed && attachments.length === 0) return;
     setBusy(true);
     try {
+      const paths = attachments.length > 0 ? await writeAttachments(attachments) : [];
+      if (paths === null) return; // a failed write must not send a half message
+      // Paths go in as their own lines so the agent reads them as files, and the
+      // effort word rides at the end where Claude Code looks for it.
+      const body = [typed, ...paths, phrase].filter(Boolean).join('\n');
       if (kind === 'send') await onSend(body);
       else await onInterrupt(body);
       setText('');
@@ -267,7 +271,6 @@ export function Composer({
           onMouseDown={keepFocus}
           className={icon}
           onClick={() => file.current?.click()}
-          disabled={busy}
         >
           <svg viewBox="0 0 24 24" className="h-6 w-6" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" aria-hidden="true">
             <path d="M12 5v14M5 12h14" />
@@ -279,7 +282,7 @@ export function Composer({
           multiple
           className="hidden"
           onChange={(e) => {
-            void upload(Array.from(e.target.files ?? []));
+            stage(Array.from(e.target.files ?? []));
             e.target.value = '';
           }}
         />
@@ -293,7 +296,7 @@ export function Composer({
             const files = Array.from(e.clipboardData.files);
             if (files.length > 0) {
               e.preventDefault();
-              void upload(files);
+              stage(files);
             }
           }}
           rows={1}
