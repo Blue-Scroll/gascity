@@ -14,6 +14,7 @@ import {
 } from '../supervisor/sessionReads';
 import { useReadOnly } from '../contexts/ReadOnlyContext';
 import { Composer } from '../components/session/Composer';
+import { keepFocus } from '../lib/keepFocus';
 
 // A session, read the way a conversation is read: the transcript owns the whole
 // viewport and every control floats out of its way. The structured plane already
@@ -270,7 +271,7 @@ export function SessionPage() {
       {/* Above the composer, not over it, so it is reachable with the keyboard up. */}
       {!atLive && (
         <div className="pointer-events-none absolute inset-x-0 bottom-16 flex justify-center">
-          <button type="button" onClick={toLive} className={pill}>
+          <button type="button" onMouseDown={keepFocus} onClick={toLive} className={pill}>
             Jump to live ↓
           </button>
         </div>

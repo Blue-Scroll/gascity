@@ -1,4 +1,5 @@
 import type { SessionStructuredBlock, SessionStructuredMessage } from 'gas-city-dashboard-shared';
+import { keepFocus } from '../../lib/keepFocus';
 
 // A message as a phone reads it. The shared transcript renderer prints every
 // field a debugger could want — model, token counts, full tool input, full tool
@@ -121,6 +122,7 @@ export function MessageCard({
         {time && <span className={chip}>{time}</span>}
         <button
           type="button"
+          onMouseDown={keepFocus}
           onClick={() => onCopy(message)}
           aria-label="Copy this message"
           className="ml-auto min-h-11 px-1 text-label uppercase tracking-wider text-fg-faint hover:text-fg focus-mark"

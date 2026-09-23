@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
+import { keepFocus } from '../../lib/keepFocus';
 
 // Claude Code's own slash commands. The agent interprets whatever is sent, so
 // this list is an affordance rather than a contract: a command it does not know
@@ -15,12 +16,27 @@ const SLASH: ReadonlyArray<{ cmd: string; hint: string }> = [
   { cmd: '/usage', hint: 'limits and usage' },
 ];
 
-// Whatever the operator can pick without knowing an exact model id. Sent as
-// Claude Code's own /model command, so the agent owns the vocabulary and this
-// list never has to track a model catalogue.
+// Picked without needing an exact model id; sent as Claude Code's own /model,
+// so the agent owns the vocabulary and no catalogue lives here.
 const MODELS = ['default', 'opus', 'sonnet', 'haiku'] as const;
 
+// How hard to think. Claude Code takes this as words in the message rather than
+// a setting, so a choice here rides along with whatever is sent next.
+const EFFORT: ReadonlyArray<{ id: string; label: string; phrase: string }> = [
+  { id: 'normal', label: 'normal', phrase: '' },
+  { id: 'think', label: 'think', phrase: 'think' },
+  { id: 'harder', label: 'think harder', phrase: 'think harder' },
+  { id: 'ultra', label: 'ultrathink', phrase: 'ultrathink' },
+];
+
 const UPLOAD_URL = '/upload';
+
+interface Attachment {
+  key: string;
+  name: string;
+  path: string;
+  preview: string | null; // object URL, images only
+}
 
 export function Composer({
   sessionId,
@@ -38,36 +54,68 @@ export function Composer({
   onNotice: (m: string) => void;
 }) {
   const [text, setText] = useState('');
+  const [attachments, setAttachments] = useState<Attachment[]>([]);
   const [busy, setBusy] = useState(false);
-  const [models, setModels] = useState(false);
+  const [sheet, setSheet] = useState(false);
+  const [effort, setEffort] = useState('normal');
   const box = useRef<HTMLTextAreaElement>(null);
   const file = useRef<HTMLInputElement>(null);
 
-  const grow = () => {
+  useEffect(() => {
     const el = box.current;
     if (!el) return;
     el.style.height = 'auto';
     el.style.height = `${Math.min(el.scrollHeight, 140)}px`;
-  };
-  useEffect(grow, [text]);
+  }, [text]);
+
+  // Object URLs are only released when the chip goes away, so a preview stays
+  // valid for as long as it is on screen.
+  const drop = (key: string) =>
+    setAttachments((list) => {
+      const gone = list.find((a) => a.key === key);
+      if (gone?.preview) URL.revokeObjectURL(gone.preview);
+      return list.filter((a) => a.key !== key);
+    });
 
   // Attachments: the bytes are written beside the city and the message carries
-  // the path, which is how a coding agent takes a file anyway. Any type — the
-  // agent decides what it can read, not us.
-  const upload = async (f: File) => {
+  // their paths, which is how a coding agent takes a file anyway. Any type —
+  // the agent decides what it can read, not us.
+  const upload = async (files: File[]) => {
+    if (files.length === 0) return;
     setBusy(true);
     try {
-      const body = new FormData();
-      body.append('file', f, f.name);
-      body.append('session', sessionId);
-      const res = await fetch(UPLOAD_URL, { method: 'POST', body, headers: { 'X-GC-Request': '1' } });
-      if (res.status === 404) return onNotice('attachments are not set up on this machine');
-      if (!res.ok) return onNotice(`attachment failed (${res.status})`);
-      const out = (await res.json()) as { path?: string; name?: string };
-      const stored = out.path;
-      if (!stored) return onNotice('attachment failed');
-      setText((t) => (t ? `${t}\n${stored}` : stored));
-      onNotice(`attached ${out.name ?? f.name}`);
+      for (const f of files) {
+        const body = new FormData();
+        body.append('file', f, f.name);
+        body.append('session', sessionId);
+        const res = await fetch(UPLOAD_URL, {
+          method: 'POST',
+          body,
+          headers: { 'X-GC-Request': '1' },
+        });
+        if (res.status === 404) {
+          onNotice('attachments are not set up on this machine');
+          return;
+        }
+        if (!res.ok) {
+          onNotice(`${f.name}: attachment failed (${res.status})`);
+          continue;
+        }
+        const out = (await res.json()) as { path?: string; name?: string };
+        if (!out.path) {
+          onNotice(`${f.name}: attachment failed`);
+          continue;
+        }
+        setAttachments((list) => [
+          ...list,
+          {
+            key: out.path as string,
+            name: out.name ?? f.name,
+            path: out.path as string,
+            preview: f.type.startsWith('image/') ? URL.createObjectURL(f) : null,
+          },
+        ]);
+      }
     } catch {
       onNotice('attachment failed');
     } finally {
@@ -77,21 +125,26 @@ export function Composer({
   };
 
   const act = async (kind: 'send' | 'interrupt') => {
-    const body = text.trim();
     if (busy) return;
+    const typed = text.trim();
+    const phrase = EFFORT.find((e) => e.id === effort)?.phrase ?? '';
+    // Paths go in as their own lines so the agent reads them as files, and the
+    // effort word rides at the end where Claude Code looks for it.
+    const body = [typed, ...attachments.map((a) => a.path), phrase].filter(Boolean).join('\n');
     if (kind === 'send' && !body) return;
     setBusy(true);
     try {
       if (kind === 'send') await onSend(body);
       else await onInterrupt(body);
       setText('');
+      attachments.forEach((a) => a.preview && URL.revokeObjectURL(a.preview));
+      setAttachments([]);
     } catch {
       onNotice(kind === 'send' ? 'could not send' : 'could not interrupt');
     } finally {
       setBusy(false);
       // The keyboard stays up: sending one message usually means sending
-      // another, and on a phone dismissing it costs a tap and the scroll
-      // position both.
+      // another, and dismissing it costs a tap and the scroll position both.
       box.current?.focus();
     }
   };
@@ -99,9 +152,13 @@ export function Composer({
   const word = text.split(/\s/).pop() ?? '';
   const showSlash = word.startsWith('/') && !text.includes('\n');
   const matches = SLASH.filter((s) => s.cmd.startsWith(word));
+  const effortLabel = EFFORT.find((e) => e.id === effort)?.label ?? 'normal';
+  const sendable = text.trim() !== '' || attachments.length > 0;
 
   const icon =
     'inline-flex h-11 w-11 shrink-0 items-center justify-center rounded-full text-fg-muted hover:text-fg focus-mark';
+  const rowButton =
+    'min-h-11 rounded-full border border-rule px-3 text-label uppercase tracking-wider focus-mark';
 
   return (
     <div className="shrink-0 border-t border-rule bg-surface">
@@ -111,6 +168,7 @@ export function Composer({
             <li key={s.cmd}>
               <button
                 type="button"
+                onMouseDown={keepFocus}
                 className="flex min-h-11 w-full items-baseline gap-3 px-4 text-left focus-mark"
                 onClick={() => {
                   setText((t) => `${t.slice(0, t.length - word.length)}${s.cmd} `);
@@ -124,35 +182,104 @@ export function Composer({
           ))}
         </ul>
       )}
-      {models && (
-        <ul className="flex flex-wrap gap-1 border-b border-rule px-2 py-1">
-          {MODELS.map((m) => (
-            <li key={m}>
+
+      {sheet && (
+        <div className="border-b border-rule px-3 py-2 space-y-2">
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="text-label uppercase tracking-wider text-fg-faint">model</span>
+            {MODELS.map((m) => (
               <button
+                key={m}
                 type="button"
-                className="min-h-11 px-3 text-label uppercase tracking-wider text-fg-muted focus-mark"
+                onMouseDown={keepFocus}
+                className={`${rowButton} text-fg-muted`}
                 onClick={() => {
-                  setModels(false);
+                  setSheet(false);
                   void onSend(`/model ${m}`);
                 }}
               >
                 {m}
               </button>
+            ))}
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="text-label uppercase tracking-wider text-fg-faint">effort</span>
+            {EFFORT.map((e) => (
+              <button
+                key={e.id}
+                type="button"
+                onMouseDown={keepFocus}
+                className={`${rowButton} ${e.id === effort ? 'border-accent text-fg' : 'text-fg-muted'}`}
+                onClick={() => {
+                  setEffort(e.id);
+                  setSheet(false);
+                  box.current?.focus();
+                }}
+              >
+                {e.label}
+              </button>
+            ))}
+          </div>
+          <p className="text-label normal-case tracking-normal text-fg-faint">
+            Picking a model sends <span className="text-fg-muted">/model</span> to this agent now.
+            Claude Code also saves it as this machine&apos;s default for new sessions, so the
+            choice outlives this conversation. Effort rides along with the next message instead.
+          </p>
+        </div>
+      )}
+
+      {attachments.length > 0 && (
+        <ul className="flex flex-wrap gap-2 border-b border-rule px-2 py-2">
+          {attachments.map((a) => (
+            <li
+              key={a.key}
+              className="flex items-center gap-2 rounded-lg border border-rule bg-surface-tint py-1 pl-1 pr-1"
+            >
+              {a.preview ? (
+                <img src={a.preview} alt="" className="h-9 w-9 rounded object-cover" />
+              ) : (
+                <span
+                  aria-hidden="true"
+                  className="flex h-9 w-9 items-center justify-center rounded bg-surface text-label text-fg-muted"
+                >
+                  FILE
+                </span>
+              )}
+              <span className="max-w-32 truncate text-label text-fg">{a.name}</span>
+              <button
+                type="button"
+                onMouseDown={keepFocus}
+                onClick={() => drop(a.key)}
+                aria-label={`Remove ${a.name}`}
+                className="inline-flex h-9 w-9 items-center justify-center rounded-full text-fg-faint hover:text-fg focus-mark"
+              >
+                <span aria-hidden="true">×</span>
+              </button>
             </li>
           ))}
         </ul>
       )}
+
       <div className="flex items-end gap-1 px-1 py-1">
-        <button type="button" aria-label="Attach a file" className={icon} onClick={() => file.current?.click()} disabled={busy}>
-          <span className="text-title leading-none">+</span>
+        <button
+          type="button"
+          aria-label="Attach files"
+          onMouseDown={keepFocus}
+          className={icon}
+          onClick={() => file.current?.click()}
+          disabled={busy}
+        >
+          <svg viewBox="0 0 24 24" className="h-6 w-6" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" aria-hidden="true">
+            <path d="M12 5v14M5 12h14" />
+          </svg>
         </button>
         <input
           ref={file}
           type="file"
+          multiple
           className="hidden"
           onChange={(e) => {
-            const f = e.target.files?.[0];
-            if (f) void upload(f);
+            void upload(Array.from(e.target.files ?? []));
             e.target.value = '';
           }}
         />
@@ -161,10 +288,12 @@ export function Composer({
           value={text}
           onChange={(e) => setText(e.target.value)}
           onPaste={(e) => {
-            const f = Array.from(e.clipboardData.files)[0];
-            if (f) {
+            // Every file on the clipboard, not just the first — pasting two
+            // screenshots should attach two.
+            const files = Array.from(e.clipboardData.files);
+            if (files.length > 0) {
               e.preventDefault();
-              void upload(f);
+              void upload(files);
             }
           }}
           rows={1}
@@ -173,30 +302,38 @@ export function Composer({
         />
         <button
           type="button"
-          aria-label="Choose a model"
+          aria-label="Choose model and effort"
+          onMouseDown={keepFocus}
           className={`${icon} w-auto px-2 text-label uppercase tracking-wider`}
-          onClick={() => setModels((v) => !v)}
+          onClick={() => setSheet((v) => !v)}
         >
-          {(model ?? 'model').replace(/^claude-/, '').slice(0, 10)}
+          {(model ?? 'model').replace(/^claude-/, '').slice(0, 9)}
+          {effort !== 'normal' ? ` · ${effortLabel}` : ''}
         </button>
         {running ? (
           <button
             type="button"
             aria-label="Stop the current run"
+            onMouseDown={keepFocus}
             className={`${icon} text-warn`}
             onClick={() => void act('interrupt')}
           >
-            <span aria-hidden="true">◼</span>
+            <svg viewBox="0 0 24 24" className="h-5 w-5" fill="currentColor" aria-hidden="true">
+              <rect x="6" y="6" width="12" height="12" rx="2" />
+            </svg>
           </button>
         ) : (
           <button
             type="button"
             aria-label="Send"
-            className={`${icon} ${text.trim() ? 'text-fg' : 'text-fg-faint'}`}
+            onMouseDown={keepFocus}
+            className={`${icon} ${sendable ? 'text-fg' : 'text-fg-faint'}`}
             onClick={() => void act('send')}
-            disabled={busy || !text.trim()}
+            disabled={busy || !sendable}
           >
-            <span aria-hidden="true">↑</span>
+            <svg viewBox="0 0 24 24" className="h-6 w-6" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+              <path d="M12 19V5M5 12l7-7 7 7" />
+            </svg>
           </button>
         )}
       </div>
