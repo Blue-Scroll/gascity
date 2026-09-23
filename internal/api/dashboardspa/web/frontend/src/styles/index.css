@@ -285,3 +285,66 @@
     scroll-behavior: auto !important;
   }
 }
+
+/* ── Touch targets ────────────────────────────────────────────────────────────
+   The design language types controls rather than boxing them, which leaves most
+   of them 14–24px tall. That reads well with a mouse and is close to untappable
+   on a phone. Rather than box them (which would change the look everywhere), a
+   coarse pointer gets an invisible hit area centred on each control: the
+   pseudo-element is part of the element for hit testing, so the tap lands on the
+   control while the ink stays exactly where the designer put it.
+   Replaced elements (select, input) cannot carry ::after, so they get a real
+   minimum instead. */
+@media (pointer: coarse) {
+  button,
+  summary,
+  [role='button'],
+  a.tap {
+    position: relative;
+  }
+  button::after,
+  summary::after,
+  [role='button']::after,
+  a.tap::after {
+    content: '';
+    position: absolute;
+    /* A little horizontal room too: several controls are narrower than a
+       fingertip ("All", a sort caret). Kept small so neighbours in a gap-6 row
+       never overlap. */
+    left: -6px;
+    right: -6px;
+    top: 50%;
+    height: max(100%, 44px);
+    transform: translateY(-50%);
+  }
+  /* A control that already boxes itself, or one drawn inside a scroller where a
+     taller hit area would overlap a neighbour, opts out. */
+  .no-tap::after {
+    content: none;
+  }
+  select,
+  input[type='text'],
+  input[type='search'],
+  input[type='number'] {
+    min-height: 44px;
+  }
+  input[type='checkbox'],
+  input[type='radio'] {
+    min-width: 24px;
+    min-height: 24px;
+  }
+}
+
+/* ── Edge-to-edge scrollers ───────────────────────────────────────────────────
+   A wide table inside the page gutter looks clipped and scrolls in a narrow
+   channel. On phones let it bleed into the gutter so the full width is usable,
+   and keep momentum scrolling. */
+@media (max-width: 639px) {
+  .bleed-x {
+    margin-left: -1rem;
+    margin-right: -1rem;
+    padding-left: 1rem;
+    padding-right: 1rem;
+    -webkit-overflow-scrolling: touch;
+  }
+}

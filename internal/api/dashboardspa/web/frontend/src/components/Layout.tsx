@@ -10,9 +10,11 @@ interface LayoutProps {
 // gutters either side.
 export function Layout({ children }: LayoutProps) {
   return (
-    <div className="min-h-screen bg-surface text-fg antialiased">
+    <div className="min-h-[100dvh] bg-surface text-fg antialiased">
       <Header />
-      <main className="max-w-dashboard mx-auto px-4 sm:px-6 lg:px-8 py-12">{children}</main>
+      <main className="max-w-dashboard mx-auto px-4 sm:px-6 lg:px-8 py-6 sm:py-12 pb-[calc(1.5rem+env(safe-area-inset-bottom))]">
+        {children}
+      </main>
     </div>
   );
 }

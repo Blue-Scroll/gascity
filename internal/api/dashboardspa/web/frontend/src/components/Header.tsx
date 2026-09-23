@@ -1,4 +1,4 @@
-import { useMemo } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { NavLink, useLocation } from 'react-router-dom';
 import { api } from '../api/client';
 import { getActiveCity } from '../api/cityBase';
@@ -100,14 +100,121 @@ export function Header() {
     return [...EXPLICIT_ROUTES, ...registry].sort((a, b) => a.order - b.order);
   }, [config?.enabledModules]);
   const { pathname } = useLocation();
+  // Below `sm` the row of route names wraps to five lines and eats a third of a
+  // phone screen, so that layout is replaced by a compact bar plus a drawer.
+  // The drawer closes on navigation; the bar is sticky because a home-screen
+  // web app has no browser chrome to navigate with.
+  const [menuOpen, setMenuOpen] = useState(false);
+  useEffect(() => {
+    setMenuOpen(false);
+  }, [pathname]);
   // "Reading as" is a Mail-only concept — the value persists across views
   // (for AgentDetail's chat filter) but the header indicator only makes
   // sense inside the mail surface.
   const showReadingAs = !viewingAs.isOperator && pathname.startsWith('/mail');
 
+  const cityLabel = selectedCity || 'city';
+
   return (
-    <header className="border-b border-rule">
-      <div className="max-w-dashboard mx-auto px-4 sm:px-6 lg:px-8 py-5 flex items-baseline gap-x-6 lg:gap-x-8 gap-y-2 flex-wrap">
+    <header className="sticky top-0 z-40 border-b border-rule bg-surface">
+      {/* Phone bar: one row, a 44px menu button, and the city we are looking at. */}
+      <div className="sm:hidden flex items-center gap-2 px-4 h-14">
+        <button
+          type="button"
+          onClick={() => setMenuOpen((v) => !v)}
+          aria-expanded={menuOpen}
+          aria-controls="mobile-nav"
+          aria-label={menuOpen ? 'Close menu' : 'Open menu'}
+          className="-ml-2 inline-flex h-11 w-11 shrink-0 items-center justify-center text-fg-muted hover:text-fg focus-mark"
+        >
+          <svg viewBox="0 0 20 20" className="h-5 w-5" aria-hidden="true" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round">
+            {menuOpen ? (
+              <>
+                <path d="M5 5l10 10" />
+                <path d="M15 5L5 15" />
+              </>
+            ) : (
+              <>
+                <path d="M3 6h14" />
+                <path d="M3 10h14" />
+                <path d="M3 14h14" />
+              </>
+            )}
+          </svg>
+        </button>
+        <span className="text-title font-semibold tracking-tight text-fg">gas city</span>
+        <span className="text-label uppercase tracking-wider text-fg-muted truncate">
+          {cityLabel}
+        </span>
+        {readOnly && (
+          <span className="ml-auto text-label uppercase tracking-wider text-warn">read-only</span>
+        )}
+      </div>
+
+      {menuOpen && (
+        <nav id="mobile-nav" className="sm:hidden border-t border-rule pb-2">
+          <ul>
+            {ROUTES.map((r) => {
+              const domain = NAV_ATTENTION_DOMAINS[r.to];
+              return (
+                <li key={r.to}>
+                  <NavLink
+                    to={r.to}
+                    end={r.end ?? false}
+                    className={({ isActive }) =>
+                      [
+                        'flex min-h-11 items-center px-4 text-title transition-colors duration-150 ease-out-quart focus-mark',
+                        isActive ? 'text-fg font-semibold' : 'text-fg-muted font-medium',
+                      ].join(' ')
+                    }
+                  >
+                    {r.label}
+                    {domain !== undefined && (
+                      <NavAttentionIndicator label={r.label} summary={attention.byDomain[domain]} />
+                    )}
+                  </NavLink>
+                </li>
+              );
+            })}
+          </ul>
+          <div className="mt-1 border-t border-rule px-4 pt-2 flex items-center gap-4 flex-wrap">
+            {showSwitcher && (
+              <select
+                aria-label="Switch city"
+                value={selectedCity}
+                onChange={(e) => onSwitchCity(e.target.value)}
+                className="min-h-11 text-label uppercase tracking-wider text-fg-muted bg-transparent border-0 focus-mark"
+              >
+                {!activeCityKnown && selectedCity !== '' ? (
+                  <option value={selectedCity} disabled>
+                    {selectedCity} (unknown)
+                  </option>
+                ) : null}
+                {cityItems.map((c) => (
+                  <option key={c.name} value={c.name}>
+                    {c.name}
+                    {c.running ? '' : ' (stopped)'}
+                  </option>
+                ))}
+              </select>
+            )}
+            <button
+              type="button"
+              onClick={toggle}
+              className="min-h-11 text-label uppercase tracking-wider text-fg-muted focus-mark"
+            >
+              {resolved === 'dark' ? 'Light theme' : 'Dark theme'}
+            </button>
+            {showReadingAs && (
+              <span className="text-label uppercase tracking-wider text-accent">
+                reading as {displayLabel(viewingAs.alias, operatorAlias)}
+              </span>
+            )}
+          </div>
+        </nav>
+      )}
+
+      <div className="max-w-dashboard mx-auto px-4 sm:px-6 lg:px-8 py-5 hidden sm:flex items-baseline gap-x-6 lg:gap-x-8 gap-y-2 flex-wrap">
         <div className="flex items-baseline gap-3 min-w-0">
           <span className="text-title font-semibold tracking-tight text-fg">gas city</span>
           <span className="text-fg-muted" aria-hidden="true">

@@ -68,7 +68,7 @@ export function Table<T>({
   };
 
   return (
-    <div className="overflow-x-auto">
+    <div className="overflow-x-auto bleed-x">
       <table className="w-full text-body tnum">
         <thead>
           <tr className="border-b border-rule text-label uppercase tracking-wider text-fg-muted">

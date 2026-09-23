@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
+import { terminalEnabled, terminalRoute } from '../lib/terminal';
 import {
   GC_EVENT_PREFIX,
   effectiveContextPct,
@@ -290,6 +291,11 @@ export function AgentsPage() {
             ? `${r.name} — configured but not running; detail will show no live session`
             : `Open drilldown for ${r.name}`;
           const linkColor = orphan ? 'text-fg-muted' : 'text-fg';
+          // A terminal into this agent's own pane, when the deployment serves
+          // one. Rendered next to the name so it is reachable from the roster
+          // without opening the drilldown first.
+          const tmuxSession = r.session?.name ?? '';
+          const showTerminal = tmuxSession !== '' && terminalEnabled();
           return (
             <div className="min-w-0">
               <Link
@@ -301,9 +307,18 @@ export function AgentsPage() {
               >
                 {agentRowLabel(r)}
               </Link>
-              {secondary && (
-                <div className="text-label uppercase tracking-wider text-fg-faint mt-1 truncate">
-                  {secondary}
+              {(secondary || showTerminal) && (
+                <div className="text-label uppercase tracking-wider text-fg-faint mt-1 flex items-center gap-2 min-w-0">
+                  {secondary && <span className="truncate">{secondary}</span>}
+                  {showTerminal && (
+                    <Link
+                      to={terminalRoute(tmuxSession, '/agents')}
+                      className="shrink-0 text-fg-muted hover:text-accent focus-mark"
+                      title={`Open a terminal on ${tmuxSession}`}
+                    >
+                      terminal
+                    </Link>
+                  )}
                 </div>
               )}
             </div>
