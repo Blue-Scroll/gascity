@@ -129,21 +129,29 @@ export function Composer({
   const act = async (kind: 'send' | 'interrupt') => {
     if (busy) return;
     const typed = text.trim();
+    const staged = attachments;
     const phrase = EFFORT.find((e) => e.id === effort)?.phrase ?? '';
-    if (kind === 'send' && !typed && attachments.length === 0) return;
+    if (kind === 'send' && !typed && staged.length === 0) return;
     setBusy(true);
+    // Clear the moment the operator commits, not when the network agrees:
+    // waiting means their words sit in the box through the whole round trip and
+    // anything they type meanwhile is wiped when the clear finally lands.
+    setText('');
+    setAttachments([]);
     try {
-      const paths = attachments.length > 0 ? await writeAttachments(attachments) : [];
-      if (paths === null) return; // a failed write must not send a half message
+      const paths = staged.length > 0 ? await writeAttachments(staged) : [];
+      if (paths === null) throw new Error('attachment failed');
       // Paths go in as their own lines so the agent reads them as files, and the
       // effort word rides at the end where Claude Code looks for it.
       const body = [typed, ...paths, phrase].filter(Boolean).join('\n');
       if (kind === 'send') await onSend(body);
       else await onInterrupt(body);
-      setText('');
-      attachments.forEach((a) => a.preview && URL.revokeObjectURL(a.preview));
-      setAttachments([]);
+      staged.forEach((a) => a.preview && URL.revokeObjectURL(a.preview));
     } catch {
+      // Nothing was delivered, so give the operator their message back exactly
+      // as they had it rather than make them retype it.
+      setText(typed);
+      setAttachments(staged);
       onNotice(kind === 'send' ? 'could not send' : 'could not interrupt');
     } finally {
       setBusy(false);

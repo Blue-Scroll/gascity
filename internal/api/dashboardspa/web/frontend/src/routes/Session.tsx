@@ -67,6 +67,11 @@ export function SessionPage() {
   const [revealed, setRevealed] = useState(LIVE_TAIL);
   const [toast, setToast] = useState('');
   const [tool, setTool] = useState<ToolCall | null>(null);
+  // A sent message takes a round trip — the API hands it to the session, the
+  // agent writes it to its own log, and only then does the stream carry it back
+  // — which on a phone reads as the message vanishing. It is echoed locally the
+  // moment it is accepted, and dropped again when the real one arrives.
+  const [pending, setPending] = useState<Array<{ key: string; text: string; at: number }>>([]);
   // On a phone the software keyboard covers the bottom of a fixed layout. The
   // visual viewport is the only thing that knows how much room is really left,
   // so the shell is sized from it and the tail stays visible while typing.
@@ -149,6 +154,28 @@ export function SessionPage() {
     if (el) el.scrollTop = el.scrollHeight;
   }, [live.length, atLive]);
 
+  useEffect(() => {
+    if (pending.length === 0) return;
+    const said = liveMessages
+      .filter((m) => m.role === 'user')
+      .map((m) =>
+        (m.blocks ?? [])
+          .filter((b) => b.type === 'text')
+          .map((b) => (b as { text?: string }).text ?? '')
+          .join('\n'),
+      );
+    setPending((list) =>
+      list.filter((echo) => {
+        // The session wraps what it delivers, so a contains-match on the head
+        // of the message is what identifies it coming back.
+        const head = echo.text.trim().slice(0, 60);
+        const landed = head !== '' && said.some((t) => t.includes(head));
+        // And never leave an echo up forever if it never returns.
+        return !landed && Date.now() - echo.at < 180000;
+      }),
+    );
+  }, [liveMessages, pending.length]);
+
   const onScroll = useCallback(() => {
     const el = scroller.current;
     if (!el) return;
@@ -185,17 +212,24 @@ export function SessionPage() {
     }
   };
 
-  const send = async (text: string) => {
-    await sendMessageToSession(id, text);
+  // Echo first, then deliver: if the API refuses, the echo goes and the
+  // composer keeps the text, so nothing is silently lost.
+  const withEcho = async (text: string, deliver: () => Promise<void>, ok: string) => {
+    const key = `echo-${Date.now()}`;
+    setPending((list) => [...list, { key, text, at: Date.now() }]);
     toLive();
-    flash('sent');
+    try {
+      await deliver();
+      flash(ok);
+    } catch (e) {
+      setPending((list) => list.filter((x) => x.key !== key));
+      throw e;
+    }
   };
 
-  const interrupt = async (text: string) => {
-    await interruptSession(id, text);
-    toLive();
-    flash('interrupted');
-  };
+  const send = (text: string) => withEcho(text, () => sendMessageToSession(id, text), 'sent');
+  const interrupt = (text: string) =>
+    withEcho(text, () => interruptSession(id, text), 'interrupted');
 
   // What the agent is doing, and on what. Both come from the stream, so the
   // composer can offer Stop only while there is something to stop.
@@ -255,6 +289,16 @@ export function SessionPage() {
               </div>
             ),
           )}
+          {pending.map((echo) => (
+            <article
+              key={echo.key}
+              className="rounded-lg bg-surface-tint px-3 py-1.5 opacity-70"
+              aria-label="message being delivered"
+            >
+              <p className="whitespace-pre-wrap break-words text-body text-fg">{echo.text}</p>
+              <p className="mt-1 text-label uppercase tracking-wider text-fg-faint">sending…</p>
+            </article>
+          ))}
         </div>
       </div>
 
