@@ -60,6 +60,49 @@ func TestReservedPrefixes404(t *testing.T) {
 	}
 }
 
+// The phone dashboard's helpers live behind a proxy in front of gc. When one
+// of their paths reaches gc, nothing serves it, and the page must hear a 404
+// so it hides the control. The SPA shell (200) would read as "served".
+func TestSidecarPaths404(t *testing.T) {
+	h := newHandler(t)
+	for _, p := range []string{
+		"/upload",
+		"/pane?session=mayor&lines=1",
+		"/keys",
+		"/file?session=mayor&path=%2Ftmp%2Fa.png",
+		"/term",
+		"/term/",
+		"/term/token",
+	} {
+		rec := get(t, h, p)
+		if rec.Code != http.StatusNotFound {
+			t.Errorf("GET %s: status = %d, want 404 (sidecar path, not SPA shell)", p, rec.Code)
+		}
+	}
+}
+
+// The page's own client routes share a first few letters with the sidecar
+// paths. They are pages, so they must still get the SPA shell.
+func TestPhoneClientRoutesServeTheShell(t *testing.T) {
+	h := newHandler(t)
+	for _, p := range []string{"/terminal/mayor", "/session/gc-123", "/pane-notes", "/uploads"} {
+		rec := get(t, h, p)
+		if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `id="root"`) {
+			t.Errorf("GET %s: status = %d, want 200 with the SPA shell", p, rec.Code)
+		}
+	}
+}
+
+func TestManifestIsServedAsAManifest(t *testing.T) {
+	rec := get(t, newHandler(t), "/manifest.webmanifest")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /manifest.webmanifest: status = %d, want 200 (is dist/ rebuilt?)", rec.Code)
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "application/manifest+json" {
+		t.Errorf("manifest Content-Type = %q, want application/manifest+json", ct)
+	}
+}
+
 func TestHashedAssetIsImmutablyCached(t *testing.T) {
 	// Vite emits content-hashed files under dist/assets/; discover a real one
 	// from the embedded FS and confirm it is served with the immutable header.
@@ -93,6 +136,14 @@ func TestCSPPinsInlineScriptHash(t *testing.T) {
 	}
 	if !strings.Contains(csp, "frame-ancestors 'none'") {
 		t.Errorf("CSP missing frame-ancestors 'none': %q", csp)
+	}
+	// The in-app terminal frames /term/ on this same origin.
+	if !strings.Contains(csp, "frame-src 'self'") {
+		t.Errorf("CSP must allow framing this origin (frame-src 'self'): %q", csp)
+	}
+	// Attachment thumbnails are object URLs until the message is sent.
+	if !strings.Contains(csp, "img-src 'self' data: blob:") {
+		t.Errorf("CSP must allow blob: images for attachment thumbnails: %q", csp)
 	}
 }
 

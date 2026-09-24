@@ -30,6 +30,44 @@ var reservedPrefixes = []string{
 	"/debug/",
 }
 
+// sidecarPaths are never served by gc. A machine set up for the phone
+// dashboard puts its own proxy in front of gc, and that proxy sends these
+// paths to local helpers instead: /upload, /pane, /keys and /file to a small
+// attachment and pane service, and /term/ to a browser terminal. A request
+// for one of them only reaches gc when nothing in front of gc serves it.
+//
+// gc answers those with 404, and the page relies on that. It asks for each
+// path once and hides the matching control (attach, live pane, terminal link)
+// when the answer is not a success. If gc handed back the SPA shell instead
+// (200, HTML), every one of those checks would read as "served", and a laptop
+// on the plain supervisor would show controls that can only fail.
+//
+// Each entry matches itself and anything under it, so "/term" covers "/term/"
+// but not the page's own client route "/terminal/<session>".
+var sidecarPaths = []string{
+	"/upload",
+	"/pane",
+	"/keys",
+	"/file",
+	"/term",
+}
+
+// notForTheSPA reports whether a request path belongs to something other than
+// the SPA, so the catch-all must answer 404 rather than the app shell.
+func notForTheSPA(path string) bool {
+	for _, p := range reservedPrefixes {
+		if strings.HasPrefix(path, p) {
+			return true
+		}
+	}
+	for _, p := range sidecarPaths {
+		if path == p || strings.HasPrefix(path, p+"/") {
+			return true
+		}
+	}
+	return false
+}
+
 // NewStaticHandler returns the embedded-SPA handler. It serves hashed assets
 // with long-lived caching, serves index.html (no-store) for the app shell and
 // for any unknown client-side route, 404s the reserved non-SPA prefixes, and
@@ -49,11 +87,9 @@ func NewStaticHandler() (http.Handler, error) {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		for _, p := range reservedPrefixes {
-			if strings.HasPrefix(r.URL.Path, p) {
-				http.NotFound(w, r)
-				return
-			}
+		if notForTheSPA(r.URL.Path) {
+			http.NotFound(w, r)
+			return
 		}
 		setSecurityHeaders(w, csp)
 
@@ -69,6 +105,11 @@ func NewStaticHandler() (http.Handler, error) {
 				w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
 			} else {
 				w.Header().Set("Cache-Control", "no-cache")
+			}
+			// Go's own type table has no entry for a web app manifest, so
+			// without this it would go out as text/plain.
+			if strings.HasSuffix(path, ".webmanifest") {
+				w.Header().Set("Content-Type", "application/manifest+json")
 			}
 			fileServer.ServeHTTP(w, r)
 			return
@@ -123,13 +164,20 @@ func buildCSP(index []byte) string {
 		"default-src 'self'",
 		scriptSrc,
 		"style-src 'self' 'unsafe-inline'",
-		"img-src 'self' data:",
+		// blob: is for the composer. An image you attach is shown as a
+		// thumbnail from an object URL, because nothing is uploaded until
+		// the message is sent.
+		"img-src 'self' data: blob:",
 		"font-src 'self' data:",
 		"connect-src 'self'",
 		"base-uri 'self'",
 		"form-action 'self'",
+		// Nobody may frame the dashboard. The dashboard may frame its own
+		// origin: the in-app terminal page (/terminal/<session>) frames the
+		// browser terminal at /term/ on this same host, so a home-screen web
+		// app with no URL bar still has a Back button around it.
 		"frame-ancestors 'none'",
-		"frame-src 'none'",
+		"frame-src 'self'",
 		"worker-src 'self'",
 		"manifest-src 'self'",
 		"object-src 'none'",
