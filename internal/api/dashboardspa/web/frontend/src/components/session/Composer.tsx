@@ -16,9 +16,16 @@ const SLASH: ReadonlyArray<{ cmd: string; hint: string }> = [
   { cmd: '/usage', hint: 'limits and usage' },
 ];
 
-// Picked without needing an exact model id; sent as Claude Code's own /model,
-// so the agent owns the vocabulary and no catalogue lives here.
-const MODELS = ['default', 'opus', 'sonnet', 'haiku'] as const;
+// Sent as Claude Code's own /model, so the agent owns the vocabulary. The
+// short names are aliases Claude Code resolves itself; fable has no alias yet,
+// so it goes by its full id.
+const MODELS: ReadonlyArray<{ id: string; label: string }> = [
+  { id: 'default', label: 'default' },
+  { id: 'claude-fable-5-1', label: 'fable' },
+  { id: 'opus', label: 'opus' },
+  { id: 'sonnet', label: 'sonnet' },
+  { id: 'haiku', label: 'haiku' },
+];
 
 // How hard to think. Claude Code takes this as words in the message rather than
 // a setting, so a choice here rides along with whatever is sent next.
@@ -201,16 +208,16 @@ export function Composer({
             <span className="text-label uppercase tracking-wider text-fg-faint">model</span>
             {MODELS.map((m) => (
               <button
-                key={m}
+                key={m.id}
                 type="button"
                 onMouseDown={keepFocus}
                 className={`${rowButton} text-fg-muted`}
                 onClick={() => {
                   setSheet(false);
-                  void onSend(`/model ${m}`);
+                  void onSend(`/model ${m.id}`);
                 }}
               >
-                {m}
+                {m.label}
               </button>
             ))}
           </div>
