@@ -16,21 +16,29 @@ import (
 
 const nativeDoltStoreActor = "gascity"
 
-// nativeDoltOpenReadyStatuses lists the upstream bd statuses Ready() queries
-// GetReadyWork for. This must match IsReadyCandidateForTier's contract of
-// "open status ... and no future defer_until": only StatusOpen (bd's own
-// status-category table marks it the sole "active" category status) and
-// StatusDeferred (kept only because IsDeferred independently re-checks
-// DeferUntil, so an expired deferral must still resurface) belong here.
-// blocked/hooked are bd's "wip" category and pinned is "frozen" — bd's own
-// ready semantics already exclude them, and Gas City has no analogous
-// re-check for them the way it does for deferred, so querying for them let
-// dependency-blocked beads erase their status to "open" via mapBdStatus and
-// pass IsReadyCandidateForTier's status gate. See ga-3mv5d3 bead notes for
-// the full investigation.
+// nativeDoltOpenReadyStatuses lists the upstream bd statuses Ready() asks
+// GetReadyWork for. It must be exactly the set a worker can be served AND can
+// claim, or the controller counts demand that no seat can take.
+//
+// That set is StatusOpen alone. `bd ready` asks for Status "open" and nothing
+// else (cmd/bd/ready.go). `bd update --claim` also accepts custom statuses in
+// the "active" category (ClaimableSourceStatusesInTx), but `bd ready` never
+// serves those, so "open" is the only status both allow.
+//
+// StatusDeferred used to be here, so that an expired `bd defer --until` would
+// come back. It never comes back in bd: the row keeps status=deferred after
+// defer_until passes, until someone runs `bd undefer`. So gc called it ready,
+// mapBdStatus turned its status into "open", the controller spawned a seat for
+// it, and the seat's `bd ready` query never saw it. That repeated every few
+// minutes for as long as the row stayed deferred (vn-et2emvw). An open row with
+// a past defer_until is still ready here; IsDeferred handles the future case.
+//
+// blocked/hooked are bd's "wip" category and pinned is "frozen", and bd's own
+// ready semantics exclude them. Querying for them let a dependency-blocked
+// bead erase its status to "open" via mapBdStatus and pass
+// IsReadyCandidateForTier's status gate (ga-3mv5d3).
 var nativeDoltOpenReadyStatuses = []beadslib.Status{
 	beadslib.StatusOpen,
-	beadslib.StatusDeferred,
 }
 
 var (
@@ -1317,20 +1325,6 @@ func (s *NativeDoltStore) Ready(queries ...ReadyQuery) ([]Bead, error) {
 			return err
 		}
 		for _, issue := range issues {
-			// The StatusDeferred branch exists so an expired time-bound
-			// deferral (defer_until in the past) can resurface. An issue
-			// with no defer_until at all was never time-bound — it's bd
-			// defer's status-based indefinite deferral — and must stay
-			// hidden. mapBdStatus collapses status to "open" and
-			// IsDeferred only inspects DeferUntil, so both would
-			// otherwise look identical to an ordinary open bead once
-			// beadFromNativeIssue erases the raw status. The per-status
-			// loop keyed this on the filter status it was querying for;
-			// with the whole set in one call the row's own raw status is
-			// the equivalent discriminator.
-			if issue.Status == beadslib.StatusDeferred && issue.DeferUntil == nil {
-				continue
-			}
 			bead, err := beadFromNativeIssue(issue)
 			if err != nil {
 				return err
