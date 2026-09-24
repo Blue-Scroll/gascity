@@ -5,6 +5,7 @@ import { hideInputBox } from '../../lib/inputbox';
 import { reflow } from '../../lib/reflow';
 import { readPane, sendPaneKey, type Pane, type PaneKey } from '../../lib/pane';
 import { keepFocus } from '../../lib/keepFocus';
+import { READ_ONLY_CONTROL_TITLE } from '../../contexts/ReadOnlyContext';
 
 // The agent's pane, as it is drawn, in a phone-shaped viewport.
 //
@@ -124,9 +125,14 @@ function LineView({ line }: { line: Line }) {
 
 export function PaneView({
   session,
+  readOnly,
   onNotice,
 }: {
   session: string;
+  // A key press drives the agent, so it is a mutation. The keys go to the
+  // machine's pane helper, not to gc, so gc's read-only gate never sees them:
+  // the bar has to honour read-only itself.
+  readOnly: boolean;
   onNotice: (text: string) => void;
 }) {
   const scroller = useRef<HTMLDivElement>(null);
@@ -475,8 +481,10 @@ export function PaneView({
             type="button"
             onMouseDown={keepFocus}
             onClick={() => void press(b.key, b.hint)}
+            disabled={readOnly}
             aria-label={b.hint}
-            className="shrink-0 rounded-md bg-surface px-2.5 py-1.5 font-mono text-body text-fg active:bg-surface-tint"
+            title={readOnly ? READ_ONLY_CONTROL_TITLE : b.hint}
+            className="shrink-0 rounded-md bg-surface px-2.5 py-1.5 font-mono text-body text-fg active:bg-surface-tint disabled:opacity-50"
           >
             {b.label}
           </button>

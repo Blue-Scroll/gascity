@@ -1,6 +1,6 @@
 import { useCallback, useRef, useState } from 'react';
 import { Link, useParams, useSearchParams } from 'react-router-dom';
-import { terminalFrameUrl } from '../lib/terminal';
+import { terminalFrameUrl, useTerminalServed } from '../lib/terminal';
 
 // The terminal frame is same-origin with the dashboard, and the terminal server
 // puts its xterm instance on the frame's window, so the bar above can drive the
@@ -19,6 +19,9 @@ export function TerminalPage() {
   const [params] = useSearchParams();
   const back = params.get('back') ?? '/agents';
   const src = terminalFrameUrl(session);
+  // Framing a terminal that is not there would frame a 404. Wait for the
+  // machine's answer, then either frame it or say plainly that there is none.
+  const served = useTerminalServed();
   const frame = useRef<HTMLIFrameElement>(null);
   const [note, setNote] = useState('');
 
@@ -95,8 +98,8 @@ export function TerminalPage() {
           </button>
         </span>
       </div>
-      {src === null ? (
-        <p className="p-4 text-body text-fg-muted">No terminal is configured for this dashboard.</p>
+      {served === null ? null : src === null || !served ? (
+        <p className="p-4 text-body text-fg-muted">No terminal is served on this machine.</p>
       ) : (
         <iframe
           ref={frame}

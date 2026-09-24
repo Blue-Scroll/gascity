@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { sessionRoute } from '../lib/sessionLink';
+import { terminalRoute, useTerminalServed } from '../lib/terminal';
 import {
   GC_EVENT_PREFIX,
   effectiveContextPct,
@@ -193,6 +194,10 @@ export function AgentsPage() {
 
   const synopsis = useMemo(() => buildAgentSynopsis(rows), [rows]);
   const readOnly = useReadOnly();
+  // A terminal link per running agent, only where this machine serves one. The
+  // session view is the usual way in; the terminal is the escape hatch for what
+  // a transcript and the live pane cannot show (a startup dialog, a wedged TUI).
+  const terminalServed = useTerminalServed() === true;
   const handlePendingResponse = useCallback(
     async (pending: AgentPendingInteraction, action: 'approve' | 'deny') => {
       // Defense-in-depth: the disabled buttons already block this, but a
@@ -297,6 +302,7 @@ export function AgentsPage() {
           const tmuxSession = r.session?.name ?? '';
           const sessionId = tmuxSession ? (sessionsById.get(tmuxSession) ?? '') : '';
           const showSession = sessionId !== '';
+          const showTerminal = terminalServed && tmuxSession !== '';
           return (
             <div className="min-w-0">
               <Link
@@ -308,7 +314,7 @@ export function AgentsPage() {
               >
                 {agentRowLabel(r)}
               </Link>
-              {(secondary || showSession) && (
+              {(secondary || showSession || showTerminal) && (
                 <div className="text-label uppercase tracking-wider text-fg-faint mt-1 flex items-center gap-2 min-w-0">
                   {secondary && <span className="truncate">{secondary}</span>}
                   {showSession && (
@@ -318,6 +324,15 @@ export function AgentsPage() {
                       title={`Open the live session for ${r.name}`}
                     >
                       session
+                    </Link>
+                  )}
+                  {showTerminal && (
+                    <Link
+                      to={terminalRoute(tmuxSession, '/agents')}
+                      className="shrink-0 text-fg-muted hover:text-accent focus-mark"
+                      title={`Open a terminal on ${tmuxSession}`}
+                    >
+                      terminal
                     </Link>
                   )}
                 </div>
@@ -461,7 +476,7 @@ export function AgentsPage() {
         className: 'w-80',
       },
     ],
-    [handlePendingResponse, now, pendingByAgent, readOnly, responding, sessionsById],
+    [handlePendingResponse, now, pendingByAgent, readOnly, responding, sessionsById, terminalServed],
   );
 
   return (

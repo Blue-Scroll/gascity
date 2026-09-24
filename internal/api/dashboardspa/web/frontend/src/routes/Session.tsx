@@ -318,7 +318,7 @@ export function SessionPage() {
       }
     >
       {showPane ? (
-        <PaneView session={tmux} onNotice={flash} />
+        <PaneView session={tmux} readOnly={readOnly} onNotice={flash} />
       ) : (
       <div
         ref={scroller}

@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { keepFocus } from '../../lib/keepFocus';
+import { useUploadsServed, writeAttachment } from '../../lib/upload';
 
 // Claude Code's own slash commands. The agent interprets whatever is sent, so
 // this list is an affordance rather than a contract: a command it does not know
@@ -36,8 +37,6 @@ const EFFORT: ReadonlyArray<{ id: string; label: string; phrase: string }> = [
   { id: 'ultra', label: 'ultrathink', phrase: 'ultrathink' },
 ];
 
-const UPLOAD_URL = '/upload';
-
 // An attachment is held in the browser until the message is actually sent.
 // Nothing reaches the machine's disk for a file that is attached and then
 // removed, or typed alongside and then abandoned.
@@ -72,6 +71,10 @@ export function Composer({
   const [effort, setEffort] = useState('normal');
   const box = useRef<HTMLTextAreaElement>(null);
   const file = useRef<HTMLInputElement>(null);
+  // Attaching needs the machine's upload helper. Where it is not served, there
+  // is no attach button and a pasted file is not picked up, so nothing is
+  // offered that could only fail at send.
+  const canAttach = useUploadsServed() === true;
 
   useEffect(() => {
     const el = box.current;
@@ -111,24 +114,12 @@ export function Composer({
   const writeAttachments = async (list: Attachment[]): Promise<string[] | null> => {
     const paths: string[] = [];
     for (const a of list) {
-      const body = new FormData();
-      body.append('file', a.file, a.name);
-      body.append('session', sessionId);
-      const res = await fetch(UPLOAD_URL, { method: 'POST', body, headers: { 'X-GC-Request': '1' } });
-      if (res.status === 404) {
-        onNotice('attachments are not set up on this machine');
+      const written = await writeAttachment(sessionId, a.file, a.name);
+      if ('problem' in written) {
+        onNotice(written.problem);
         return null;
       }
-      if (!res.ok) {
-        onNotice(`${a.name}: attachment failed (${res.status})`);
-        return null;
-      }
-      const out = (await res.json()) as { path?: string };
-      if (!out.path) {
-        onNotice(`${a.name}: attachment failed`);
-        return null;
-      }
-      paths.push(out.path);
+      paths.push(written.path);
     }
     return paths;
   };
@@ -280,27 +271,31 @@ export function Composer({
       )}
 
       <div className="flex items-end gap-1 px-1 py-1">
-        <button
-          type="button"
-          aria-label="Attach files"
-          onMouseDown={keepFocus}
-          className={icon}
-          onClick={() => file.current?.click()}
-        >
-          <svg viewBox="0 0 24 24" className="h-6 w-6" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" aria-hidden="true">
-            <path d="M12 5v14M5 12h14" />
-          </svg>
-        </button>
-        <input
-          ref={file}
-          type="file"
-          multiple
-          className="hidden"
-          onChange={(e) => {
-            stage(Array.from(e.target.files ?? []));
-            e.target.value = '';
-          }}
-        />
+        {canAttach && (
+          <>
+            <button
+              type="button"
+              aria-label="Attach files"
+              onMouseDown={keepFocus}
+              className={icon}
+              onClick={() => file.current?.click()}
+            >
+              <svg viewBox="0 0 24 24" className="h-6 w-6" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" aria-hidden="true">
+                <path d="M12 5v14M5 12h14" />
+              </svg>
+            </button>
+            <input
+              ref={file}
+              type="file"
+              multiple
+              className="hidden"
+              onChange={(e) => {
+                stage(Array.from(e.target.files ?? []));
+                e.target.value = '';
+              }}
+            />
+          </>
+        )}
         <textarea
           data-composer-input
           ref={box}
@@ -309,7 +304,7 @@ export function Composer({
           onPaste={(e) => {
             // Every file on the clipboard, not just the first — pasting two
             // screenshots should attach two.
-            const files = Array.from(e.clipboardData.files);
+            const files = canAttach ? Array.from(e.clipboardData.files) : [];
             if (files.length > 0) {
               e.preventDefault();
               stage(files);
