@@ -84,9 +84,13 @@ function focusComposer() {
   document.querySelector<HTMLTextAreaElement>('[data-composer-input]')?.focus();
 }
 
+// One element per line, so the view can find the line under the reader's eye
+// again after the text changes and put it back where it was.
 function LineView({ line }: { line: Line }) {
+  const empty = line.every((r) => r.text === '' && !r.hint);
   return (
-    <>
+    <div data-line="">
+      {empty ? ' ' : null}
       {line.map((r, i) =>
         r.hint === 'reply' ? (
           <button
@@ -114,8 +118,7 @@ function LineView({ line }: { line: Line }) {
           </span>
         ),
       )}
-      {'\n'}
-    </>
+    </div>
   );
 }
 
@@ -131,7 +134,18 @@ export function PaneView({
   const probe = useRef<HTMLSpanElement>(null);
   const atLive = useRef(true);
 
+  // What is shown and what was most recently fetched are different things
+  // while the reader is scrolled up. New output would shift the block under
+  // their finger -- the window is anchored to the bottom, so every line added
+  // there drops one off the top -- so the view holds what they are reading
+  // and keeps the newest fetch aside until they come back to the tail.
   const [pane, setPane] = useState<Pane | null>(null);
+  const latest = useRef<Pane | null>(null);
+  const [live, setLive] = useState(true);
+  const [behind, setBehind] = useState(false);
+  const growing = useRef(false);
+  // The line at the top of the viewport before a change, so it can be put back.
+  const anchor = useRef<{ text: string; index: number; top: number } | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [lines, setLines] = useState(FIRST_WINDOW);
   const [mode, setModeState] = useState<Mode>(loadMode);
@@ -150,28 +164,83 @@ export function PaneView({
 
   // Poll the tail. The pane has no event stream, and a second is well inside
   // what a person reads as live while costing one small request.
+  // The first line whose bottom edge is inside the viewport, with where it sits.
+  const topLine = useCallback(() => {
+    const box = scroller.current;
+    if (!box) return null;
+    const boxTop = box.getBoundingClientRect().top;
+    const els = Array.from(box.querySelectorAll<HTMLElement>('[data-line]'));
+    for (let i = 0; i < els.length; i++) {
+      const r = els[i]!.getBoundingClientRect();
+      if (r.bottom > boxTop) return { text: els[i]!.textContent ?? '', index: i, top: r.top - boxTop };
+    }
+    return null;
+  }, []);
+
   useEffect(() => {
-    let live = true;
+    let alive = true;
     const ac = new AbortController();
     const tick = async () => {
       try {
         const next = await readPane(session, lines, ac.signal);
-        if (!live) return;
-        setPane(next);
+        if (!alive) return;
+        latest.current = next;
         setError(null);
+        if (atLive.current) {
+          setPane(next);
+          setBehind(false);
+        } else if (growing.current) {
+          // The reader asked for more history. Remember the line at the top of
+          // the viewport so the layout effect can put it back after the
+          // older lines land above it.
+          growing.current = false;
+          anchor.current = topLine();
+          setPane(next);
+        } else {
+          setBehind(true);
+        }
       } catch (e) {
-        if (!live || ac.signal.aborted) return;
+        if (!alive || ac.signal.aborted) return;
         setError(e instanceof Error ? e.message : 'pane read failed');
       }
     };
     void tick();
     const id = window.setInterval(() => void tick(), POLL_MS);
     return () => {
-      live = false;
+      alive = false;
       ac.abort();
       window.clearInterval(id);
     };
-  }, [session, lines]);
+  }, [session, lines, topLine]);
+
+  // After older lines land above, find the remembered line again -- by text,
+  // searching outward from where it was -- and scroll so it sits where it did.
+  useLayoutEffect(() => {
+    const a = anchor.current;
+    const box = scroller.current;
+    if (!a || !box) return;
+    anchor.current = null;
+    const els = Array.from(box.querySelectorAll<HTMLElement>('[data-line]'));
+    for (let d = 0; d < els.length; d++) {
+      for (const i of [a.index + d, a.index - d]) {
+        const el = els[i];
+        if (el && (el.textContent ?? '') === a.text) {
+          const now = el.getBoundingClientRect().top - box.getBoundingClientRect().top;
+          box.scrollTop += now - a.top;
+          return;
+        }
+      }
+    }
+  }, [pane]);
+
+  const jumpToBottom = useCallback(() => {
+    atLive.current = true;
+    setLive(true);
+    setBehind(false);
+    if (latest.current) setPane(latest.current);
+    const box = scroller.current;
+    if (box) box.scrollTop = box.scrollHeight;
+  }, []);
 
   // How many columns this screen holds at full size. Re-measured when the
   // viewport changes, which on a phone means rotating it.
@@ -248,10 +317,20 @@ export function PaneView({
   const onScroll = useCallback(() => {
     const el = scroller.current;
     if (!el) return;
-    atLive.current = el.scrollHeight - el.scrollTop - el.clientHeight <= NEAR_BOTTOM;
+    const near = el.scrollHeight - el.scrollTop - el.clientHeight <= NEAR_BOTTOM;
+    if (near !== atLive.current) {
+      atLive.current = near;
+      setLive(near);
+      // Scrolled back to the tail by hand: show what arrived meanwhile.
+      if (near && latest.current) {
+        setPane(latest.current);
+        setBehind(false);
+      }
+    }
     // Reaching the top asks for more of the scrollback, up to whatever tmux
     // still holds. `at_oldest` is what stops it.
-    if (el.scrollTop <= NEAR_TOP && pane && !pane.at_oldest && lines < MAX_WINDOW) {
+    if (el.scrollTop <= NEAR_TOP && pane && !pane.at_oldest && lines < MAX_WINDOW && !growing.current) {
+      growing.current = true;
       setLines((n) => Math.min(MAX_WINDOW, n + GROW_BY));
     }
   }, [pane, lines]);
@@ -276,6 +355,7 @@ export function PaneView({
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
+      <div className="relative flex min-h-0 flex-1 flex-col">
       <div
         ref={scroller}
         onScroll={onScroll}
@@ -352,6 +432,26 @@ export function PaneView({
 
       {/* Two rows above the composer: how the pane is laid out, and the keys
           the composer cannot send. */}
+      {/* The way back to the tail while the reader is scrolled up. The dot
+          says output arrived meanwhile and is being held. */}
+      {!live && (
+        <button
+          type="button"
+          onMouseDown={keepFocus}
+          onClick={jumpToBottom}
+          aria-label="Jump to bottom"
+          className="absolute bottom-3 right-3 inline-flex h-11 w-11 items-center justify-center rounded-full bg-fg text-surface shadow-lg active:opacity-80"
+        >
+          <span aria-hidden="true" className="text-xl leading-none">
+            ↓
+          </span>
+          {behind && (
+            <span aria-hidden="true" className="absolute -right-0.5 -top-0.5 h-3 w-3 rounded-full bg-accent ring-2 ring-surface" />
+          )}
+        </button>
+      )}
+      </div>
+
       <div className="flex items-center gap-2 overflow-x-auto px-3 py-1">
         <button type="button" onMouseDown={keepFocus} onClick={() => setMode('wrap')} className={chip(!isGrid)} aria-pressed={!isGrid}>
           Wrap

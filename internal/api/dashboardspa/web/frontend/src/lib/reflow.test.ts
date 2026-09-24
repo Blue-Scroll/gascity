@@ -69,6 +69,11 @@ describe('reflow', () => {
     expect(cellWidth('⏺ ok')).toBe(4);
   });
 
+  it('passes a hint line through untouched, since it has no characters to wrap', () => {
+    const hint: Line = [{ text: '', hint: 'reply' }];
+    expect(reflow([hint], 40)).toEqual([hint]);
+  });
+
   it('never lets an indent eat the whole line', () => {
     const out = text(reflow([L(' '.repeat(30) + 'deep text here')], 20));
     for (const l of out) expect(cellWidth(l)).toBeLessThanOrEqual(20);

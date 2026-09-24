@@ -86,6 +86,9 @@ function runsFrom(line: Line, seg: Cell[]): Run[] {
 }
 
 function wrapOne(line: Line, cols: number): Line[] {
+  // A line that stands in for something (a hint rendered as a control) has no
+  // characters to wrap, and rebuilding it from its characters would erase it.
+  if (line.some((r) => r.hint)) return [line];
   const text = plain(line);
   const rule = RULE.exec(text);
   if (rule) {
