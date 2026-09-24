@@ -1,3 +1,7 @@
 node_modules/
 */dist/
 *.tsbuildinfo
+# A screenshot once got committed under frontend/undefined/shots/ because a
+# script built its output path from a variable that was not set. Nothing real
+# here is ever named "undefined".
+undefined/
