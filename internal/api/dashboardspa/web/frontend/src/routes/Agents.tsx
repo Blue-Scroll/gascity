@@ -313,7 +313,7 @@ export function AgentsPage() {
                   {secondary && <span className="truncate">{secondary}</span>}
                   {showSession && (
                     <Link
-                      to={sessionRoute(sessionId, '/agents', agentRowLabel(r))}
+                      to={sessionRoute(sessionId, '/agents', agentRowLabel(r), tmuxSession)}
                       className="shrink-0 text-fg-muted hover:text-accent focus-mark"
                       title={`Open the live session for ${r.name}`}
                     >

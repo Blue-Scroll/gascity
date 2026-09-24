@@ -15,6 +15,8 @@ import {
 } from '../supervisor/sessionReads';
 import { useReadOnly } from '../contexts/ReadOnlyContext';
 import { Composer } from '../components/session/Composer';
+import { PaneView } from '../components/session/PaneView';
+import { paneAvailable } from '../lib/pane';
 import { keepFocus } from '../lib/keepFocus';
 
 // A session, read the way a conversation is read: the transcript owns the whole
@@ -52,8 +54,53 @@ export function SessionPage() {
   const [params] = useSearchParams();
   const back = params.get('back') ?? '/agents';
   const label = params.get('label') ?? id;
+  // The agent's tmux session, carried by the link that got us here. Its presence
+  // is what makes the live pane offerable at all.
+  const tmux = params.get('tmux') ?? '';
   const readOnly = useReadOnly();
   const state = useStructuredSessionStream(id, true);
+
+  // Two ways to read the same session. The transcript is the city's rendering:
+  // markdown, per-message copy, a tool call that opens its command and output,
+  // and history that pages back through the whole session. The pane is what the
+  // agent is actually drawing, which is the only place a TUI's banner, spinner
+  // and prompt exist -- at the cost of every one of those features, because a
+  // pane has no message boundaries to hang them on.
+  //
+  // The choice sticks, because an operator who wants one almost always wants it
+  // again. The composer is the same in both: this is the read surface only.
+  const [surface, setSurface] = useState<'transcript' | 'pane'>(() => {
+    try {
+      return localStorage.getItem('gc.session.surface') === 'pane' ? 'pane' : 'transcript';
+    } catch {
+      return 'transcript';
+    }
+  });
+  // Offered only where a pane is actually served, so the control is never a
+  // button that fails. A deployment without the sidecar simply never sees it.
+  const [hasPane, setHasPane] = useState(false);
+  useEffect(() => {
+    if (!tmux) return;
+    let live = true;
+    void paneAvailable(tmux).then((ok) => {
+      if (live) setHasPane(ok);
+    });
+    return () => {
+      live = false;
+    };
+  }, [tmux]);
+  const showPane = surface === 'pane' && hasPane && tmux !== '';
+  const toggleSurface = useCallback(() => {
+    setSurface((s) => {
+      const next = s === 'pane' ? 'transcript' : 'pane';
+      try {
+        localStorage.setItem('gc.session.surface', next);
+      } catch {
+        /* a private window is not a reason to refuse the toggle */
+      }
+      return next;
+    });
+  }, []);
 
   const scroller = useRef<HTMLDivElement>(null);
   const content = useRef<HTMLDivElement>(null);
@@ -289,6 +336,9 @@ export function SessionPage() {
           : { top: 0, height: '100dvh' }
       }
     >
+      {showPane ? (
+        <PaneView session={tmux} onNotice={flash} />
+      ) : (
       <div
         ref={scroller}
         onScroll={onScroll}
@@ -338,6 +388,7 @@ export function SessionPage() {
           ))}
         </div>
       </div>
+      )}
 
       {/* Floating controls: a back chip and the session name at the top, the
           composer and a jump-to-live pill at the bottom. Nothing takes a
@@ -352,6 +403,18 @@ export function SessionPage() {
         <span className="pointer-events-none truncate rounded-full bg-surface/80 px-2 text-label uppercase tracking-wider text-fg backdrop-blur">
           {label}
         </span>
+        {hasPane && (
+          <button
+            type="button"
+            onMouseDown={keepFocus}
+            onClick={toggleSurface}
+            className={pill}
+            aria-pressed={showPane}
+            aria-label={showPane ? 'Show the transcript' : 'Show the live pane'}
+          >
+            {showPane ? 'Transcript' : 'Live pane'}
+          </button>
+        )}
         {toast && (
           <span className="pointer-events-none ml-auto rounded-full bg-surface/80 px-2 text-label uppercase tracking-wider text-fg-faint backdrop-blur">
             {toast}
@@ -360,7 +423,7 @@ export function SessionPage() {
       </div>
 
       {/* Above the composer, not over it, so it is reachable with the keyboard up. */}
-      {!atLive && (
+      {!atLive && !showPane && (
         <div className="pointer-events-none absolute inset-x-0 bottom-16 flex justify-center">
           <button type="button" onMouseDown={keepFocus} onClick={toLive} className={pill}>
             Jump to live ↓
