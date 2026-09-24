@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
-import { ansiLines, ansiToReactNodes, type Line } from '../../lib/ansi';
+import { ansiLines, type Line } from '../../lib/ansi';
+import { linkify } from '../../lib/linkify';
 import { reflow } from '../../lib/reflow';
 import { readPane, sendPaneKey, type Pane, type PaneKey } from '../../lib/pane';
 import { keepFocus } from '../../lib/keepFocus';
@@ -71,14 +72,32 @@ function loadMode(): Mode {
   }
 }
 
+// A run with a link is an anchor. A URL opens where it points; a file path
+// opens through the sidecar, which decides whether the phone views it or saves
+// it. Both open in a new tab, so a home-screen app with no URL bar still has a
+// way back. Long-press gives the phone's own copy menu, which is the copy the
+// pane cannot otherwise offer.
 function LineView({ line }: { line: Line }) {
   return (
     <>
-      {line.map((r, i) => (
-        <span key={i} className={r.className} style={r.style}>
-          {r.text}
-        </span>
-      ))}
+      {line.map((r, i) =>
+        r.link ? (
+          <a
+            key={i}
+            href={r.link.href}
+            target="_blank"
+            rel="noopener noreferrer"
+            className={r.className}
+            style={{ ...r.style, textDecoration: 'underline', textDecorationStyle: 'dotted', textUnderlineOffset: 3 }}
+          >
+            {r.text}
+          </a>
+        ) : (
+          <span key={i} className={r.className} style={r.style}>
+            {r.text}
+          </span>
+        ),
+      )}
       {'\n'}
     </>
   );
@@ -157,11 +176,16 @@ export function PaneView({
     return () => ro.disconnect();
   }, [measureCols]);
 
-  const wrapped = useMemo<Line[]>(
-    () => (pane && mode === 'wrap' && cols > 0 ? reflow(ansiLines(pane.text), cols) : []),
-    [pane, mode, cols],
+  // Links are found on the line as the agent wrote it, before any wrapping, so
+  // a URL broken across two visual lines is tappable on both.
+  const linked = useMemo<Line[]>(
+    () => (pane ? ansiLines(pane.text).map((l) => linkify(l, session)) : []),
+    [pane, session],
   );
-  const gridNodes = useMemo(() => (pane && mode !== 'wrap' ? ansiToReactNodes(pane.text) : []), [pane, mode]);
+  const wrapped = useMemo<Line[]>(
+    () => (mode === 'wrap' && cols > 0 ? reflow(linked, cols) : []),
+    [linked, mode, cols],
+  );
 
   // Grid modes: measure what the block wants to be, then scale that to fit the
   // pane's CURRENT width. Not the widest line in the buffer: a pane that used to
@@ -297,7 +321,9 @@ export function PaneView({
                     transformOrigin: 'top left',
                   }}
                 >
-                  {gridNodes}
+                  {linked.map((line, i) => (
+                    <LineView key={i} line={line} />
+                  ))}
                 </pre>
               </div>
             )}
