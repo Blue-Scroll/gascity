@@ -30,7 +30,7 @@ const LIVE_TAIL = 60; // messages rendered on arrival, newest first
 const REVEAL_STEP = 40; // more of the already-fetched segment, per scroll to the top
 const OLDER_WINDOW = 400; // messages held above the live tail before the oldest are dropped
 const NEAR_TOP = 320; // px from the top that triggers the next page
-const NEAR_BOTTOM = 48; // px from the bottom that still counts as "live"
+const NEAR_BOTTOM = 96; // px from the bottom that still counts as "live"
 
 // A tool's output arrives as its own block in a later message, keyed by the id
 // of the call that made it. Pairing them here is what lets a call show its
@@ -153,11 +153,27 @@ export function SessionPage() {
     if (el) el.scrollTop = el.scrollHeight;
   }, []);
 
-  // Anything that changes the height of the transcript should keep the tail in
-  // view while the operator is at the tail: a message arriving, the local echo
-  // of one they just sent, a fold opening, an image finishing its load. Watching
-  // the content box catches all of them, including the ones React never hears
-  // about — a <details> toggling open is not a state change.
+  // While the operator is at the tail, the tail is where the view stays. Full
+  // stop — no list of things that are allowed to move it.
+  //
+  // Enumerating triggers was wrong twice over. It missed the ones React never
+  // sees (a <details> opening, a font or image settling), and it missed new
+  // messages outright: the rendered window is capped, so its length sits at the
+  // cap and never changes when a message arrives. Watching the scroller itself,
+  // on a cheap timer, has no such list to get wrong. It only ever acts when the
+  // view has drifted and the operator has not scrolled away.
+  useEffect(() => {
+    const tick = window.setInterval(() => {
+      if (!atLiveRef.current) return;
+      const el = scroller.current;
+      if (!el) return;
+      if (el.scrollHeight - el.scrollTop - el.clientHeight > 1) pinToBottom();
+    }, 150);
+    return () => window.clearInterval(tick);
+  }, [pinToBottom]);
+
+  // Instant for the common case, so the timer is a backstop rather than the
+  // thing the operator can feel.
   useEffect(() => {
     const box = content.current;
     if (!box || typeof ResizeObserver === 'undefined') return;
@@ -168,10 +184,10 @@ export function SessionPage() {
     return () => ro.disconnect();
   }, [pinToBottom]);
 
-  // Arriving at the session, and every render that adds to the tail.
+  // First paint of a session opens at the tail.
   useLayoutEffect(() => {
     if (atLiveRef.current) pinToBottom();
-  }, [live.length, pending.length, pinToBottom]);
+  }, [state.status, pinToBottom]);
 
   useEffect(() => {
     if (pending.length === 0) return;
