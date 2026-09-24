@@ -69,3 +69,33 @@ jobs:
           # than letting every row fail for a reason the log does not name.
           jq --version
           go test ./examples/gastown/ -run 'TestSpawnStorm' -count=1 -v
+
+  dashboard:
+    # The dashboard gc embeds (internal/api/dashboardspa). `verify` above builds
+    # Go only, so without this job a dashboard change could go green with a page
+    # that does not typecheck, a failing vitest, or a dist/ that no longer matches
+    # its sources. dist/ is what the gc binary actually serves, so a stale one
+    # ships the old page with no error anywhere.
+    #
+    # These are upstream's "Dashboard SPA" checks plus `make dashboard-ci`,
+    # without the browser e2e. The job runs on every branch. A red here on a
+    # branch that never touched the dashboard means town's own dist/ or API
+    # client has drifted from its sources, and that is worth knowing too.
+    if: ${{ github.repository != 'gastownhall/gascity' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22"
+      - name: Install SPA dependencies
+        run: npm ci --silent
+        working-directory: internal/api/dashboardspa/web
+      - name: Vitest
+        run: npm run --workspace gas-city-dashboard-frontend test
+        working-directory: internal/api/dashboardspa/web
+      - name: Typecheck, build, handler tests, and no drift in dist/ or the API client (make dashboard-ci)
+        run: make dashboard-ci
