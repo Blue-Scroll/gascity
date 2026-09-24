@@ -1341,6 +1341,9 @@ describe('supervisor client wrapper', () => {
       sessionStreamUrl: vi.fn(() => '/gc-supervisor/v0/city/test-city/session/gc-session-1/stream'),
       mutationHeaders: vi.fn(() => GC_MUTATION_HEADERS),
       sessionTranscript: vi.fn(),
+      sessionTranscriptPage: vi.fn(),
+      sendSessionMessage: vi.fn(),
+      submitSession: vi.fn(),
       workflowRun: vi.fn(),
       formulaDetail: vi.fn(),
     };
