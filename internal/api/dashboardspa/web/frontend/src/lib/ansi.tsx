@@ -52,6 +52,47 @@ function toReact(node: ChildNode, key: string): ReactNode {
   );
 }
 
+// A styled run of text on one line. This is the form the pane reflow works
+// in: plain text with its colour attached, no DOM, so it can be re-wrapped at
+// any width and tested without a browser.
+export type Run = { text: string; className?: string; style?: CSSProperties };
+export type Line = Run[];
+
+function runsOf(node: ChildNode, inherit: Run, out: Run[]): void {
+  if (node.nodeType === 3) {
+    const text = node.textContent ?? '';
+    if (text) out.push({ ...inherit, text });
+    return;
+  }
+  if (node.nodeType !== 1) return;
+  const element = node as Element;
+  const own: Run = { text: '' };
+  const cls = element.getAttribute('class');
+  const style = styleOf(element);
+  if (cls) own.className = cls;
+  if (style) own.style = style;
+  const next: Run = { ...inherit, ...own, text: '' };
+  for (const child of Array.from(element.childNodes)) runsOf(child, next, out);
+}
+
+// The pane as lines of styled runs. One ansi_up instance across the whole
+// text, because SGR state carries from line to line: a colour opened on one
+// line and closed three lines later must colour the lines in between.
+export function ansiLines(text: string): Line[] {
+  const cleaned = stripTerminalControls(text);
+  const renderer = new AnsiUp();
+  renderer.use_classes = true;
+  const lines = cleaned.split('\n');
+  if (typeof DOMParser === 'undefined') return lines.map((l) => [{ text: l }]);
+  return lines.map((raw) => {
+    const html = renderer.ansi_to_html(raw);
+    const doc = new DOMParser().parseFromString(`<body>${html}</body>`, 'text/html');
+    const out: Run[] = [];
+    for (const node of Array.from(doc.body.childNodes)) runsOf(node, { text: '' }, out);
+    return out;
+  });
+}
+
 export function ansiToReactNodes(text: string): ReactNode[] {
   // Strip OSC / non-SGR CSI / lone-ESC / bare C1 control bytes before ansi_up
   // runs: it colorizes SGR and passes every other control sequence through as
