@@ -61,23 +61,15 @@ export function SessionPage() {
   const state = useStructuredSessionStream(id, true);
 
   // Two ways to read the same session. The transcript is the city's rendering:
-  // markdown, per-message copy, a tool call that opens its command and output,
-  // and history that pages back through the whole session. The pane is what the
-  // agent is actually drawing, which is the only place a TUI's banner, spinner
-  // and prompt exist -- at the cost of every one of those features, because a
-  // pane has no message boundaries to hang them on.
+  // The read surface is the agent's live tmux pane: what the agent is actually
+  // drawing, banner and spinner and prompt included, none of which exists as a
+  // message. The composer below is unchanged -- this is what you read, not how
+  // you reply.
   //
-  // The choice sticks, because an operator who wants one almost always wants it
-  // again. The composer is the same in both: this is the read surface only.
-  const [surface, setSurface] = useState<'transcript' | 'pane'>(() => {
-    try {
-      return localStorage.getItem('gc.session.surface') === 'pane' ? 'pane' : 'transcript';
-    } catch {
-      return 'transcript';
-    }
-  });
-  // Offered only where a pane is actually served, so the control is never a
-  // button that fails. A deployment without the sidecar simply never sees it.
+  // The transcript remains as the fallback, not as a choice. A session with no
+  // pane behind it (no sidecar serving one, or no tmux session name on the link
+  // that got us here) still has to be readable, and the transcript is what the
+  // supervisor can always produce.
   const [hasPane, setHasPane] = useState(false);
   useEffect(() => {
     if (!tmux) return;
@@ -89,18 +81,7 @@ export function SessionPage() {
       live = false;
     };
   }, [tmux]);
-  const showPane = surface === 'pane' && hasPane && tmux !== '';
-  const toggleSurface = useCallback(() => {
-    setSurface((s) => {
-      const next = s === 'pane' ? 'transcript' : 'pane';
-      try {
-        localStorage.setItem('gc.session.surface', next);
-      } catch {
-        /* a private window is not a reason to refuse the toggle */
-      }
-      return next;
-    });
-  }, []);
+  const showPane = hasPane && tmux !== '';
 
   const scroller = useRef<HTMLDivElement>(null);
   const content = useRef<HTMLDivElement>(null);
@@ -411,18 +392,6 @@ export function SessionPage() {
         <span className="pointer-events-none truncate rounded-full bg-surface/80 px-2 text-label uppercase tracking-wider text-fg backdrop-blur">
           {label}
         </span>
-        {hasPane && (
-          <button
-            type="button"
-            onMouseDown={keepFocus}
-            onClick={toggleSurface}
-            className={pill}
-            aria-pressed={showPane}
-            aria-label={showPane ? 'Show the transcript' : 'Show the live pane'}
-          >
-            {showPane ? 'Transcript' : 'Live pane'}
-          </button>
-        )}
         {toast && (
           <span className="pointer-events-none ml-auto rounded-full bg-surface/80 px-2 text-label uppercase tracking-wider text-fg-faint backdrop-blur">
             {toast}
