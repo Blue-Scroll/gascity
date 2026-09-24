@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { ansiLines, type Line } from '../../lib/ansi';
 import { linkify } from '../../lib/linkify';
+import { hideInputBox } from '../../lib/inputbox';
 import { reflow } from '../../lib/reflow';
 import { readPane, sendPaneKey, type Pane, type PaneKey } from '../../lib/pane';
 import { keepFocus } from '../../lib/keepFocus';
@@ -77,11 +78,26 @@ function loadMode(): Mode {
 // it. Both open in a new tab, so a home-screen app with no URL bar still has a
 // way back. Long-press gives the phone's own copy menu, which is the copy the
 // pane cannot otherwise offer.
+// Focus the message box below the pane. It carries a data attribute rather
+// than a ref because the composer is a sibling, not a child.
+function focusComposer() {
+  document.querySelector<HTMLTextAreaElement>('[data-composer-input]')?.focus();
+}
+
 function LineView({ line }: { line: Line }) {
   return (
     <>
       {line.map((r, i) =>
-        r.link ? (
+        r.hint === 'reply' ? (
+          <button
+            key={i}
+            type="button"
+            onClick={focusComposer}
+            className="my-1 rounded-md border border-dashed border-current px-2 py-1 font-sans text-label uppercase tracking-wider opacity-60 active:opacity-100"
+          >
+            ↓ reply in the box below
+          </button>
+        ) : r.link ? (
           <a
             key={i}
             href={r.link.href}
@@ -178,8 +194,11 @@ export function PaneView({
 
   // Links are found on the line as the agent wrote it, before any wrapping, so
   // a URL broken across two visual lines is tappable on both.
+  // Links are found on the line as the agent wrote it, and the program's own
+  // input box -- which the phone cannot type into -- is swapped for a hint
+  // that focuses the one it can.
   const linked = useMemo<Line[]>(
-    () => (pane ? ansiLines(pane.text).map((l) => linkify(l, session)) : []),
+    () => (pane ? hideInputBox(ansiLines(pane.text).map((l) => linkify(l, session))).lines : []),
     [pane, session],
   );
   const wrapped = useMemo<Line[]>(

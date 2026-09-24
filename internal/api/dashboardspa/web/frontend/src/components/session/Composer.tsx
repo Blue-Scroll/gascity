@@ -302,6 +302,7 @@ export function Composer({
           }}
         />
         <textarea
+          data-composer-input
           ref={box}
           value={text}
           onChange={(e) => setText(e.target.value)}

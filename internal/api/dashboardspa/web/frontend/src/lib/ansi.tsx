@@ -56,7 +56,15 @@ function toReact(node: ChildNode, key: string): ReactNode {
 // in: plain text with its colour attached, no DOM, so it can be re-wrapped at
 // any width and tested without a browser.
 export type Link = { kind: 'url' | 'file'; href: string };
-export type Run = { text: string; className?: string; style?: CSSProperties; link?: Link };
+export type Run = {
+  text: string;
+  className?: string;
+  style?: CSSProperties;
+  link?: Link;
+  // A run that stands in for something the view chose not to show, rendered
+  // as a control rather than as text.
+  hint?: 'reply';
+};
 export type Line = Run[];
 
 function runsOf(node: ChildNode, inherit: Run, out: Run[]): void {
