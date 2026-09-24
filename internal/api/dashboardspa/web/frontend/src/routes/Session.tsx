@@ -393,9 +393,17 @@ export function SessionPage() {
       {/* Floating controls: a back chip and the session name at the top, the
           composer and a jump-to-live pill at the bottom. Nothing takes a
           permanent slice of a phone screen. */}
+      {/* A scrim under the floating chips. They sit over a scroller, so without
+          one the line passing behind them reads as part of the chip row --
+          worst on the pane, where it is a wall of monospace. */}
       <div
         className="pointer-events-none absolute inset-x-0 top-0 flex items-center gap-2 px-3 py-2"
-        style={{ paddingTop: 'calc(env(safe-area-inset-top) + 0.5rem)' }}
+        style={{
+          paddingTop: 'calc(env(safe-area-inset-top) + 0.5rem)',
+          background: showPane
+            ? 'linear-gradient(to bottom, rgba(29,29,31,0.96) 55%, rgba(29,29,31,0))'
+            : undefined,
+        }}
       >
         <Link to={back} className={pill}>
           <span aria-hidden="true">←</span> Back
