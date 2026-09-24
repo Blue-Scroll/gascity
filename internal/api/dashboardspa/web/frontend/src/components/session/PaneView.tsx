@@ -27,6 +27,11 @@ const MAX_WINDOW = 4000; // the sidecar's own ceiling; asking for more gains not
 const POLL_MS = 1000;
 const NEAR_TOP = 120;
 const NEAR_BOTTOM = 40;
+const GUTTER = 8; // px of padding either side of the block
+// Measured rather than assumed: the monospace advance depends on which font in
+// the stack the device actually has, and the fit is wrong by whatever the guess
+// is off by.
+const PROBE = 'MMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMM';
 
 // The keys a text box cannot express. Everything here is a key the operator
 // already has in the browser terminal, so the bar adds reach, not privilege.
@@ -50,6 +55,7 @@ export function PaneView({
 }) {
   const scroller = useRef<HTMLDivElement>(null);
   const block = useRef<HTMLPreElement>(null);
+  const probe = useRef<HTMLSpanElement>(null);
   const atLive = useRef(true);
 
   const [pane, setPane] = useState<Pane | null>(null);
@@ -91,13 +97,22 @@ export function PaneView({
   useLayoutEffect(() => {
     const el = block.current;
     const box = scroller.current;
-    if (!el || !box || !pane) return;
+    const pr = probe.current;
+    if (!el || !box || !pane || !pr) return;
     const w = el.scrollWidth;
     const h = el.scrollHeight;
     if (w === 0 || h === 0) return;
     setNatural({ w, h });
+
+    // Fit the pane's CURRENT width, not the widest line in the buffer. A pane
+    // that used to be wider leaves long lines in its scrollback, and fitting
+    // those would shrink everything the agent is writing now to suit history
+    // nobody is reading. Old wide lines stay reachable by panning sideways,
+    // which is what the extra width in the wrapper below is for.
+    const advance = pr.getBoundingClientRect().width / PROBE.length;
+    const want = pane.width * advance + GUTTER * 2;
     const room = box.clientWidth;
-    setScale(fit && w > room ? room / w : 1);
+    setScale(fit && want > room ? room / want : 1);
   }, [pane, fit]);
 
   // While the operator is at the tail, the tail is where the view stays. An
@@ -183,12 +198,19 @@ export function PaneView({
                   fontSize: BASE_FONT,
                   lineHeight: 1.25,
                   margin: 0,
-                  padding: '0 8px',
+                  padding: `0 ${GUTTER}px`,
                   whiteSpace: 'pre',
                   transform: `scale(${scale})`,
                   transformOrigin: 'top left',
                 }}
               >
+                <span
+                  ref={probe}
+                  aria-hidden="true"
+                  style={{ position: 'absolute', visibility: 'hidden', whiteSpace: 'pre' }}
+                >
+                  {PROBE}
+                </span>
                 {nodes}
               </pre>
             </div>
