@@ -47,10 +47,12 @@ export async function fetchSupervisorSessionTranscript(
 export async function fetchStructuredTranscript(
   sessionId: string,
 ): Promise<SessionStreamStructuredMessageEvent | null> {
-  const transcript = await supervisorApi().sessionTranscript(
+  const transcript = await supervisorApi().sessionTranscriptPage(
     activeCityOrThrow('fetch structured session transcript'),
     sessionId,
-    'structured',
+    // Thinking text is redacted unless asked for; a reader that offers to show
+    // it has to ask, or every fold opens on nothing.
+    { format: 'structured', include_thinking: true },
   );
   return structuredTranscriptOrNull(transcript);
 }

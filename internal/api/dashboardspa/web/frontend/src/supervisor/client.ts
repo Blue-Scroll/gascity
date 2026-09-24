@@ -155,6 +155,7 @@ export interface SupervisorApi {
     sessionId: string,
     afterCursor?: string,
     format?: SessionStreamFormat,
+    includeThinking?: boolean,
   ): string;
   listSessions(cityName: string): Promise<ListBodySessionResponse>;
   sessionPending(cityName: string, sessionId: string): Promise<SessionPendingResponse>;
@@ -474,10 +475,13 @@ export function createSupervisorApi(options: CreateSupervisorApiOptions = {}): S
         afterSeq === undefined ? undefined : { after_seq: afterSeq },
       );
     },
-    sessionStreamUrl(cityName, sessionId, afterCursor, format) {
+    sessionStreamUrl(cityName, sessionId, afterCursor, format, includeThinking) {
       const query: Record<string, string> = {};
       if (afterCursor !== undefined) query.after_cursor = afterCursor;
       if (format !== undefined) query.format = format;
+      // Thinking text is redacted unless asked for, so a reader that shows it
+      // has to say so on every request and on the stream.
+      if (includeThinking) query.include_thinking = 'true';
       return supervisorUrl(
         baseUrl,
         `/v0/city/${encodeURIComponent(cityName)}/session/${encodeURIComponent(sessionId)}/stream`,

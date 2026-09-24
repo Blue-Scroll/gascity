@@ -56,6 +56,7 @@ export function SessionPage() {
   const state = useStructuredSessionStream(id, true);
 
   const scroller = useRef<HTMLDivElement>(null);
+  const content = useRef<HTMLDivElement>(null);
   const [older, setOlder] = useState<SessionStructuredMessage[]>([]);
   const [hasOlder, setHasOlder] = useState(true);
   const [loadingOlder, setLoadingOlder] = useState(false);
@@ -124,7 +125,7 @@ export function SessionPage() {
     const el = scroller.current;
     keepScroll.current = el ? el.scrollHeight - el.scrollTop : null;
     try {
-      const page = await fetchStructuredTranscriptPage(id, { before: cursor });
+      const page = await fetchStructuredTranscriptPage(id, { before: cursor, includeThinking: true });
       const msgs = page.event ? structuredMessagesFromEnvelope(page.event) : [];
       setHasOlder(page.hasOlder && msgs.length > 0);
       if (msgs.length > 0) {
@@ -147,12 +148,30 @@ export function SessionPage() {
     }
   }, [older, revealed]);
 
-  // Follow the tail while the operator is at the bottom.
-  useEffect(() => {
-    if (!atLive) return;
+  const pinToBottom = useCallback(() => {
     const el = scroller.current;
     if (el) el.scrollTop = el.scrollHeight;
-  }, [live.length, atLive]);
+  }, []);
+
+  // Anything that changes the height of the transcript should keep the tail in
+  // view while the operator is at the tail: a message arriving, the local echo
+  // of one they just sent, a fold opening, an image finishing its load. Watching
+  // the content box catches all of them, including the ones React never hears
+  // about — a <details> toggling open is not a state change.
+  useEffect(() => {
+    const box = content.current;
+    if (!box || typeof ResizeObserver === 'undefined') return;
+    const ro = new ResizeObserver(() => {
+      if (atLiveRef.current) pinToBottom();
+    });
+    ro.observe(box);
+    return () => ro.disconnect();
+  }, [pinToBottom]);
+
+  // Arriving at the session, and every render that adds to the tail.
+  useLayoutEffect(() => {
+    if (atLiveRef.current) pinToBottom();
+  }, [live.length, pending.length, pinToBottom]);
 
   useEffect(() => {
     if (pending.length === 0) return;
@@ -199,8 +218,10 @@ export function SessionPage() {
     setRevealed(LIVE_TAIL);
     setAtLive(true);
     atLiveRef.current = true;
-    const el = scroller.current;
-    if (el) el.scrollTop = el.scrollHeight;
+    pinToBottom();
+    // The list shrinks back to the live window on the next paint, so pin again
+    // once that has happened rather than to the height it has right now.
+    requestAnimationFrame(pinToBottom);
   };
 
   const copy = async (text: string, what: string) => {
@@ -269,7 +290,7 @@ export function SessionPage() {
             {state.error}
           </p>
         )}
-        <div className="space-y-2">
+        <div ref={content} className="space-y-2">
           {older
             .filter((m) => !seen.has(m.id))
             .map((m) => (

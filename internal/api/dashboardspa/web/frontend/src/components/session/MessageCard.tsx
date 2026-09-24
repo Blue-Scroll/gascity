@@ -99,17 +99,25 @@ function Block({
       if (!text.trim()) return null;
       return <Markdown text={text} />;
     }
-    case 'thinking':
+    case 'thinking': {
+      const thought = ((block as { thinking?: string }).thinking ?? '').trim();
+      // Roughly two thirds of thinking blocks carry no text at all — the agent
+      // records that it thought, not what it thought. Those get a plain marker
+      // rather than a fold that opens on nothing.
+      if (thought === '') {
+        return <p className="text-label uppercase tracking-wider text-fg-faint">thinking</p>;
+      }
       return (
         <details>
           <summary className="flex min-h-11 cursor-pointer list-none items-center gap-2 text-label uppercase tracking-wider text-fg-faint marker:hidden">
             <span aria-hidden="true">▸</span> thinking
           </summary>
-          <pre className="mt-1 max-h-80 overflow-auto whitespace-pre-wrap break-words rounded bg-surface-tint p-2 text-label text-fg-muted">
-            {(block as { thinking?: string }).thinking ?? '(not recorded)'}
-          </pre>
+          <p className="mt-1 whitespace-pre-wrap break-words rounded bg-surface-tint p-2 text-body italic text-fg-muted">
+            {thought}
+          </p>
         </details>
       );
+    }
     case 'tool_use': {
       const name = (block as { name?: string }).name ?? 'tool';
       const id = (block as { id?: string }).id ?? '';
