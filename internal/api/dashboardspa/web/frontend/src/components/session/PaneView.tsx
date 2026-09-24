@@ -33,6 +33,17 @@ const GUTTER = 8; // px of padding either side of the block
 // is off by.
 const PROBE = 'MMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMM';
 
+// The pane is a terminal, so it gets a terminal's surface rather than the
+// dashboard's. This is not a style preference. An agent picks its colours for
+// the background it believes it is drawing on -- Claude Code shades panels with
+// a dark 256-colour background and writes near-white text into them -- so
+// rendering those same sequences on a light page produces dark blocks and
+// low-contrast text that is genuinely hard to read. Fixed rather than themed,
+// because the sequences the agent emits do not change with the dashboard's
+// theme.
+const TERM_BG = '#1d1d1f';
+const TERM_FG = '#e8e6e3';
+
 // The keys a text box cannot express. Everything here is a key the operator
 // already has in the browser terminal, so the bar adds reach, not privilege.
 const BAR: Array<{ key: PaneKey; label: string; hint: string }> = [
@@ -165,8 +176,12 @@ export function PaneView({
       <div
         ref={scroller}
         onScroll={onScroll}
-        className="min-h-0 flex-1 overflow-auto overscroll-contain bg-surface-tint"
-        style={{ paddingTop: 'calc(env(safe-area-inset-top) + 4.25rem)' }}
+        className="min-h-0 flex-1 overflow-auto overscroll-contain"
+        style={{
+          paddingTop: 'calc(env(safe-area-inset-top) + 4.25rem)',
+          background: TERM_BG,
+          color: TERM_FG,
+        }}
       >
         {error && (
           <p className="px-3 py-8 text-center text-accent" role="alert">
@@ -177,12 +192,12 @@ export function PaneView({
         {pane && (
           <>
             {!pane.at_oldest && (
-              <p className="py-2 text-center text-label uppercase tracking-wider text-fg-faint">
+              <p className="py-2 text-center text-label uppercase tracking-wider opacity-50">
                 scroll up for earlier output
               </p>
             )}
             {pane.at_oldest && (
-              <p className="py-2 text-center text-label uppercase tracking-wider text-fg-faint">
+              <p className="py-2 text-center text-label uppercase tracking-wider opacity-50">
                 the oldest line this pane still holds
               </p>
             )}
@@ -198,8 +213,9 @@ export function PaneView({
             >
               <pre
                 ref={block}
-                className="w-max font-mono text-fg"
+                className="w-max font-mono"
                 style={{
+                  color: TERM_FG,
                   fontSize: BASE_FONT,
                   lineHeight: 1.25,
                   margin: 0,
