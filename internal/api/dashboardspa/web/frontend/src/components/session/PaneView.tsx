@@ -109,7 +109,12 @@ export function PaneView({
     // those would shrink everything the agent is writing now to suit history
     // nobody is reading. Old wide lines stay reachable by panning sideways,
     // which is what the extra width in the wrapper below is for.
-    const advance = pr.getBoundingClientRect().width / PROBE.length;
+    // offsetWidth, not getBoundingClientRect: the probe lives inside the block
+    // this effect is about to scale, and a client rect would come back already
+    // multiplied by the previous scale -- a feedback loop that settles on a
+    // number that merely looks plausible. offsetWidth is the layout width and
+    // ignores transforms.
+    const advance = pr.offsetWidth / PROBE.length;
     const want = pane.width * advance + GUTTER * 2;
     const room = box.clientWidth;
     setScale(fit && want > room ? room / want : 1);
