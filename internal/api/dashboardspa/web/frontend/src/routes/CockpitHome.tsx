@@ -21,6 +21,7 @@ import {
   StatusLamps,
   type LampState,
 } from '../components/cockpit/Instruments';
+import { MayorButton, mayorLink } from '../components/cockpit/MayorButton';
 import {
   burnPerHour,
   laneToRing,
@@ -82,6 +83,9 @@ export function CockpitHomePage() {
   const canonicalRuns = runsReading.data;
   const sessions = sessionsReading.data;
   const richRuns = runProjection.source;
+  // Read live, not frozen: pausing the instruments must not strand the
+  // button on a mayor session that has since restarted.
+  const mayor = mayorLink(sessionsState.data, sessionsState.loading);
 
   const [activitySamples, setActivitySamples] = useState<number[]>([]);
   const lastUsageSampleRef = useRef<string | null>(null);
@@ -304,6 +308,7 @@ export function CockpitHomePage() {
       <PageHeader
         title="Home"
         synopsis={synopsis}
+        action={<MayorButton link={mayor} />}
         meta={
           <button
             type="button"
