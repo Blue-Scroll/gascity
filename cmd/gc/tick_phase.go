@@ -51,3 +51,27 @@ func (c *SessionReconcilerTraceCycle) RecordTickPhase(site TraceSiteCode, name s
 	}
 	c.RecordControllerOperation(site, TraceReasonRetained, TraceOutcomeComplete, name, start.elapsed(), start.withBDCost(fields))
 }
+
+// tickPhaseParts holds the fields of one tick phase record that break the
+// phase into named parts. Each part adds <name>_ms and <name>_bd_calls, so a
+// slow phase's record says WHICH part was slow and whether that part was
+// paying for bd calls. Pass it as the fields of RecordTickPhase.
+//
+// Use it on a phase that does several unrelated things in a row. The
+// dispatch_orders phase is the first: it ran three sweeps, a rescan and the
+// order gates under one 20s to 221s number, and the trace could not say which
+// (hq-mb1gvr).
+type tickPhaseParts map[string]any
+
+// time runs fn and records it as the part called name.
+func (p tickPhaseParts) time(name string, fn func()) {
+	start := startTickPhase()
+	fn()
+	p.record(name, start)
+}
+
+// record records the part called name as running from start until now.
+func (p tickPhaseParts) record(name string, start tickPhaseStart) {
+	p[name+"_ms"] = start.elapsed().Milliseconds()
+	p[name+"_bd_calls"] = beads.ReadBDExecTotals().Since(start.bd).Calls
+}

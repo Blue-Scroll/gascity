@@ -1227,8 +1227,8 @@ func (cr *CityRuntime) tick(
 	// but after the pressure gate and managed-Dolt preflight so skipped or
 	// endpoint-repair ticks do not add tracking writes first.
 	phaseStart = startTickPhase()
-	cr.dispatchOrders(ctx, cityRoot)
-	trace.RecordTickPhase(TraceSiteOrderDispatch, "dispatch_orders", phaseStart, nil)
+	orderParts := cr.dispatchOrders(ctx, cityRoot)
+	trace.RecordTickPhase(TraceSiteOrderDispatch, "dispatch_orders", phaseStart, orderParts)
 	if ctx.Err() != nil {
 		return
 	}
@@ -1479,22 +1479,30 @@ func (cr *CityRuntime) tick(
 	tickCompleted = true
 }
 
-func (cr *CityRuntime) dispatchOrders(ctx context.Context, cityRoot string) {
+// dispatchOrders runs the order phase of a tick and returns where its time
+// went, as fields for the dispatch_orders trace record. The phase is more
+// than the dispatcher: three sweeps and a rescan run first, each on its own
+// interval, so each is timed as its own part.
+func (cr *CityRuntime) dispatchOrders(ctx context.Context, cityRoot string) tickPhaseParts {
+	parts := tickPhaseParts{}
 	if ctx.Err() != nil {
-		return
+		return parts
 	}
 	now := time.Now()
 	if !cr.wispIndexMigrationApplied {
 		cr.wispIndexMigrationApplied = true
-		cr.applyWispQueryIndexes(ctx)
+		parts.time("wisp_index", func() { cr.applyWispQueryIndexes(ctx) })
 	}
-	cr.rescanOrderDispatcherIfDue(ctx, cityRoot, now)
-	cr.runOrderTrackingSweepWatchdog(now)
-	cr.runOrderTrackingRetentionWatchdog(now)
-	cr.runNudgeMailSweepWatchdog(now)
+	parts.time("rescan", func() { cr.rescanOrderDispatcherIfDue(ctx, cityRoot, now) })
+	parts.time("tracking_sweep", func() { cr.runOrderTrackingSweepWatchdog(now) })
+	parts.time("tracking_retention", func() { cr.runOrderTrackingRetentionWatchdog(now) })
+	parts.time("nudge_mail_sweep", func() { cr.runNudgeMailSweepWatchdog(now) })
 	if cr.od != nil {
-		cr.od.dispatch(ctx, cityRoot, now)
+		var report orderDispatchReport
+		parts.time("dispatch", func() { report = cr.od.dispatch(ctx, cityRoot, now) })
+		report.addTo(parts)
 	}
+	return parts
 }
 
 func (cr *CityRuntime) rescanOrderDispatcherIfDue(ctx context.Context, cityRoot string, now time.Time) {
