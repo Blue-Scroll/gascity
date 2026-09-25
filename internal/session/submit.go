@@ -537,6 +537,17 @@ func piSessionSearchPaths(hints runtime.Config) []string {
 	return paths
 }
 
+// usesImmediateDefaultSubmit reports whether a default submit types the
+// message into the pane right away (NudgeNow) instead of first waiting for the
+// pane to look idle (Nudge, up to NudgeIdleTimeout = 30s).
+//
+// A default submit is a person's own turn: the dashboard composer, POST
+// /messages, `gc session submit`. System messages take the Nudge path and keep
+// the idle wait. Claude Code accepts typing while it works and queues the
+// Enter as a mid-turn message, exactly as when a person types into the tmux
+// pane, so a live claude pane gets the text at once. Before this, a dashboard
+// send to a busy claude agent sat for 11 to 15 seconds (measured, vn-c5j2a29).
+// A claude pane that is being resumed still waits: its TUI is still starting.
 func usesImmediateDefaultSubmit(b beads.Bead, resuming ...bool) bool {
 	isResuming := len(resuming) > 0 && resuming[0]
 	if transportFromMetadata(b) == "acp" {
@@ -545,6 +556,8 @@ func usesImmediateDefaultSubmit(b beads.Bead, resuming ...bool) bool {
 	switch providerKind(b) {
 	case "codex":
 		return true
+	case "claude":
+		return !isResuming
 	case "gemini":
 		return isResuming
 	default:
