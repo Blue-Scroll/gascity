@@ -5,6 +5,7 @@ import type {
   SessionResponse,
 } from 'gas-city-dashboard-shared/gc-supervisor';
 import { supervisorApi } from './client';
+import { hasSessionId } from './sessionReads';
 
 export type SupervisorAgent = AgentResponse;
 
@@ -49,7 +50,7 @@ export function agentsLackSessionIds(agents: readonly Pick<SupervisorAgent, 'ses
 export function sessionIdsByName(sessions: readonly SessionResponse[]): Map<string, string> {
   const out = new Map<string, string>();
   for (const session of sessions) {
-    if (session.session_name) out.set(session.session_name, session.id);
+    if (session.session_name && hasSessionId(session)) out.set(session.session_name, session.id);
   }
   return out;
 }

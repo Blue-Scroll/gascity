@@ -34,4 +34,14 @@ describe('agentSessionId (hq-subxy4)', () => {
     ] as SessionResponse[];
     expect([...sessionIdsByName(sessions)]).toEqual([['rig--worker', 'gc-1']]);
   });
+
+  it('skips a live row that has no id yet, so a name never maps to ""', () => {
+    // While the bead store is slow, /sessions answers with live rows that have
+    // no id (vn-fzant5y). An empty id would open a session that does not exist.
+    const sessions = [
+      { id: '', session_name: 'rig--worker' },
+      { id: 'gc-2', session_name: 'rig--other' },
+    ] as SessionResponse[];
+    expect([...sessionIdsByName(sessions)]).toEqual([['rig--other', 'gc-2']]);
+  });
 });

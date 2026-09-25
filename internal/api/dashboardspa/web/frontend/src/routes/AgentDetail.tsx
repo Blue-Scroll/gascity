@@ -20,7 +20,11 @@ import { useGcEventRefresh } from '../hooks/useGcEvents';
 import { reportClientError } from '../lib/clientErrorReporting';
 import { listSupervisorBeadsAssignedTo, type SupervisorBead } from '../supervisor/beadReads';
 import { listSupervisorMail, type SupervisorMailItem } from '../supervisor/mailReads';
-import { listSupervisorSessions, type SupervisorSession } from '../supervisor/sessionReads';
+import {
+  hasSessionId,
+  listSupervisorSessions,
+  type SupervisorSession,
+} from '../supervisor/sessionReads';
 
 // Read-only drilldown for a single agent. Route: /agents/:slug where
 // slug resolves against session_name, alias, then id (see sessionSlug).
@@ -76,10 +80,12 @@ export function AgentDetailPage() {
 
   const session = useMemo<SupervisorSession | null>(() => {
     if (sessions === null) return null;
+    // This page opens the session by its id, so a row without one is no use.
+    const withIds = sessions.filter(hasSessionId);
     return (
-      sessions.find((s) => s.session_name === decoded) ??
-      sessions.find((s) => s.alias === decoded) ??
-      sessions.find((s) => s.id === decoded) ??
+      withIds.find((s) => s.session_name === decoded) ??
+      withIds.find((s) => s.alias === decoded) ??
+      withIds.find((s) => s.id === decoded) ??
       null
     );
   }, [sessions, decoded]);
