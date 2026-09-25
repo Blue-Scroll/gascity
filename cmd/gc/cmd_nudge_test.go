@@ -5279,7 +5279,7 @@ func TestRunNudgeQueueMaintenanceSweepDeadLettersRowsForClosedSession(t *testing
 		}
 	}
 
-	if err := runNudgeQueueMaintenanceSweep(dir, store.Store, time.Now()); err != nil {
+	if err := runNudgeQueueMaintenanceSweep(dir, store.Store, store.Store, time.Now()); err != nil {
 		t.Fatalf("runNudgeQueueMaintenanceSweep: %v", err)
 	}
 
@@ -5307,7 +5307,7 @@ func TestRunNudgeQueueMaintenanceSweepDeadLettersRowsForClosedSession(t *testing
 	}
 
 	// A nil session store skips the pass and leaves the queue alone.
-	if err := runNudgeQueueMaintenanceSweep(dir, nil, time.Now()); err != nil {
+	if err := runNudgeQueueMaintenanceSweep(dir, store.Store, nil, time.Now()); err != nil {
 		t.Fatalf("runNudgeQueueMaintenanceSweep(nil sessStore): %v", err)
 	}
 	state, err = nudgequeue.LoadState(dir)

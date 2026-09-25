@@ -1877,22 +1877,48 @@ func queuedNudgeClaimableForTarget(target nudgeTarget, item queuedNudge) bool {
 //
 // It owns the handle it opens and closes exactly that handle (and only if it
 // opened one), preserving the closeBeadStoreHandle ownership contract the
-// …WithStore variants model.
+// …WithStore variants model. A caller that already holds the store open (the
+// supervisor's dispatch tick) lends it through borrowedNudgeMaintenanceStore
+// instead, and then nothing here opens or closes anything.
 type nudgeMaintenanceStore struct {
 	cityPath string
 	opened   bool
+	// borrowed is set when the store came from the caller. close() must leave
+	// a borrowed store alone: the caller owns it and keeps using it.
+	borrowed bool
 	store    beads.NudgesStore
 	front    *nudgequeue.Store
 }
 
+// borrowedNudgeMaintenanceStore wraps a store the caller already holds open, so
+// the maintenance passes reuse it instead of opening a second one. Opening a
+// store means loading the whole city config (every agent, every pack) and
+// dialing the sql-server. The supervisor did both at boot and already holds the
+// handle, so paying them again on every tick was pure waste: measured 19s to
+// 280s per tick on 2026-09-24, when the town's queue held only dead-letter rows
+// (hq-ga1qga). A nil store falls back to the lazy open, so tests and callers
+// with no handle keep the old behavior.
+func borrowedNudgeMaintenanceStore(cityPath string, store beads.NudgesStore) nudgeMaintenanceStore {
+	if store.Store == nil {
+		return nudgeMaintenanceStore{cityPath: cityPath}
+	}
+	return nudgeMaintenanceStore{
+		cityPath: cityPath,
+		opened:   true,
+		borrowed: true,
+		store:    store,
+		front:    nudgeFrontDoor(store),
+	}
+}
+
 // frontForState returns the front-door handle to use for the maintenance passes
-// over state, opening the underlying store on first need. When the queue has no
-// Pending/InFlight/Dead items there is nothing for recover/prune/terminalize to
+// over state, opening the underlying store on first need. When no item in the
+// queue can reach the store there is nothing for recover/prune/terminalize to
 // do, so the store is left closed and the returned front is nil — every
-// maintenance pass only dereferences front while iterating a non-empty slice, so
-// a nil front is never touched on an empty queue.
+// maintenance pass only dereferences front for an item that carries store work,
+// so a nil front is never touched on such a queue.
 func (m *nudgeMaintenanceStore) frontForState(state *nudgeQueueState) *nudgequeue.Store {
-	if nudgeQueueHasWork(state) {
+	if nudgeQueueHasStoreWork(state) {
 		m.ensureOpen()
 	}
 	return m.front
@@ -1912,20 +1938,32 @@ func (m *nudgeMaintenanceStore) ensureOpen() beads.NudgesStore {
 	return m.store
 }
 
-// close releases the store this frame opened (if any). It never touches a
-// caller-passed store because this type only ever holds a store it opened.
+// close releases the store this frame opened (if any). A borrowed store belongs
+// to the caller and is left open.
 func (m *nudgeMaintenanceStore) close() error {
-	if !m.opened {
+	if !m.opened || m.borrowed {
 		return nil
 	}
 	return closeBeadStoreHandle(m.store.Store)
 }
 
-// nudgeQueueHasWork reports whether the queue holds any item a maintenance pass
-// could act on. An empty queue means recover/prune/terminalize are all no-ops,
-// so the Dolt front door need not be opened for this tick.
-func nudgeQueueHasWork(state *nudgeQueueState) bool {
-	return len(state.Pending) > 0 || len(state.InFlight) > 0 || len(state.Dead) > 0
+// nudgeQueueHasStoreWork reports whether the queue holds any item a maintenance
+// pass could take to the store. Pending and in-flight rows can be terminalized,
+// so any of them counts. A dead row reaches the store only through its shadow
+// bead, so a dead row with no BeadID never does: pruneDeadQueuedNudges skips it
+// before touching front. Counting those rows used to open the Dolt front door
+// on every supervisor tick for a queue that had nothing to do with it; the
+// town's queue held twelve such rows for weeks (hq-ga1qga).
+func nudgeQueueHasStoreWork(state *nudgeQueueState) bool {
+	if len(state.Pending) > 0 || len(state.InFlight) > 0 {
+		return true
+	}
+	for _, item := range state.Dead {
+		if item.BeadID != "" {
+			return true
+		}
+	}
+	return false
 }
 
 func claimDueQueuedNudgesForTarget(cityPath string, target nudgeTarget, now time.Time) ([]queuedNudge, error) {
@@ -2476,11 +2514,15 @@ func recordNudgeDispatchSkips(cityPath string, counts map[string]int64) error {
 // tick is the one path that iterates the whole queue every cycle regardless
 // of match outcome, so it owns running this sweep unconditionally.
 //
+// store is the nudges-class store the caller already holds open; the passes
+// borrow it and never open one of their own. A nil store falls back to a lazy
+// open, closed before return.
+//
 // sessStore is the session-class store. When it is backed, pending rows whose
 // session bead is already closed are dead-lettered as "session replaced"
 // (hq-02cr3). A nil or unbacked store skips that pass.
-func runNudgeQueueMaintenanceSweep(cityPath string, sessStore beads.Store, now time.Time) error {
-	maint := nudgeMaintenanceStore{cityPath: cityPath}
+func runNudgeQueueMaintenanceSweep(cityPath string, store, sessStore beads.Store, now time.Time) error {
+	maint := borrowedNudgeMaintenanceStore(cityPath, beads.NudgesStore{Store: store})
 	defer maint.close() //nolint:errcheck // best-effort
 	// The session reads happen before the queue flock is taken, so a slow
 	// session store never makes a foreground `gc sling --nudge` wait on the
@@ -2673,13 +2715,24 @@ func pruneDeadQueuedNudgesWithClock(state *nudgeQueueState, front *nudgequeue.St
 					continue
 				}
 				shadow, ok, err = front.FindIncludingTerminal(item.ID)
-				if err != nil || !ok || !nudgequeue.IsTerminalState(shadow.State) {
+				if err != nil || (ok && !nudgequeue.IsTerminalState(shadow.State)) {
 					filtered = append(filtered, item)
 					continue
 				}
+				// ok == false here means no repair is left. Terminalize
+				// returned nil, so it either stamped and closed the bead by its
+				// id (the label lookup just cannot see it) or found no bead at
+				// all. Wisp GC purges a nudge shadow; the queue row outlives it.
+				// Treating "gone" as "not yet terminal" kept such a row forever
+				// and re-asked the store three times for it on EVERY pass, in
+				// every process that touches the queue and under the queue
+				// lock: six of them cost the supervisor tick 19s to 280s on
+				// 2026-09-24 (hq-ga1qga). So a gone bead falls through to the
+				// retention check like a confirmed terminal one.
 			}
 			if !item.DeadAt.IsZero() && item.DeadAt.Before(cutoff) {
-				// Terminal bead confirmed in store — safe to prune once past retention.
+				// Terminal bead confirmed in store, or gone for good — safe to
+				// prune once past retention.
 				continue
 			}
 		}

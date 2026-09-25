@@ -135,7 +135,7 @@ func dispatchAllQueuedNudges(cityPath string, cfg *config.City, store, sessStore
 	// session bead is already closed (a replaced polecat): no open session
 	// will ever match them either, and they burned a tick each until their
 	// TTL (hq-02cr3). sessStore is the session-class store it reads.
-	if err := runNudgeQueueMaintenanceSweep(cityPath, sessStore, now); err != nil {
+	if err := runNudgeQueueMaintenanceSweep(cityPath, store, sessStore, now); err != nil {
 		return 0, fmt.Errorf("nudge queue maintenance sweep: %w", err)
 	}
 	state, err := nudgequeue.LoadState(cityPath)
