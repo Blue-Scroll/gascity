@@ -3,9 +3,8 @@ import { ansiLines, type Line } from '../../lib/ansi';
 import { linkify } from '../../lib/linkify';
 import { hideInputBox } from '../../lib/inputbox';
 import { reflow } from '../../lib/reflow';
-import { readPane, sendPaneKey, type Pane, type PaneKey } from '../../lib/pane';
+import { readPane, type Pane } from '../../lib/pane';
 import { keepFocus } from '../../lib/keepFocus';
-import { READ_ONLY_CONTROL_TITLE } from '../../contexts/ReadOnlyContext';
 
 // The agent's pane, as it is drawn, in a phone-shaped viewport.
 //
@@ -51,19 +50,6 @@ const TERM_FG = '#e8e6e3';
 
 type Mode = 'wrap' | 'fit' | 'one';
 const MODE_KEY = 'gc.pane.mode';
-
-// The keys a text box cannot express. Everything here is a key the operator
-// already has in the browser terminal, so the bar adds reach, not privilege.
-const BAR: Array<{ key: PaneKey; label: string; hint: string }> = [
-  { key: 'escape', label: 'Esc', hint: 'Interrupt' },
-  { key: 'c-o', label: '^O', hint: 'Expand output' },
-  { key: 'btab', label: '⇧⇥', hint: 'Cycle permission mode' },
-  { key: 'tab', label: '⇥', hint: 'Complete' },
-  { key: 'up', label: '↑', hint: 'Previous' },
-  { key: 'down', label: '↓', hint: 'Next' },
-  { key: 'enter', label: '⏎', hint: 'Enter' },
-  { key: 'c-c', label: '^C', hint: 'Cancel' },
-];
 
 function loadMode(): Mode {
   try {
@@ -123,18 +109,9 @@ function LineView({ line }: { line: Line }) {
   );
 }
 
-export function PaneView({
-  session,
-  readOnly,
-  onNotice,
-}: {
-  session: string;
-  // A key press drives the agent, so it is a mutation. The keys go to the
-  // machine's pane helper, not to gc, so gc's read-only gate never sees them:
-  // the bar has to honour read-only itself.
-  readOnly: boolean;
-  onNotice: (text: string) => void;
-}) {
+// This view only reads the pane. The keys that drive it are KeyBar, which the
+// session page draws below this view, and below the transcript too.
+export function PaneView({ session }: { session: string }) {
   const scroller = useRef<HTMLDivElement>(null);
   const block = useRef<HTMLPreElement>(null);
   const probe = useRef<HTMLSpanElement>(null);
@@ -341,18 +318,6 @@ export function PaneView({
     }
   }, [pane, lines]);
 
-  const press = useCallback(
-    async (key: PaneKey, hint: string) => {
-      try {
-        await sendPaneKey(session, key);
-        onNotice(hint);
-      } catch {
-        onNotice('key not sent');
-      }
-    },
-    [session, onNotice],
-  );
-
   const chip = (on: boolean) =>
     `pointer-events-auto rounded-full px-2.5 py-0.5 text-label uppercase tracking-wider backdrop-blur ${
       on ? 'bg-fg text-surface' : 'bg-surface/85 text-fg'
@@ -436,8 +401,6 @@ export function PaneView({
         )}
       </div>
 
-      {/* Two rows above the composer: how the pane is laid out, and the keys
-          the composer cannot send. */}
       {/* The way back to the tail while the reader is scrolled up. The dot
           says output arrived meanwhile and is being held. */}
       {!live && (
@@ -458,6 +421,8 @@ export function PaneView({
       )}
       </div>
 
+      {/* How the pane is laid out. The key bar sits below this, drawn by the
+          session page. */}
       <div className="flex items-center gap-2 overflow-x-auto px-3 py-1">
         <button type="button" onMouseDown={keepFocus} onClick={() => setMode('wrap')} className={chip(!isGrid)} aria-pressed={!isGrid}>
           Wrap
@@ -473,22 +438,6 @@ export function PaneView({
             {isGrid ? `${pane.width}×${pane.height}` : `${cols} cols`} · {pane.history} back
           </span>
         )}
-      </div>
-      <div className="flex gap-1 overflow-x-auto px-3 pb-1">
-        {BAR.map((b) => (
-          <button
-            key={b.key}
-            type="button"
-            onMouseDown={keepFocus}
-            onClick={() => void press(b.key, b.hint)}
-            disabled={readOnly}
-            aria-label={b.hint}
-            title={readOnly ? READ_ONLY_CONTROL_TITLE : b.hint}
-            className="shrink-0 rounded-md bg-surface px-2.5 py-1.5 font-mono text-body text-fg active:bg-surface-tint disabled:opacity-50"
-          >
-            {b.label}
-          </button>
-        ))}
       </div>
     </div>
   );

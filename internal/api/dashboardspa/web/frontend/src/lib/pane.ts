@@ -1,3 +1,5 @@
+import { useServed } from './served';
+
 // The agent's live tmux pane, read straight from the machine it runs on.
 //
 // The transcript is something the city assembles from messages. A pane is what
@@ -37,6 +39,8 @@ export type PaneKey =
   | 'pageup'
   | 'pagedown'
   | 'c-c'
+  | 'c-b'
+  | 'c-s'
   | 'c-o'
   | 'c-r'
   | 'c-l'
@@ -65,7 +69,21 @@ export async function sendPaneKey(session: string, key: PaneKey): Promise<void> 
     headers: { ...headers(), 'Content-Type': 'application/json' },
     body: JSON.stringify({ session, key }),
   });
-  if (!res.ok) throw new Error(`key not sent (${res.status})`);
+  if (!res.ok) throw new Error(res.status === 404 ? 'no live pane for this agent' : `key not sent (${res.status})`);
+}
+
+// GET /keys answers {"ok": true} where the helper is. It sends no key, so it is
+// safe to ask before anyone taps one. This is what lets the key bar show on the
+// transcript too: that view has no pane read to prove the helper is there.
+async function probeKeys(): Promise<boolean> {
+  const res = await fetch(KEYS, { cache: 'no-store' });
+  if (!res.ok) return false;
+  const body = (await res.json()) as { ok?: unknown } | null;
+  return body?.ok === true;
+}
+
+export function useKeysServed(): boolean | null {
+  return useServed(KEYS, probeKeys);
 }
 
 // Whether this deployment serves a pane at all. Asked once, cheaply, so the

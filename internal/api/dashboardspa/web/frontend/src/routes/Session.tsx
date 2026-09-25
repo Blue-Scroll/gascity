@@ -16,7 +16,8 @@ import {
 import { useReadOnly } from '../contexts/ReadOnlyContext';
 import { Composer } from '../components/session/Composer';
 import { PaneView } from '../components/session/PaneView';
-import { paneAvailable } from '../lib/pane';
+import { KeyBar } from '../components/session/KeyBar';
+import { paneAvailable, useKeysServed } from '../lib/pane';
 import { keepFocus } from '../lib/keepFocus';
 
 // A session, read the way a conversation is read: the transcript owns the whole
@@ -82,6 +83,12 @@ export function SessionPage() {
     };
   }, [tmux]);
   const showPane = hasPane && tmux !== '';
+  // The key bar goes to the same pane whichever way the session is read, so it
+  // is drawn for the transcript too. A pane that reads proves the helper that
+  // takes the keys is here. The transcript has no such proof, so it asks
+  // GET /keys, and a machine without the helper draws no bar.
+  const keysServed = useKeysServed();
+  const showKeys = tmux !== '' && (showPane || keysServed === true);
 
   const scroller = useRef<HTMLDivElement>(null);
   const content = useRef<HTMLDivElement>(null);
@@ -318,8 +325,9 @@ export function SessionPage() {
       }
     >
       {showPane ? (
-        <PaneView session={tmux} readOnly={readOnly} onNotice={flash} />
+        <PaneView session={tmux} />
       ) : (
+      <div className="relative flex min-h-0 flex-1 flex-col">
       <div
         ref={scroller}
         onScroll={onScroll}
@@ -369,11 +377,21 @@ export function SessionPage() {
           ))}
         </div>
       </div>
+      {/* The way back to the live tail. It sits at the bottom of the
+          transcript itself, so the key bar and the composer below can never
+          cover it, and it stays reachable with the keyboard up. */}
+      {!atLive && (
+        <div className="pointer-events-none absolute inset-x-0 bottom-3 flex justify-center">
+          <button type="button" onMouseDown={keepFocus} onClick={toLive} className={pill}>
+            Jump to live ↓
+          </button>
+        </div>
+      )}
+      </div>
       )}
 
-      {/* Floating controls: a back chip and the session name at the top, the
-          composer and a jump-to-live pill at the bottom. Nothing takes a
-          permanent slice of a phone screen. */}
+      {/* Floating controls: a back chip and the session name at the top.
+          Below the surface, the key bar and the composer. */}
       {/* A scrim under the floating chips. They sit over a scroller, so without
           one the line passing behind them reads as part of the chip row --
           worst on the pane, where it is a wall of monospace. */}
@@ -399,15 +417,6 @@ export function SessionPage() {
         )}
       </div>
 
-      {/* Above the composer, not over it, so it is reachable with the keyboard up. */}
-      {!atLive && !showPane && (
-        <div className="pointer-events-none absolute inset-x-0 bottom-16 flex justify-center">
-          <button type="button" onMouseDown={keepFocus} onClick={toLive} className={pill}>
-            Jump to live ↓
-          </button>
-        </div>
-      )}
-
       {tool && (
         <ToolSheet
           name={tool.name}
@@ -417,6 +426,8 @@ export function SessionPage() {
           onCopy={copy}
         />
       )}
+
+      {showKeys && <KeyBar session={tmux} readOnly={readOnly} onNotice={flash} />}
 
       {!readOnly && (
         <div style={{ paddingBottom: 'env(safe-area-inset-bottom)' }}>
