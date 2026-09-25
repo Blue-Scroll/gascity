@@ -656,6 +656,74 @@ func TestAgentListReadsEachStoreOnceForActiveBeads(t *testing.T) {
 	}
 }
 
+// TestAgentListRuntimeCallsScaleWithRunningSessions pins the other half of
+// hq-xujh6g. On tmux every runtime call is an exec and the tmux server takes
+// them one at a time, so the list must not pay one per configured slot:
+// unlimited pools share ONE session listing, and a stopped slot gets no
+// meta reads at all. A running slot still reports its suspended meta.
+func TestAgentListRuntimeCallsScaleWithRunningSessions(t *testing.T) {
+	state := newFakeState(t)
+	state.cfg.Agents = []config.Agent{
+		{Name: "dog", Dir: "myrig", MinActiveSessions: intPtr(0), MaxActiveSessions: intPtr(-1)},
+		{Name: "cat", Dir: "myrig", MinActiveSessions: intPtr(0), MaxActiveSessions: intPtr(-1)},
+		{Name: "owl", Dir: "myrig", MinActiveSessions: intPtr(0), MaxActiveSessions: intPtr(-1)},
+		{Name: "polecat", Dir: "myrig", MinActiveSessions: intPtr(1), MaxActiveSessions: intPtr(20), ScaleCheck: "echo 20"},
+	}
+	for _, name := range []string{"myrig--dog-1", "myrig--cat-1", "myrig--polecat-3"} {
+		if err := state.sp.Start(context.Background(), name, runtime.Config{}); err != nil {
+			t.Fatalf("Start(%s): %v", name, err)
+		}
+	}
+	if err := state.sp.SetMeta("myrig--polecat-3", "suspended", "true"); err != nil {
+		t.Fatalf("SetMeta: %v", err)
+	}
+	callsBefore := len(state.sp.Calls)
+
+	srv := New(state)
+	h := newTestCityHandlerWith(t, state, srv)
+	req := httptest.NewRequest("GET", cityURL(state, "/agents"), nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	var resp struct {
+		Items []agentResponse `json:"items"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	// 1 dog + 1 cat + 0 owl + 20 polecat slots.
+	if len(resp.Items) != 22 {
+		t.Fatalf("items = %d, want 22", len(resp.Items))
+	}
+	for _, item := range resp.Items {
+		if want := item.Name == "myrig/polecat-3"; item.Suspended != want {
+			t.Errorf("%s suspended = %v, want %v", item.Name, item.Suspended, want)
+		}
+	}
+
+	listings := 0
+	metaReadsOnStopped := map[string]int{}
+	running := map[string]bool{"myrig--dog-1": true, "myrig--cat-1": true, "myrig--polecat-3": true}
+	for _, call := range state.sp.Calls[callsBefore:] {
+		switch call.Method {
+		case "ListRunning":
+			listings++
+		case "GetMeta":
+			if !running[call.Name] {
+				metaReadsOnStopped[call.Name]++
+			}
+		}
+	}
+	if listings != 1 {
+		t.Errorf("ListRunning calls = %d, want 1 shared by all 3 unlimited pools", listings)
+	}
+	if len(metaReadsOnStopped) != 0 {
+		t.Errorf("GetMeta on stopped sessions = %v, want none", metaReadsOnStopped)
+	}
+}
+
 func TestAgentGetActiveBeadUsesLiveLookup(t *testing.T) {
 	state := newFakeState(t)
 	sessionName := "myrig--worker"

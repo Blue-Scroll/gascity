@@ -145,6 +145,29 @@ type sessionLister interface {
 	ListRunning(prefix string) ([]string, error)
 }
 
+// runningSessionsOnce answers ListRunning(prefix) for one request from a
+// single full listing. expandAgent asks once per unlimited pool, and on tmux
+// every ask is a list-sessions exec: 72 pools cost 2.2s per agent list on
+// the town (hq-xujh6g). Errors pass through unchanged, so a pool still fails
+// closed when the listing is partial.
+type runningSessionsOnce struct {
+	sp   sessionLister
+	once sync.Once
+	all  []string
+	err  error
+}
+
+func (r *runningSessionsOnce) ListRunning(prefix string) ([]string, error) {
+	r.once.Do(func() { r.all, r.err = r.sp.ListRunning("") })
+	var matched []string
+	for _, name := range r.all {
+		if strings.HasPrefix(name, prefix) {
+			matched = append(matched, name)
+		}
+	}
+	return matched, r.err
+}
+
 // discoverUnlimitedPool finds running instances of an unlimited pool by
 // listing sessions with a matching prefix, then reverse-mapping session
 // names back to qualified agent names.

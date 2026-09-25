@@ -56,16 +56,17 @@ func (s *Server) humaHandleAgentList(ctx context.Context, input *AgentListInput)
 	// so a cached response never pays for the graph-store list.
 	graphWork := s.graphActiveWorkBySession()
 	activeBeads := s.newActiveBeadIndex()
+	runningSessions := &runningSessionsOnce{sp: sp}
 
 	// Pass 1, in order and cheap: expand pools and apply the filters.
-	// IsRunning reads the provider's cached session list, so no row here
-	// costs a runtime call.
+	// IsRunning reads the provider's cached session list, and every pool
+	// shares runningSessions, so this pass makes at most one runtime call.
 	var rows []agentListRow
 	for _, a := range cfg.Agents {
 		// Provenance is a property of the declared agent, shared by every
 		// pool-expanded instance, so compute it once per source agent.
 		pack, packDerived := agentPackProvenance(a, rawCfg, cfg)
-		expanded := expandAgent(a, cityName, sessTmpl, sp)
+		expanded := expandAgent(a, cityName, sessTmpl, runningSessions)
 		for _, ea := range expanded {
 			if input.Rig != "" && ea.rig != input.Rig {
 				continue
@@ -97,10 +98,9 @@ func (s *Server) humaHandleAgentList(ctx context.Context, input *AgentListInput)
 		}
 	}
 
-	// Pass 2, in parallel: every row makes runtime calls (tmux on this
-	// town, about 20ms each under load), and a town has hundreds of pool
-	// slots. Run in series, that alone was several seconds. Each goroutine
-	// fills only its own slot, so the output order stays the config order.
+	// Pass 2, in parallel: a running row makes a few runtime calls (tmux
+	// execs on this town, about 20ms each under load). Each goroutine fills
+	// only its own slot, so the output order stays the config order.
 	agents := make([]agentResponse, len(rows))
 	group := new(errgroup.Group)
 	group.SetLimit(agentListRowConcurrency)
@@ -127,9 +127,9 @@ func (s *Server) humaHandleAgentList(ctx context.Context, input *AgentListInput)
 	}, nil
 }
 
-// agentListRowConcurrency bounds how many agent rows build at once. Each row
-// makes a few runtime calls (tmux execs on this town), so a small pool cuts
-// the wall time without flooding the provider.
+// agentListRowConcurrency bounds how many agent rows build at once. A running
+// row makes a few runtime calls (tmux execs on this town), so a small pool
+// cuts the wall time without flooding the provider.
 const agentListRowConcurrency = 16
 
 // agentListRow is one agent that passed the list filters, with what pass 1
@@ -152,8 +152,14 @@ func (s *Server) agentListResponse(row agentListRow, cfg *config.City, sp runtim
 	effectiveRunning := running || row.hasGraphWork
 
 	suspended := ea.suspended
-	if v, err := sp.GetMeta(sessionName, "suspended"); err == nil && v == "true" {
-		suspended = true
+	// Runtime meta lives on a live session, so only a running one has any to
+	// read. Asking a stopped tmux session still costs an exec that can only
+	// fail: for every one of the town's 234 to 419 slots that was 3 to 6
+	// seconds per list (hq-xujh6g).
+	if running {
+		if v, err := sp.GetMeta(sessionName, "suspended"); err == nil && v == "true" {
+			suspended = true
+		}
 	}
 
 	provider, displayName := resolveProviderInfo(ea.provider, cfg)
