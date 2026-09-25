@@ -188,27 +188,37 @@ func isOwnDraft(box, head string) bool {
 
 // inputBoxText finds the input box in a pane captured WITH color codes
 // (capture-pane -e) and returns the text a person typed there. found is false
-// when no line starts with the prompt.
+// when no line is the box.
 //
-// The box is the LAST prompt line: Claude also draws queued messages with the
-// same prompt glyph, above the box.
+// The box is the LAST prompt line that is not drawn on a background color.
+// Claude draws past and queued messages with the same prompt glyph, but as a
+// shaded bubble ("❯ " on a gray background). The box itself has no background.
+// This matters most on a resume: for several seconds the screen shows only the
+// old conversation, whose first bubble is gc's own startup prompt (first line
+// "[city] rig/agent • time"). Reading that bubble as the box made the guard
+// probe a box that did not exist yet, get no clear answer, and refuse every
+// resume nudge (hq-51ocez). With no box on screen there is nothing anybody
+// could have typed into, so there is nothing to guard.
 //
 // Dim text is dropped. Claude draws its placeholder ("Press up to edit queued
 // messages") and its suggested next prompt dim, and real typing is never dim.
-// A plain capture cannot see dim, which is why this reads color codes.
+// A plain capture cannot see dim or a background, which is why this reads
+// color codes.
 func inputBoxText(lines []string, promptPrefix string) (text string, found bool) {
-	boxAt := -1
-	for i, line := range lines {
-		all, _ := splitDimText(line)
-		if matchesPromptPrefix(all, promptPrefix) {
-			boxAt = i
+	var box styledLine
+	for _, line := range lines {
+		l := readStyledLine(line)
+		if l.onBackground {
+			continue // a message bubble, not the box
+		}
+		if matchesPromptPrefix(l.all, promptPrefix) {
+			box, found = l, true
 		}
 	}
-	if boxAt < 0 {
+	if !found {
 		return "", false
 	}
-	_, typed := splitDimText(lines[boxAt])
-	typed = strings.ReplaceAll(typed, "\u00a0", " ")
+	typed := strings.ReplaceAll(box.typed, "\u00a0", " ")
 	typed = stripLeadingBoxBorder(typed)
 	typed = strings.TrimRight(typed, " \t│┃")
 	glyph := strings.TrimSpace(strings.ReplaceAll(promptPrefix, "\u00a0", " "))
@@ -216,18 +226,38 @@ func inputBoxText(lines []string, promptPrefix string) (text string, found bool)
 	return strings.TrimSpace(typed), true
 }
 
-// splitDimText reads one captured line with its escape codes. all is every
-// visible character; typed is only the characters not drawn dim.
-func splitDimText(line string) (all, typed string) {
+// styledLine is one captured line, read with its escape codes.
+type styledLine struct {
+	all   string // every visible character
+	typed string // only the visible characters not drawn dim
+	// onBackground is true when the first visible, non-space character sits
+	// on a background color: a message bubble, never the input box.
+	onBackground bool
+}
+
+// sgrState is the part of the terminal's drawing style the guard cares about.
+type sgrState struct {
+	dim bool
+	bg  bool
+}
+
+// readStyledLine reads one captured line with its escape codes.
+func readStyledLine(line string) styledLine {
 	var a, b strings.Builder
-	dim := false
+	var st sgrState
+	var out styledLine
+	sawText := false
 	for i := 0; i < len(line); {
 		c := line[i]
 		if c != 0x1b {
 			r, size := utf8.DecodeRuneInString(line[i:])
 			a.WriteRune(r)
-			if !dim {
+			if !st.dim {
 				b.WriteRune(r)
+			}
+			if !sawText && r != ' ' && r != '\t' && r != '\u00a0' {
+				sawText = true
+				out.onBackground = st.bg
 			}
 			i += size
 			continue
@@ -242,7 +272,7 @@ func splitDimText(line string) (all, typed string) {
 				j++
 			}
 			if j < len(line) && line[j] == 'm' {
-				dim = applySGRDim(line[i+2:j], dim)
+				st = applySGR(line[i+2:j], st)
 			}
 			i = j + 1
 		case ']': // OSC (for example a hyperlink): ends at BEL or ESC \.
@@ -258,28 +288,46 @@ func splitDimText(line string) (all, typed string) {
 			i += 2
 		}
 	}
-	return a.String(), b.String()
+	out.all, out.typed = a.String(), b.String()
+	return out
 }
 
-// applySGRDim returns the dim state after one SGR sequence's parameters.
-// 2 turns dim on; 0 (or no parameter) and 22 turn it off. Color parameters
-// (38, 48, 58) carry numbers of their own, so "38;5;2" is a color, not dim.
-func applySGRDim(params string, dim bool) bool {
+// applySGR returns the style after one SGR sequence's parameters.
+//
+//	dim: 2 turns it on; 0 (or no parameter) and 22 turn it off.
+//	background: 40-47, 100-107 and 48 turn it on; 0 (or none) and 49 turn it off.
+//
+// Color parameters (38, 48, 58) carry numbers of their own, so "38;5;2" is a
+// color, not dim.
+func applySGR(params string, st sgrState) sgrState {
 	if params == "" {
-		return false
+		return sgrState{}
 	}
 	fields := strings.Split(params, ";")
 	for k := 0; k < len(fields); k++ {
 		n, err := strconv.Atoi(fields[k])
 		if err != nil {
-			continue // colon sub-parameters such as "38:5:2" are one color
+			// Colon sub-parameters such as "48:5:237" are one color.
+			if strings.HasPrefix(fields[k], "48:") {
+				st.bg = true
+			}
+			continue
 		}
-		switch n {
-		case 0, 22:
-			dim = false
-		case 2:
-			dim = true
-		case 38, 48, 58:
+		switch {
+		case n == 0:
+			st = sgrState{}
+		case n == 22:
+			st.dim = false
+		case n == 2:
+			st.dim = true
+		case n == 49:
+			st.bg = false
+		case n >= 40 && n <= 47, n >= 100 && n <= 107:
+			st.bg = true
+		case n == 38, n == 48, n == 58:
+			if n == 48 {
+				st.bg = true
+			}
 			if k+1 < len(fields) {
 				switch fields[k+1] {
 				case "5":
@@ -290,5 +338,5 @@ func applySGRDim(params string, dim bool) bool {
 			}
 		}
 	}
-	return dim
+	return st
 }
