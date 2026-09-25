@@ -70,6 +70,7 @@ func TestSidecarPaths404(t *testing.T) {
 		"/pane?session=mayor&lines=1",
 		"/keys",
 		"/file?session=mayor&path=%2Ftmp%2Fa.png",
+		"/commands?session=mayor",
 		"/term",
 		"/term/",
 		"/term/token",

@@ -56,7 +56,8 @@ export function SessionPage() {
   const back = params.get('back') ?? '/agents';
   const label = params.get('label') ?? id;
   // The agent's tmux session, carried by the link that got us here. Its presence
-  // is what makes the live pane offerable at all.
+  // is what makes the live pane offerable at all, and it is how the composer's
+  // "/" list finds this agent's own skills.
   const tmux = params.get('tmux') ?? '';
   const readOnly = useReadOnly();
   const state = useStructuredSessionStream(id, true);
@@ -433,6 +434,7 @@ export function SessionPage() {
         <div style={{ paddingBottom: 'env(safe-area-inset-bottom)' }}>
           <Composer
             sessionId={id}
+            tmuxSession={tmux}
             running={running}
             model={model}
             onSend={send}

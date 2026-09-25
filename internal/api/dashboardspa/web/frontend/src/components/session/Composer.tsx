@@ -1,21 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
+import { matchCommands, useSlashCommands } from '../../lib/commands';
 import { keepFocus } from '../../lib/keepFocus';
 import { useUploadsServed, writeAttachment } from '../../lib/upload';
-
-// Claude Code's own slash commands. The agent interprets whatever is sent, so
-// this list is an affordance rather than a contract: a command it does not know
-// still works, the palette only saves the typing.
-const SLASH: ReadonlyArray<{ cmd: string; hint: string }> = [
-  { cmd: '/clear', hint: 'start a fresh context' },
-  { cmd: '/compact', hint: 'summarise and shrink the context' },
-  { cmd: '/context', hint: 'what is in the context window' },
-  { cmd: '/cost', hint: 'token spend for this session' },
-  { cmd: '/help', hint: 'list commands' },
-  { cmd: '/model', hint: 'switch model' },
-  { cmd: '/review', hint: 'review the current diff' },
-  { cmd: '/status', hint: 'session and account status' },
-  { cmd: '/usage', hint: 'limits and usage' },
-];
 
 // Sent as Claude Code's own /model, so the agent owns the vocabulary. The
 // short names are aliases Claude Code resolves itself; fable has no alias yet,
@@ -51,6 +37,7 @@ let attachSeq = 0;
 
 export function Composer({
   sessionId,
+  tmuxSession,
   running,
   model,
   onSend,
@@ -58,6 +45,10 @@ export function Composer({
   onNotice,
 }: {
   sessionId: string;
+  // The agent's tmux session name, or '' when the link did not carry one. It is
+  // how the "/" list finds this agent's own skills; with '' the list is the
+  // built-in commands alone.
+  tmuxSession: string;
   running: boolean;
   model: string | null;
   onSend: (text: string) => Promise<void>;
@@ -75,6 +66,7 @@ export function Composer({
   // is no attach button and a pasted file is not picked up, so nothing is
   // offered that could only fail at send.
   const canAttach = useUploadsServed() === true;
+  const commands = useSlashCommands(tmuxSession);
 
   useEffect(() => {
     const el = box.current;
@@ -161,7 +153,7 @@ export function Composer({
 
   const word = text.split(/\s/).pop() ?? '';
   const showSlash = word.startsWith('/') && !text.includes('\n');
-  const matches = SLASH.filter((s) => s.cmd.startsWith(word));
+  const matches = showSlash ? matchCommands(commands, word) : [];
   const effortLabel = EFFORT.find((e) => e.id === effort)?.label ?? 'normal';
   const sendable = text.trim() !== '' || attachments.length > 0;
 
@@ -172,21 +164,28 @@ export function Composer({
 
   return (
     <div className="shrink-0 border-t border-rule bg-surface">
-      {showSlash && matches.length > 0 && (
-        <ul className="max-h-48 overflow-y-auto border-b border-rule">
-          {matches.map((s) => (
-            <li key={s.cmd}>
+      {matches.length > 0 && (
+        <ul aria-label="Commands" className="max-h-60 overflow-y-auto border-b border-rule">
+          {matches.map((c) => (
+            <li key={c.name}>
               <button
                 type="button"
                 onMouseDown={keepFocus}
-                className="flex min-h-11 w-full items-baseline gap-3 px-4 text-left focus-mark"
+                className="flex min-h-11 w-full min-w-0 flex-col justify-center px-4 py-1 text-left focus-mark"
                 onClick={() => {
-                  setText((t) => `${t.slice(0, t.length - word.length)}${s.cmd} `);
+                  setText((t) => `${t.slice(0, t.length - word.length)}/${c.name} `);
                   box.current?.focus();
                 }}
               >
-                <span className="text-body text-fg">{s.cmd}</span>
-                <span className="text-label uppercase tracking-wider text-fg-faint">{s.hint}</span>
+                <span className="text-body text-fg">/{c.name}</span>
+                {/* Skill descriptions run long, so one line of it, and where
+                    the command comes from, the way the pane tags its rows. */}
+                <span className="w-full truncate text-label text-fg-faint">
+                  {c.source !== 'builtin' && (
+                    <span className="uppercase tracking-wider">{c.source} · </span>
+                  )}
+                  {c.description}
+                </span>
               </button>
             </li>
           ))}
