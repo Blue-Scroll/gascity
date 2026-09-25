@@ -30,6 +30,7 @@ import {
 } from '../components/cockpit/model';
 import { PageHeader } from '../components/PageHeader';
 import { useCachedData } from '../hooks/useCachedData';
+import { useRefreshWhilePartial } from '../hooks/useRefreshWhilePartial';
 import { useRunSummary } from '../runs/runSummarySubscription';
 import { SUPERVISOR_REQUEST_TIMEOUT_MS, supervisorApi } from '../supervisor/client';
 
@@ -64,6 +65,16 @@ export function CockpitHomePage() {
   usePoll(statusState.refresh, statusState.loading, pausedRef);
   usePoll(runsState.refresh, runsState.loading, pausedRef);
   usePoll(sessionsState.refresh, sessionsState.loading, pausedRef);
+  // While the bead store is slow, the sessions list answers at once with the
+  // live sessions and no ids, marked partial (vn-fzant5y). Ask again soon
+  // instead of waiting a whole poll, so the Mayor button gets its link as soon
+  // as the full list is ready. This runs while paused too: the button reads
+  // live, and it stops by itself once an answer is not partial.
+  useRefreshWhilePartial(
+    sessionsState.data?.partial === true,
+    sessionsState.fetchedAt,
+    sessionsState.refresh,
+  );
 
   const usageReading = useFrozenWhilePaused(useReadingSnapshot(usageState, cityKey), paused);
   const statusReading = useFrozenWhilePaused(useReadingSnapshot(statusState, cityKey), paused);

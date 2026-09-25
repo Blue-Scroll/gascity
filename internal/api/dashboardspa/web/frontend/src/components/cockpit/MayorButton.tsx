@@ -1,6 +1,7 @@
 import { Link } from 'react-router-dom';
 import type { ListBodySessionResponse } from 'gas-city-dashboard-shared/gc-supervisor';
 import { sessionRoute } from '../../lib/sessionLink';
+import { hasSessionId } from '../../supervisor/sessionReads';
 
 // The front page's way into the mayor's session (vn-zh1offx). The mayor is the
 // session the operator opens most, often from a phone, so it gets one button
@@ -32,14 +33,17 @@ export function mayorLink(
   if (list === undefined) return loading ? { kind: 'checking' } : { kind: 'unknown' };
   const mayors = (list.items ?? []).filter((session) => session.template === MAYOR_AGENT);
   const live = mayors
-    .filter((session) => session.running && session.id !== '')
+    .filter((session) => session.running && hasSessionId(session))
     .sort((a, b) => b.created_at.localeCompare(a.created_at))[0];
   if (live !== undefined) {
     // The tmux name rides along so the session view can offer the live pane.
     return { kind: 'running', to: sessionRoute(live.id, '/', 'Mayor', live.session_name) };
   }
   // A running mayor with no id yet, or a partial list with no mayor row at
-  // all, is still an open question. The page polls, so the answer comes.
+  // all, is still an open question. While the bead store is slow, GET
+  // /sessions answers at once from the live sessions, and those rows carry the
+  // template but no id (vn-fzant5y). Home asks again while the list is
+  // partial, so the answer comes.
   if (mayors.some((session) => session.running) || (list.partial === true && mayors.length === 0)) {
     return { kind: 'checking' };
   }

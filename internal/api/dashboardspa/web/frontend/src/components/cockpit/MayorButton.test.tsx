@@ -98,6 +98,11 @@ describe('mayorLink', () => {
   it('keeps checking when a partial list leaves the mayor out, or has no id for it yet', () => {
     expect(mayorLink(list([session({})], true), false)).toEqual({ kind: 'checking' });
     expect(mayorLink(list([mayor({ id: '' })]), false)).toEqual({ kind: 'checking' });
+    // The row GET /sessions sends while the bead store is slow (vn-fzant5y):
+    // built from the live session, so no id and no created_at.
+    expect(mayorLink(list([mayor({ id: '', created_at: '' })], true), false)).toEqual({
+      kind: 'checking',
+    });
   });
 
   it('trusts a partial list that does carry a stopped mayor', () => {
