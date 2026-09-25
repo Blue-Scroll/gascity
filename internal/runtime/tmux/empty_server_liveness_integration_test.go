@@ -35,12 +35,12 @@ func TestStateCache_RealEmptyServerObservesEmptyFleet(t *testing.T) {
 	}
 
 	fetcher := &tmuxFetcher{tm: tm}
-	snap, err := fetcher.FetchState(context.Background())
+	sessions, err := fetcher.FetchSessions(context.Background())
 	if err != nil {
-		t.Fatalf("FetchState with one live session: %v", err)
+		t.Fatalf("FetchSessions with one live session: %v", err)
 	}
-	if !snap.Sessions[session].Running {
-		t.Fatalf("FetchState did not see the live session; sessions = %v", snap.Sessions)
+	if !sessions[session].Running {
+		t.Fatalf("FetchSessions did not see the live session; sessions = %v", sessions)
 	}
 
 	if err := tm.KillSession(session); err != nil {
@@ -49,16 +49,16 @@ func TestStateCache_RealEmptyServerObservesEmptyFleet(t *testing.T) {
 
 	// kill-session completes on the server before the client returns, so the
 	// very next observation must already see the empty-but-alive server.
-	snap, err = fetcher.FetchState(context.Background())
+	sessions, err = fetcher.FetchSessions(context.Background())
 	if err != nil {
-		t.Fatalf("FetchState against an alive empty server: err = %v (ErrRuntimeUnavailable=%t), want a successful empty observation",
+		t.Fatalf("FetchSessions against an alive empty server: err = %v (ErrRuntimeUnavailable=%t), want a successful empty observation",
 			err, errors.Is(err, gcruntime.ErrRuntimeUnavailable))
 	}
-	if snap.Sessions == nil {
-		t.Fatal("FetchState Sessions = nil for an alive empty server, want an empty non-nil map")
+	if sessions == nil {
+		t.Fatal("FetchSessions Sessions = nil for an alive empty server, want an empty non-nil map")
 	}
-	if len(snap.Sessions) != 0 {
-		t.Fatalf("FetchState Sessions = %v after the last session was killed, want empty", snap.Sessions)
+	if len(sessions) != 0 {
+		t.Fatalf("FetchSessions Sessions = %v after the last session was killed, want empty", sessions)
 	}
 
 	// Recovery: a new session on the same server must be observed again with no
@@ -66,11 +66,11 @@ func TestStateCache_RealEmptyServerObservesEmptyFleet(t *testing.T) {
 	if err := tm.NewSessionWithCommand(session, t.TempDir(), "sleep 300"); err != nil {
 		t.Fatalf("NewSessionWithCommand after empty: %v", err)
 	}
-	snap, err = fetcher.FetchState(context.Background())
+	sessions, err = fetcher.FetchSessions(context.Background())
 	if err != nil {
-		t.Fatalf("FetchState after the server refilled: %v", err)
+		t.Fatalf("FetchSessions after the server refilled: %v", err)
 	}
-	if !snap.Sessions[session].Running {
-		t.Fatalf("session not observed after the server refilled; sessions = %v", snap.Sessions)
+	if !sessions[session].Running {
+		t.Fatalf("session not observed after the server refilled; sessions = %v", sessions)
 	}
 }

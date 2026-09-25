@@ -16,17 +16,21 @@ import (
 	gcruntime "github.com/gastownhall/gascity/internal/runtime"
 )
 
-// mockFetcher implements StateFetcher for testing.
+// mockFetcher implements StateFetcher for testing. calls counts list-panes
+// fetches and procCalls counts ps scans. state.ProcessesAvailable=false makes
+// every ps scan fail.
 type mockFetcher struct {
-	mu       sync.Mutex
-	calls    int
-	sessions map[string]bool
-	state    runtimeStateSnapshot
-	err      error
-	delay    time.Duration
+	mu        sync.Mutex
+	calls     int
+	procCalls int
+	sessions  map[string]bool
+	state     runtimeStateSnapshot
+	err       error
+	delay     time.Duration
+	procDelay time.Duration
 }
 
-func (m *mockFetcher) FetchState(ctx context.Context) (runtimeStateSnapshot, error) {
+func (m *mockFetcher) FetchSessions(ctx context.Context) (map[string]sessionRuntimeState, error) {
 	m.mu.Lock()
 	m.calls++
 	state := m.state
@@ -39,7 +43,7 @@ func (m *mockFetcher) FetchState(ctx context.Context) (runtimeStateSnapshot, err
 		select {
 		case <-time.After(delay):
 		case <-ctx.Done():
-			return runtimeStateSnapshot{}, ctx.Err()
+			return nil, ctx.Err()
 		}
 	}
 	if state.Sessions == nil && sessions != nil {
@@ -48,7 +52,39 @@ func (m *mockFetcher) FetchState(ctx context.Context) (runtimeStateSnapshot, err
 			state.Sessions[name] = sessionRuntimeState{Running: running}
 		}
 	}
-	return state, err
+	return state.Sessions, err
+}
+
+func (m *mockFetcher) FetchProcesses(ctx context.Context) (processSnapshot, error) {
+	m.mu.Lock()
+	m.procCalls++
+	state := m.state
+	delay := m.procDelay
+	m.mu.Unlock()
+
+	if delay > 0 {
+		select {
+		case <-time.After(delay):
+		case <-ctx.Done():
+			return processSnapshot{}, ctx.Err()
+		}
+	}
+	if !state.ProcessesAvailable {
+		return processSnapshot{}, errors.New("mock: ps scan failed")
+	}
+	return state.Processes, nil
+}
+
+func (m *mockFetcher) getProcCalls() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.procCalls
+}
+
+func (m *mockFetcher) setState(state runtimeStateSnapshot) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.state = state
 }
 
 func (m *mockFetcher) getCalls() int {
@@ -74,7 +110,13 @@ type controlledRefreshFetcher struct {
 	release   chan struct{}
 }
 
-func (f *controlledRefreshFetcher) FetchState(ctx context.Context) (runtimeStateSnapshot, error) {
+func (f *controlledRefreshFetcher) FetchProcesses(context.Context) (processSnapshot, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.state.Processes, nil
+}
+
+func (f *controlledRefreshFetcher) FetchSessions(ctx context.Context) (map[string]sessionRuntimeState, error) {
 	f.mu.Lock()
 	f.calls++
 	call := f.calls
@@ -86,10 +128,10 @@ func (f *controlledRefreshFetcher) FetchState(ctx context.Context) (runtimeState
 		select {
 		case <-f.release:
 		case <-ctx.Done():
-			return runtimeStateSnapshot{}, ctx.Err()
+			return nil, ctx.Err()
 		}
 	}
-	return state, nil
+	return state.Sessions, nil
 }
 
 func (f *controlledRefreshFetcher) getCalls() int {
@@ -248,6 +290,164 @@ func TestStateCache_DegradedProcessSnapshotRetainsLiveness(t *testing.T) {
 	}
 }
 
+// shellPaneWithClaude is one session, agent-1, whose bash pane (PID 101) runs
+// claude as a child. It is the fixture for the ps-off-the-caller-path tests.
+func shellPaneWithClaude() runtimeStateSnapshot {
+	return runtimeStateSnapshot{
+		Sessions: map[string]sessionRuntimeState{
+			"agent-1": {Running: true, Panes: []paneRuntimeState{{Command: "bash", PID: "101"}}},
+		},
+		Processes: newProcessSnapshot([]processRuntimeState{
+			{PID: "101", PPID: "1", Command: "bash", Args: "bash -lc claude"},
+			{PID: "102", PPID: "101", Command: "claude", Args: "claude"},
+		}),
+		ProcessesAvailable: true,
+	}
+}
+
+// waitFor polls cond for up to 5s. The ps scans below run in the background,
+// so a test can only watch for their effect.
+func waitFor(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s", what)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// vn-cj72bmr: a refresh used to run tmux list-panes AND two full ps scans
+// under one 3s timeout, so under load every IsRunning past the 2s TTL waited
+// on ps. IsRunning only needs list-panes, so it must never start a ps scan.
+func TestStateCache_IsRunningNeverRunsPS(t *testing.T) {
+	f := &mockFetcher{state: shellPaneWithClaude()}
+	cache := NewStateCache(f, time.Nanosecond) // every read refreshes
+
+	for range 5 {
+		if !cache.IsRunning("agent-1") {
+			t.Fatal("IsRunning(agent-1) = false, want true")
+		}
+	}
+	if got := f.getCalls(); got < 2 {
+		t.Fatalf("list-panes fetches = %d, want the expired TTL to refresh on each read", got)
+	}
+	if got := f.getProcCalls(); got != 0 {
+		t.Fatalf("ps scans = %d after only IsRunning reads, want 0", got)
+	}
+}
+
+// Once a scan has landed, a slow ps must not hold up ProcessAlive: it answers
+// from the last good snapshot while the new scan runs in the background.
+func TestStateCache_ProcessAliveDoesNotWaitOnSlowPS(t *testing.T) {
+	f := &mockFetcher{state: shellPaneWithClaude()}
+	cache := NewStateCache(f, time.Hour)
+
+	if !cache.ProcessAlive("agent-1", []string{"claude"}) {
+		t.Fatal("first ProcessAlive = false, want true from the first scan")
+	}
+	if got := f.getProcCalls(); got != 1 {
+		t.Fatalf("ps scans = %d after the first ProcessAlive, want 1 (it waits for the first scan)", got)
+	}
+
+	f.mu.Lock()
+	f.procDelay = 2 * time.Second
+	f.mu.Unlock()
+	cache.mu.Lock()
+	cache.procsTTL = time.Nanosecond // the snapshot is always due for a rescan
+	cache.mu.Unlock()
+
+	start := time.Now()
+	alive := cache.ProcessAlive("agent-1", []string{"claude"})
+	elapsed := time.Since(start)
+	if !alive {
+		t.Fatal("ProcessAlive = false, want true from the last good snapshot")
+	}
+	if elapsed > time.Second {
+		t.Fatalf("ProcessAlive took %v with a 2s ps scan running, want it to return without waiting", elapsed)
+	}
+	waitFor(t, "the background ps scan to start", func() bool { return f.getProcCalls() == 2 })
+}
+
+// A pane that appeared after the last scan began (a new session, a respawned
+// pane, or one another gc process started) is not in that scan. The scan must
+// not call it dead: that would read as a crashed agent. Once a scan that began
+// after the pane landed, its answer is trusted again, including a "dead".
+func TestStateCache_ScanOlderThanPaneCannotCallItDead(t *testing.T) {
+	f := &mockFetcher{state: shellPaneWithClaude()}
+	cache := NewStateCache(f, time.Hour)
+	if !cache.ProcessAlive("agent-1", []string{"claude"}) {
+		t.Fatal("ProcessAlive(agent-1) = false, want true")
+	}
+
+	// agent-2 appears with a bash pane (PID 201) that has no claude child. The
+	// next scan is slow, so the old snapshot (no PID 201 at all) is what the
+	// read sees.
+	withNewPane := shellPaneWithClaude()
+	withNewPane.Sessions["agent-2"] = sessionRuntimeState{Running: true, Panes: []paneRuntimeState{{Command: "bash", PID: "201"}}}
+	withNewPane.Processes = newProcessSnapshot([]processRuntimeState{
+		{PID: "101", PPID: "1", Command: "bash", Args: "bash -lc claude"},
+		{PID: "102", PPID: "101", Command: "claude", Args: "claude"},
+		{PID: "201", PPID: "1", Command: "bash", Args: "bash"},
+	})
+	f.setState(withNewPane)
+	f.mu.Lock()
+	f.procDelay = 200 * time.Millisecond
+	f.mu.Unlock()
+	cache.Invalidate()
+
+	if !cache.ProcessAlive("agent-2", []string{"claude"}) {
+		t.Fatal("ProcessAlive(agent-2) = false from a scan that began before its pane existed, want the optimistic true")
+	}
+	if !cache.ProcessAlive("agent-1", []string{"claude"}) {
+		t.Fatal("ProcessAlive(agent-1) = false, want true: its pane is older than the scan")
+	}
+
+	// The read above started a fresh scan. When it lands it began after the
+	// pane was seen, so its "no claude under PID 201" is believed.
+	waitFor(t, "a scan newer than agent-2's pane to report it dead", func() bool {
+		return !cache.ProcessAlive("agent-2", []string{"claude"})
+	})
+}
+
+// A failed scan keeps the last good snapshot, so a real "dead" still reads as
+// dead. Past the staleTTL cliff the snapshot is dropped and ProcessAlive
+// degrades optimistically, the same as a cache that never had one.
+func TestStateCache_FailedPSKeepsLastGoodUntilStaleTTL(t *testing.T) {
+	f := &mockFetcher{state: shellPaneWithClaude()}
+	cache := NewStateCache(f, time.Hour)
+	if cache.ProcessAlive("agent-1", []string{"codex"}) {
+		t.Fatal("ProcessAlive(agent-1, codex) = true, want false from a good scan")
+	}
+
+	failing := shellPaneWithClaude()
+	failing.ProcessesAvailable = false
+	f.setState(failing)
+	cache.mu.Lock()
+	cache.procsTTL = time.Nanosecond
+	cache.mu.Unlock()
+
+	if cache.ProcessAlive("agent-1", []string{"codex"}) {
+		t.Fatal("ProcessAlive(agent-1, codex) = true while ps fails, want false from the last good snapshot")
+	}
+	waitFor(t, "the failing background scan", func() bool { return f.getProcCalls() >= 2 })
+
+	// Only the process snapshot passes the cliff: list-panes stays fresh.
+	// The pane is aged too, so the scan still postdates it and only the cliff
+	// can explain an optimistic answer.
+	cache.mu.Lock()
+	cache.procs.startedAt = time.Now().Add(-2 * cache.staleTTL)
+	cache.state.Sessions["agent-1"].Panes[0].FirstSeen = cache.procs.startedAt.Add(-time.Second)
+	cache.mu.Unlock()
+	if !cache.ProcessAlive("agent-1", []string{"codex"}) {
+		t.Fatal("ProcessAlive(agent-1, codex) = false past staleTTL, want the optimistic true")
+	}
+	if !cache.IsRunning("agent-1") {
+		t.Fatal("IsRunning(agent-1) = false, want true: tmux liveness does not depend on ps")
+	}
+}
+
 func TestStateCache_ProcessAliveMatchesShellDescendantFromSnapshot(t *testing.T) {
 	f := &mockFetcher{
 		state: runtimeStateSnapshot{
@@ -311,7 +511,7 @@ func TestProviderObserveLivenessUsesCacheProcessSnapshot(t *testing.T) {
 	}
 }
 
-// FetchState must report an unreachable tmux server as an observation FAILURE
+// FetchSessions must report an unreachable tmux server as an observation FAILURE
 // (runtime.ErrRuntimeUnavailable), not as an empty success. The empty-success
 // form let refresh() overwrite last-known-good and instantly report every
 // session not-running, draining healthy pool slots on a brief tmux blip. The
@@ -320,15 +520,15 @@ func TestProviderObserveLivenessUsesCacheProcessSnapshot(t *testing.T) {
 func TestTmuxFetcher_NoServerMapsToRuntimeUnavailable(t *testing.T) {
 	f := &tmuxFetcher{tm: &Tmux{cfg: DefaultConfig(), exec: &fakeExecutor{err: ErrNoServer}}}
 
-	snap, err := f.FetchState(context.Background())
+	sessions, err := f.FetchSessions(context.Background())
 	if err == nil {
-		t.Fatalf("FetchState() err = nil (snapshot %+v), want an error for an unreachable server", snap)
+		t.Fatalf("FetchSessions() err = nil (sessions %+v), want an error for an unreachable server", sessions)
 	}
 	if !errors.Is(err, gcruntime.ErrRuntimeUnavailable) {
-		t.Fatalf("FetchState() err = %v, want errors.Is(runtime.ErrRuntimeUnavailable)", err)
+		t.Fatalf("FetchSessions() err = %v, want errors.Is(runtime.ErrRuntimeUnavailable)", err)
 	}
 	if !isNoServerError(err) {
-		t.Fatalf("FetchState() err = %v must still satisfy isNoServerError so downstream ErrNoServer absorbers work", err)
+		t.Fatalf("FetchSessions() err = %v must still satisfy isNoServerError so downstream ErrNoServer absorbers work", err)
 	}
 }
 
@@ -336,8 +536,7 @@ func TestTmuxFetcher_NoServerMapsToRuntimeUnavailable(t *testing.T) {
 // preserve last-known-good (within staleTTL) instead of collapsing to empty.
 func TestStateCache_NoServerRefreshPreservesLastKnownGood(t *testing.T) {
 	fe := &fakeExecutor{
-		// FetchState issues exactly one executor call (list-panes); the
-		// process-table half reads /proc directly, not through exec. First
+		// FetchSessions issues exactly one executor call (list-panes). First
 		// call primes one live pane, every later call reports no server.
 		outs: []string{"agent-1\t0\tclaude\t123"},
 		errs: []error{nil, ErrNoServer, ErrNoServer, ErrNoServer},
