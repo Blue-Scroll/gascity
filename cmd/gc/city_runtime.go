@@ -1215,15 +1215,9 @@ func (cr *CityRuntime) tick(
 		cr.resetFSPressureEpisode()
 	}
 
-	recordPhase := func(site TraceSiteCode, name string, start time.Time, fields map[string]any) {
-		if trace != nil {
-			trace.RecordControllerOperation(site, TraceReasonRetained, TraceOutcomeComplete, name, time.Since(start), fields)
-		}
-	}
-
-	phaseStart := time.Now()
+	phaseStart := startTickPhase()
 	cr.ensureManagedDoltPublishedForTick()
-	recordPhase(TraceSiteControllerTickPhase, "managed_dolt_preflight", phaseStart, nil)
+	trace.RecordTickPhase(TraceSiteControllerTickPhase, "managed_dolt_preflight", phaseStart, nil)
 	if ctx.Err() != nil {
 		return
 	}
@@ -1232,9 +1226,9 @@ func (cr *CityRuntime) tick(
 	// phases so due formulas are not starved by slow startup/config drift work,
 	// but after the pressure gate and managed-Dolt preflight so skipped or
 	// endpoint-repair ticks do not add tracking writes first.
-	phaseStart = time.Now()
+	phaseStart = startTickPhase()
 	cr.dispatchOrders(ctx, cityRoot)
-	recordPhase(TraceSiteOrderDispatch, "dispatch_orders", phaseStart, nil)
+	trace.RecordTickPhase(TraceSiteOrderDispatch, "dispatch_orders", phaseStart, nil)
 	if ctx.Err() != nil {
 		return
 	}
@@ -1247,7 +1241,7 @@ func (cr *CityRuntime) tick(
 	// the last pass, and nothing else. A steady tick names nothing and reads no
 	// store at all. The authoritative full scan this replaced was 185.3s of a
 	// ~360s tick (ga-l7jdg) and now runs off-tick in the backstop lane.
-	phaseStart = time.Now()
+	phaseStart = startTickPhase()
 	routeReport := cr.recoverUnroutedWorkRoutesDelta()
 	if trace != nil {
 		// The convergence lane runs on a background goroutine, so the tick's
@@ -1258,15 +1252,15 @@ func (cr *CityRuntime) tick(
 		backstopAt, backstopReason, backstopRan := cr.routeRecoveryLaneOf().lastBackstop()
 		addBackstopAgeFields(routeFields, backstopAt, backstopReason, backstopRan)
 		trace.RecordControllerOperation(TraceSiteControllerTickPhase, TraceReasonRetained, routeReport.outcome(),
-			"recover_unrouted_work_routes", time.Since(phaseStart), routeFields)
+			"recover_unrouted_work_routes", phaseStart.elapsed(), phaseStart.withBDCost(routeFields))
 	}
 	if ctx.Err() != nil {
 		return
 	}
 
-	phaseStart = time.Now()
+	phaseStart = startTickPhase()
 	sessionBeads := cr.loadSessionBeadSnapshot()
-	recordPhase(TraceSiteSessionSnapshot, "load_session_snapshot.initial", phaseStart, traceSessionSnapshotFields(sessionBeads))
+	trace.RecordTickPhase(TraceSiteSessionSnapshot, "load_session_snapshot.initial", phaseStart, traceSessionSnapshotFields(sessionBeads))
 	if trace != nil && sessionBeads != nil {
 		trace.RecordSessionBaseline("", "", traceRecordPayload{
 			"open_count": len(sessionBeads.OpenInfos()),
@@ -1280,39 +1274,39 @@ func (cr *CityRuntime) tick(
 	// the reconciler to read/write hashes during reconciliation.
 	// Reap open session beads whose tmux session is dead before loading demand
 	// so stale names cannot block desired-state computation (#742).
-	phaseStart = time.Now()
+	phaseStart = startTickPhase()
 	cleanupDeadRuntimeSessionCorpses(cr.sessionsBeadStore().Store, cr.rigBeadStores(), cr.cfg, sessionBeads, cr.sessionDrains, cr.sp, clock.Real{}, cr.stderr)
-	recordPhase(TraceSiteControllerTickPhase, "cleanup_dead_runtime_session_corpses", phaseStart, nil)
+	trace.RecordTickPhase(TraceSiteControllerTickPhase, "cleanup_dead_runtime_session_corpses", phaseStart, nil)
 	// Reap live runtimes still bound to a closed bead (e.g. a named-session
 	// identity re-minted as a pool slot) so the name's current owner can rebind
 	// it and attach lands on the right runtime.
-	phaseStart = time.Now()
+	phaseStart = startTickPhase()
 	reapRuntimesBoundToClosedBeads(cr.sessionsBeadStore().Store, sessionBeads, cr.sessionDrains, cr.sp, cr.stderr)
-	recordPhase(TraceSiteControllerTickPhase, "reap_runtimes_bound_to_closed_beads", phaseStart, nil)
-	phaseStart = time.Now()
+	trace.RecordTickPhase(TraceSiteControllerTickPhase, "reap_runtimes_bound_to_closed_beads", phaseStart, nil)
+	phaseStart = startTickPhase()
 	swept := sweepProcessTableOrphans(cr.sp, sessionBeads, cr.sessionsBeadStore().Store, cr.cityPath, cr.stderr)
 	if swept > 0 {
 		fmt.Fprintf(cr.stderr, "session reconciler: swept %d process-table orphan runtime(s)\n", swept) //nolint:errcheck
 	}
-	recordPhase(TraceSiteControllerTickPhase, "sweep_process_table_orphans", phaseStart, map[string]any{"reaped": swept})
-	phaseStart = time.Now()
+	trace.RecordTickPhase(TraceSiteControllerTickPhase, "sweep_process_table_orphans", phaseStart, map[string]any{"reaped": swept})
+	phaseStart = startTickPhase()
 	reaped := reapStaleSessionBeads(cr.sessionsBeadStore().Store, cr.sp, cr.sessionDrains, &cr.asyncStarts, clock.Real{}, cr.stderr)
-	recordPhase(TraceSiteControllerTickPhase, "reap_stale_session_beads", phaseStart, map[string]any{"reaped": reaped})
+	trace.RecordTickPhase(TraceSiteControllerTickPhase, "reap_stale_session_beads", phaseStart, map[string]any{"reaped": reaped})
 	if reaped > 0 {
-		phaseStart = time.Now()
+		phaseStart = startTickPhase()
 		sessionBeads = cr.loadSessionBeadSnapshot()
-		recordPhase(TraceSiteSessionSnapshot, "load_session_snapshot.after_reap", phaseStart, traceSessionSnapshotFields(sessionBeads))
+		trace.RecordTickPhase(TraceSiteSessionSnapshot, "load_session_snapshot.after_reap", phaseStart, traceSessionSnapshotFields(sessionBeads))
 	}
 	reapEnabled := cr.cfg.Daemon.AutoReapClosedBeadWorktreesEnabled()
 	reapDryRun := cr.cfg.Daemon.AutoReapClosedBeadWorktreesDryRunEnabled()
 	if reapEnabled || reapDryRun {
-		phaseStart = time.Now()
+		phaseStart = startTickPhase()
 		// Cross-check the liveness gate against the current open-session set in
 		// addition to the authoritative /proc cwd scan. Real removal supersedes
 		// dry-run when both flags are set.
 		liveSessionDirs := liveSessionWorktreeDirs(sessionBeads)
 		report := reapClosedBeadWorktrees(cr.cityPath, cr.cfg, cr.rigBeadStores(), liveSessionDirs, !reapEnabled, cr.rec, cr.reapSkips, cr.stderr)
-		recordPhase(TraceSiteControllerTickPhase, "reap_closed_bead_worktrees", phaseStart, map[string]any{
+		trace.RecordTickPhase(TraceSiteControllerTickPhase, "reap_closed_bead_worktrees", phaseStart, map[string]any{
 			"reaped":    len(report.Reaped),
 			"protected": len(report.Protected),
 			"dry_run":   !reapEnabled,
@@ -1320,15 +1314,15 @@ func (cr *CityRuntime) tick(
 		// Agent-home worktree cleanup performs real removals, so it runs only
 		// when real reaping is enabled — never under dry-run.
 		if reapEnabled {
-			phaseStart = time.Now()
+			phaseStart = startTickPhase()
 			agentHomesReset := cleanupClosedBeadAgentHomeWorktrees(cr.cityPath, cr.cfg, cr.rigBeadStores(), cr.stderr)
-			recordPhase(TraceSiteControllerTickPhase, "cleanup_agent_home_worktrees", phaseStart, map[string]any{"reset": agentHomesReset})
+			trace.RecordTickPhase(TraceSiteControllerTickPhase, "cleanup_agent_home_worktrees", phaseStart, map[string]any{"reset": agentHomesReset})
 		}
 	}
 	if ctx.Err() != nil {
 		return
 	}
-	phaseStart = time.Now()
+	phaseStart = startTickPhase()
 	finalizedDrainAckStops := 0
 	if sessionBeads != nil {
 		finalizedDrainAckStops = finalizeDrainAckStopPendingSessions(
@@ -1346,71 +1340,71 @@ func (cr *CityRuntime) tick(
 			cr.stderr,
 		)
 	}
-	recordPhase(TraceSiteControllerTickPhase, "finalize_drain_ack_stop_pending", phaseStart, map[string]any{
+	trace.RecordTickPhase(TraceSiteControllerTickPhase, "finalize_drain_ack_stop_pending", phaseStart, map[string]any{
 		"finalized": finalizedDrainAckStops,
 	})
 	if finalizedDrainAckStops > 0 {
-		phaseStart = time.Now()
+		phaseStart = startTickPhase()
 		sessionBeads = cr.loadSessionBeadSnapshot()
-		recordPhase(TraceSiteSessionSnapshot, "load_session_snapshot.after_drain_ack_stop_pending", phaseStart, traceSessionSnapshotFields(sessionBeads))
+		trace.RecordTickPhase(TraceSiteSessionSnapshot, "load_session_snapshot.after_drain_ack_stop_pending", phaseStart, traceSessionSnapshotFields(sessionBeads))
 	}
 	if ctx.Err() != nil {
 		return
 	}
-	phaseStart = time.Now()
+	phaseStart = startTickPhase()
 	demand := cr.loadDemandSnapshot(sessionBeads, trace, trigger, configChanged)
-	recordPhase(TraceSiteDemandSnapshot, "load_demand_snapshot", phaseStart, map[string]any{
+	trace.RecordTickPhase(TraceSiteDemandSnapshot, "load_demand_snapshot", phaseStart, map[string]any{
 		"config_changed": configChanged,
 		"trigger":        trigger,
 	})
 	result := demand.result
-	phaseStart = time.Now()
+	phaseStart = startTickPhase()
 	sessionBeads = cr.loadSessionBeadSnapshot()
-	recordPhase(TraceSiteSessionSnapshot, "load_session_snapshot.after_demand", phaseStart, traceSessionSnapshotFields(sessionBeads))
-	phaseStart = time.Now()
+	trace.RecordTickPhase(TraceSiteSessionSnapshot, "load_session_snapshot.after_demand", phaseStart, traceSessionSnapshotFields(sessionBeads))
+	phaseStart = startTickPhase()
 	result = cr.refreshDesiredState(result, sessionBeads)
-	recordPhase(TraceSiteDesiredStateBuild, "refresh_desired_state.before_sync", phaseStart, traceDesiredStateFields(result))
-	phaseStart = time.Now()
+	trace.RecordTickPhase(TraceSiteDesiredStateBuild, "refresh_desired_state.before_sync", phaseStart, traceDesiredStateFields(result))
+	phaseStart = startTickPhase()
 	_ = cr.syncBeadsAndUpdateIndex(result.State, sessionBeads)
-	recordPhase(TraceSiteSessionSync, "sync_beads_and_update_index", phaseStart, traceDesiredStateFields(result))
+	trace.RecordTickPhase(TraceSiteSessionSync, "sync_beads_and_update_index", phaseStart, traceDesiredStateFields(result))
 	// Reload snapshot after sync so the reconciler sees metadata written
 	// by syncBeadsAndUpdateIndex (e.g., configured_named_session/mode
 	// stamped on adopted beads). The CachingStore has the updated data
 	// from SetMetadataBatch write-through.
-	phaseStart = time.Now()
+	phaseStart = startTickPhase()
 	sessionBeads = cr.loadSessionBeadSnapshot()
-	recordPhase(TraceSiteSessionSnapshot, "load_session_snapshot.after_sync", phaseStart, traceSessionSnapshotFields(sessionBeads))
+	trace.RecordTickPhase(TraceSiteSessionSnapshot, "load_session_snapshot.after_sync", phaseStart, traceSessionSnapshotFields(sessionBeads))
 	// Re-point external-message bindings at respawned sessions (and clear
 	// bindings whose session is gone) now that replacement beads are visible.
-	phaseStart = time.Now()
+	phaseStart = startTickPhase()
 	reapStaleExtmsgBindings(ctx, cr.sessionsBeadStore(), time.Now(), cr.stderr)
-	recordPhase(TraceSiteControllerTickPhase, "reap_stale_extmsg_bindings", phaseStart, nil)
+	trace.RecordTickPhase(TraceSiteControllerTickPhase, "reap_stale_extmsg_bindings", phaseStart, nil)
 	// Re-point group participants at respawned sessions and carry their
 	// group-owned transcript membership; the participant side has no read-time
 	// membership overlay, so this backstop is what converges binding-less
 	// participants the binding reaper never sees.
-	phaseStart = time.Now()
+	phaseStart = startTickPhase()
 	reapStaleExtmsgParticipants(ctx, cr.sessionsBeadStore(), cr.stderr)
-	recordPhase(TraceSiteControllerTickPhase, "reap_stale_extmsg_participants", phaseStart, nil)
-	phaseStart = time.Now()
+	trace.RecordTickPhase(TraceSiteControllerTickPhase, "reap_stale_extmsg_participants", phaseStart, nil)
+	phaseStart = startTickPhase()
 	result = cr.refreshDesiredState(result, sessionBeads)
-	recordPhase(TraceSiteDesiredStateBuild, "refresh_desired_state.after_sync", phaseStart, traceDesiredStateFields(result))
+	trace.RecordTickPhase(TraceSiteDesiredStateBuild, "refresh_desired_state.after_sync", phaseStart, traceDesiredStateFields(result))
 
 	if manualReload != nil && manualReload.soft && manualReloadCompleted &&
 		(manualReply.Outcome == reloadOutcomeApplied || manualReply.Outcome == reloadOutcomeNoChange) {
-		phaseStart = time.Now()
+		phaseStart = startTickPhase()
 		cr.applySoftReloadAcceptance(&manualReply, result.State, sessionBeads)
-		recordPhase(TraceSiteConfigReload, "apply_soft_reload_acceptance", phaseStart, nil)
-		phaseStart = time.Now()
+		trace.RecordTickPhase(TraceSiteConfigReload, "apply_soft_reload_acceptance", phaseStart, nil)
+		phaseStart = startTickPhase()
 		sessionBeads = cr.loadSessionBeadSnapshot()
-		recordPhase(TraceSiteSessionSnapshot, "load_session_snapshot.after_soft_reload", phaseStart, traceSessionSnapshotFields(sessionBeads))
+		trace.RecordTickPhase(TraceSiteSessionSnapshot, "load_session_snapshot.after_soft_reload", phaseStart, traceSessionSnapshotFields(sessionBeads))
 	}
 
 	// Bead-driven reconciliation (requires bead store / drain tracker).
 	if cr.sessionDrains != nil {
-		phaseStart = time.Now()
+		phaseStart = startTickPhase()
 		cr.beadReconcileTick(ctx, result, sessionBeads, trace, false)
-		recordPhase(TraceSiteControllerTickPhase, "bead_reconcile_tick", phaseStart, traceDesiredStateFields(result))
+		trace.RecordTickPhase(TraceSiteControllerTickPhase, "bead_reconcile_tick", phaseStart, traceDesiredStateFields(result))
 	}
 	// Graph stores intentionally do not emit bead.closed, so a step closed
 	// between the durable write and the best-effort journal append would be a
@@ -1422,7 +1416,7 @@ func (cr *CityRuntime) tick(
 	// overload every surviving ticker fire IS a patrol trigger, so the full pass
 	// ran on every tick and cost 72.4s of it (ga-l7jdg).
 	if cr.cs != nil {
-		phaseStart = time.Now()
+		phaseStart = startTickPhase()
 		completionsLane := cr.completionsLaneOf()
 		namedRoots := completionsLane.takePending()
 		emitted := cr.cs.reconcileExecutionCompletionsDelta(namedRoots)
@@ -1433,7 +1427,7 @@ func (cr *CityRuntime) tick(
 		}
 		sweptAt, sweptReason, swept := completionsLane.lastSweep()
 		addBackstopAgeFields(completionFields, sweptAt, sweptReason, swept)
-		recordPhase(TraceSiteControllerTickPhase, "reconcile_execution_completions", phaseStart, completionFields)
+		trace.RecordTickPhase(TraceSiteControllerTickPhase, "reconcile_execution_completions", phaseStart, completionFields)
 	}
 
 	// Wisp GC: purge expired closed molecules. The molecule/wisp/workflow purge
@@ -1441,9 +1435,9 @@ func (cr *CityRuntime) tick(
 	// arm through the typed messaging-class store. Both collapse to the city store
 	// today, so the GC is byte-identical.
 	if graphStore := cr.graphBeadStore(); cr.wg != nil && graphStore.Store != nil && cr.wg.shouldRun(time.Now()) {
-		phaseStart = time.Now()
+		phaseStart = startTickPhase()
 		purged, gcErr := cr.wg.runGC(graphStore, cr.mailBeadStore(), time.Now())
-		recordPhase(TraceSiteControllerTickPhase, "wisp_gc", phaseStart, map[string]any{"purged": purged})
+		trace.RecordTickPhase(TraceSiteControllerTickPhase, "wisp_gc", phaseStart, map[string]any{"purged": purged})
 		if gcErr != nil {
 			for _, line := range strings.Split(gcErr.Error(), "\n") {
 				if line == "" {
@@ -1458,28 +1452,28 @@ func (cr *CityRuntime) tick(
 	}
 
 	if cr.svc != nil {
-		phaseStart = time.Now()
+		phaseStart = startTickPhase()
 		cr.svc.Tick(ctx, time.Now())
-		recordPhase(TraceSiteControllerTickPhase, "workspace_service_tick", phaseStart, nil)
+		trace.RecordTickPhase(TraceSiteControllerTickPhase, "workspace_service_tick", phaseStart, nil)
 	}
 
 	// Chat session auto-suspend: suspend detached idle sessions.
 	if idleTimeout := cr.cfg.ChatSessions.IdleTimeoutDuration(); idleTimeout > 0 {
-		phaseStart = time.Now()
+		phaseStart = startTickPhase()
 		autoSuspendChatSessions(cr.sessionsBeadStore().Store, cr.sp, idleTimeout, clock.Real{}, cr.stdout, cr.stderr)
-		recordPhase(TraceSiteControllerTickPhase, "auto_suspend_chat_sessions", phaseStart, map[string]any{"idle_timeout_ms": idleTimeout.Milliseconds()})
+		trace.RecordTickPhase(TraceSiteControllerTickPhase, "auto_suspend_chat_sessions", phaseStart, map[string]any{"idle_timeout_ms": idleTimeout.Milliseconds()})
 	}
 
 	// Drain queued convergence requests (CLI commands) BEFORE tick so
 	// user commands (e.g. stop) take precedence over automated progression.
-	phaseStart = time.Now()
+	phaseStart = startTickPhase()
 	cr.processConvergenceRequests(ctx)
-	recordPhase(TraceSiteControllerTickPhase, "process_convergence_requests", phaseStart, nil)
+	trace.RecordTickPhase(TraceSiteControllerTickPhase, "process_convergence_requests", phaseStart, nil)
 
 	// Convergence tick: process active convergence loops.
-	phaseStart = time.Now()
+	phaseStart = startTickPhase()
 	cr.convergenceTick(ctx)
-	recordPhase(TraceSiteControllerTickPhase, "convergence_tick", phaseStart, nil)
+	trace.RecordTickPhase(TraceSiteControllerTickPhase, "convergence_tick", phaseStart, nil)
 	completeManualReload()
 	completion = TraceCompletionCompleted
 	tickCompleted = true
@@ -2425,17 +2419,12 @@ func (cr *CityRuntime) beadReconcileTick(ctx context.Context, result DesiredStat
 	// sessions this is a different store than the work store, so the two must
 	// not be used interchangeably (ga-g3pf0).
 	sessStore := cr.sessionsBeadStore()
-	recordPhase := func(site TraceSiteCode, name string, start time.Time, fields map[string]any) {
-		if trace != nil {
-			trace.RecordControllerOperation(site, TraceReasonRetained, TraceOutcomeComplete, name, time.Since(start), fields)
-		}
-	}
 
 	if sessionBeads == nil {
 		var sessionQueryPartial bool
-		phaseStart := time.Now()
+		phaseStart := startTickPhase()
 		sessionBeads, sessionQueryPartial = cr.loadSessionBeadSnapshotWithPartial()
-		recordPhase(TraceSiteSessionSnapshot, "bead_reconcile.load_session_snapshot", phaseStart, traceSessionSnapshotFields(sessionBeads))
+		trace.RecordTickPhase(TraceSiteSessionSnapshot, "bead_reconcile.load_session_snapshot", phaseStart, traceSessionSnapshotFields(sessionBeads))
 		result.SessionQueryPartial = result.SessionQueryPartial || sessionQueryPartial
 	}
 	// Emit any due compute usage facts by reusing the open-session snapshot this
@@ -2454,9 +2443,9 @@ func (cr *CityRuntime) beadReconcileTick(ctx context.Context, result DesiredStat
 	rigStores := cr.rigBeadStores()
 	assignedWorkBeads := result.AssignedWorkBeads
 	assignedWorkStoreRefs := result.AssignedWorkStoreRefs
-	phaseStart := time.Now()
+	phaseStart := startTickPhase()
 	released := releaseOrphanedPoolAssignmentsWhenSnapshotsComplete(store, sessStore, cr.cfg, cr.cityPath, sessionBeads.OpenInfos(), result, rigStores)
-	recordPhase(TraceSiteControllerTickPhase, "bead_reconcile.release_orphaned_pool_assignments", phaseStart, map[string]any{
+	trace.RecordTickPhase(TraceSiteControllerTickPhase, "bead_reconcile.release_orphaned_pool_assignments", phaseStart, map[string]any{
 		"released_count": len(released),
 	})
 	if len(released) > 0 {
@@ -2475,12 +2464,12 @@ func (cr *CityRuntime) beadReconcileTick(ctx context.Context, result DesiredStat
 	// open-corpus read of the city ledger and every rig, serially, on every tick
 	// — 180.8s of a 373s tick with restored_count=0 on every one (ga-l7jdg). It
 	// now runs off-tick on the convergence lane's cadence.
-	phaseStart = time.Now()
+	phaseStart = startTickPhase()
 	detachedReport := cr.sweepDetachedHandoffOrphansDelta()
 	detachedFields := detachedReport.fields()
 	sweptAt, sweptReason, swept := cr.detachedOrphanLaneOf().lastBackstop()
 	addBackstopAgeFields(detachedFields, sweptAt, sweptReason, swept)
-	recordPhase(TraceSiteControllerTickPhase, "bead_reconcile.sweep_detached_handoff_orphans", phaseStart, detachedFields)
+	trace.RecordTickPhase(TraceSiteControllerTickPhase, "bead_reconcile.sweep_detached_handoff_orphans", phaseStart, detachedFields)
 	// Squatter guard (gastownhall/gascity#2930): a foreign Dolt that has bound
 	// this city's managed port returns zero demand, indistinguishable from a
 	// genuinely-idle fleet — and would drain every running pool. This runs on
@@ -2500,7 +2489,7 @@ func (cr *CityRuntime) beadReconcileTick(ctx context.Context, result DesiredStat
 	// work beads + new tier from scale_check + min fill.
 	poolDesired := result.PoolDesiredCounts
 	if poolDesired == nil {
-		phaseStart = time.Now()
+		phaseStart = startTickPhase()
 		poolWorkBeads := filterAssignedWorkBeadsForPoolDemand(cr.cfg, cr.cityPath, sessionBeads.OpenInfos(), assignedWorkBeads, assignedWorkStoreRefs)
 		poolDesired = retainScaleCheckPartialPoolDesired(
 			cr.cfg,
@@ -2509,7 +2498,7 @@ func (cr *CityRuntime) beadReconcileTick(ctx context.Context, result DesiredStat
 			sessionBeads,
 			effectivePoolPartialRetentionTemplates(result),
 		)
-		recordPhase(TraceSitePoolDemandCompute, "bead_reconcile.compute_pool_desired", phaseStart, map[string]any{
+		trace.RecordTickPhase(TraceSitePoolDemandCompute, "bead_reconcile.compute_pool_desired", phaseStart, map[string]any{
 			"pool_work_bead_count": len(poolWorkBeads),
 			"pool_desired_count":   len(poolDesired),
 		})
@@ -2531,9 +2520,9 @@ func (cr *CityRuntime) beadReconcileTick(ctx context.Context, result DesiredStat
 		}
 	}
 	// #3288: defer the undesired-pool-session sweep on the boot tick. The sweep
-	// probes each sweepable candidate against the city store + N rig stores × 2
-	// statuses × identifiers, each a `bd` read (listWispsTier fires two
-	// subprocesses); serialized on the synchronous readiness path that fan-out
+	// probes each sweepable candidate against the city store + N rig stores ×
+	// identifiers, each a both-tier `bd` read (two subprocesses: bd list plus
+	// bd query); serialized on the synchronous readiness path that fan-out
 	// can exceed the startup watchdog on a heavy-session city and hang boot.
 	// Skipping it on boot lets readiness flip without waiting on those reads; the
 	// first steady-state tick (fired moments later by the startup poke / patrol
@@ -2541,9 +2530,9 @@ func (cr *CityRuntime) beadReconcileTick(ctx context.Context, result DesiredStat
 	// not-running, unassigned ephemeral pool-session beads and fails closed on
 	// query error, so a few seconds of staleness cannot wrongly close live work.
 	if bootReconcile {
-		recordPhase(TraceSiteControllerTickPhase, "bead_reconcile.sweep_undesired_pool_sessions.deferred_on_boot", time.Now(), traceSessionSnapshotFields(sessionBeads))
+		trace.RecordTickPhase(TraceSiteControllerTickPhase, "bead_reconcile.sweep_undesired_pool_sessions.deferred_on_boot", startTickPhase(), traceSessionSnapshotFields(sessionBeads))
 	} else {
-		phaseStart = time.Now()
+		phaseStart = startTickPhase()
 		if sweepUndesiredPoolSessionBeads(
 			cr.cityPath,
 			sessStore,
@@ -2558,14 +2547,14 @@ func (cr *CityRuntime) beadReconcileTick(ctx context.Context, result DesiredStat
 			sessionBeads, sessionQueryPartial = cr.loadSessionBeadSnapshotWithPartial()
 			result.SessionQueryPartial = result.SessionQueryPartial || sessionQueryPartial
 		}
-		recordPhase(TraceSiteControllerTickPhase, "bead_reconcile.sweep_undesired_pool_sessions", phaseStart, traceSessionSnapshotFields(sessionBeads))
+		trace.RecordTickPhase(TraceSiteControllerTickPhase, "bead_reconcile.sweep_undesired_pool_sessions", phaseStart, traceSessionSnapshotFields(sessionBeads))
 	}
 	openInfos := sessionBeads.OpenInfos()
 
 	// Use cr.cityName consistently — it's the authoritative runtime name.
 	cityName := cr.cityName
 
-	phaseStart = time.Now()
+	phaseStart = startTickPhase()
 	cfgNames := configuredSessionNamesWithSnapshot(cr.cfg, cityName, sessionBeads)
 
 	readyWaitSet, err := prepareWaitWakeStateWithSnapshot(sessionpkg.NewStore(sessStore), newWaitDependencyStoreSet(store, rigStores), cr.nudgesBeadStore(), time.Now(), sessionBeads)
@@ -2573,7 +2562,7 @@ func (cr *CityRuntime) beadReconcileTick(ctx context.Context, result DesiredStat
 		fmt.Fprintf(cr.stderr, "%s: preparing waits: %v\n", cr.logPrefix, err) //nolint:errcheck
 		readyWaitSet = nil
 	}
-	recordPhase(TraceSiteControllerTickPhase, "bead_reconcile.prepare_wait_wake_state", phaseStart, map[string]any{
+	trace.RecordTickPhase(TraceSiteControllerTickPhase, "bead_reconcile.prepare_wait_wake_state", phaseStart, map[string]any{
 		"configured_name_count": len(cfgNames),
 		"ready_wait_count":      len(readyWaitSet),
 	})
@@ -2583,15 +2572,15 @@ func (cr *CityRuntime) beadReconcileTick(ctx context.Context, result DesiredStat
 	// work_query here can block assigned-work resumes behind unrelated probes.
 	workSet := make(map[string]bool)
 	traceWorkRequested := traceWorkRequestedByTemplate(result.ScaleCheckCounts, result.NamedSessionDemand, workSet, cr.cfg)
-	cr.recordReconcileTraceInputs(trace, openInfos, desiredState, poolDesired, workSet, traceWorkRequested, readyWaitSet, result, recordPhase)
+	cr.recordReconcileTraceInputs(trace, openInfos, desiredState, poolDesired, workSet, traceWorkRequested, readyWaitSet, result)
 
-	phaseStart = time.Now()
+	phaseStart = startTickPhase()
 	awakeAssignedWorkBeads, awakeAssignedStoreRefs := filterAssignedWorkBeadsForSessionWake(cr.cfg, cr.cityPath, store, openInfos, assignedWorkBeads, assignedWorkStoreRefs)
-	recordPhase(TraceSiteControllerTickPhase, "bead_reconcile.filter_assigned_work_for_wake", phaseStart, map[string]any{
+	trace.RecordTickPhase(TraceSiteControllerTickPhase, "bead_reconcile.filter_assigned_work_for_wake", phaseStart, map[string]any{
 		"assigned_work_bead_count":       len(assignedWorkBeads),
 		"awake_assigned_work_bead_count": len(awakeAssignedWorkBeads),
 	})
-	phaseStart = time.Now()
+	phaseStart = startTickPhase()
 	reconcileStartOptions := []startExecutionOption{
 		withAsyncStartExecution(),
 		withAsyncStartFollowUp(cr.requestAsyncStartFollowUpTick),
@@ -2623,7 +2612,7 @@ func (cr *CityRuntime) beadReconcileTick(ctx context.Context, result DesiredStat
 		cr.stdout, cr.stderr, trace,
 		reconcileStartOptions...,
 	)
-	recordPhase(TraceSiteControllerTickPhase, "bead_reconcile.reconcile_sessions", phaseStart, map[string]any{
+	trace.RecordTickPhase(TraceSiteControllerTickPhase, "bead_reconcile.reconcile_sessions", phaseStart, map[string]any{
 		"open_session_count":             len(openInfos),
 		"desired_session_count":          len(desiredState),
 		"awake_assigned_work_bead_count": len(awakeAssignedWorkBeads),
@@ -2636,26 +2625,26 @@ func (cr *CityRuntime) beadReconcileTick(ctx context.Context, result DesiredStat
 	// mutation provided (a dedup-retired loser under its retired session_name, a
 	// healed-then-closed session under its post-heal/closed state) — MORE accurate
 	// than a store reload, which excludes closed history.
-	cr.recordReconcileTraceResults(trace, sessionBeads.OpenInfos(), recordPhase)
+	cr.recordReconcileTraceResults(trace, sessionBeads.OpenInfos())
 	// Post-reconcile session snapshot feeds the wait-nudge dispatch; read it from
 	// the typed session store (controller-parity fix, identity today).
 	dispatchSessionBeads, err := loadSessionBeadSnapshot(sessStore.Store)
 	if err != nil {
 		fmt.Fprintf(cr.stderr, "%s: loading post-reconcile session snapshot: %v\n", cr.logPrefix, err) //nolint:errcheck
 	}
-	phaseStart = time.Now()
+	phaseStart = startTickPhase()
 	if err == nil {
 		if nudgeErr := dispatchReadyWaitNudgesWithSnapshot(cr.cityPath, cr.cfg, sessionpkg.NewStore(sessStore), cr.nudgesBeadStore(), time.Now(), dispatchSessionBeads); nudgeErr != nil {
 			fmt.Fprintf(cr.stderr, "%s: dispatching wait nudges: %v\n", cr.logPrefix, nudgeErr) //nolint:errcheck
 		}
 	}
-	recordPhase(TraceSiteControllerTickPhase, "bead_reconcile.dispatch_wait_nudges", phaseStart, traceSessionSnapshotFields(dispatchSessionBeads))
+	trace.RecordTickPhase(TraceSiteControllerTickPhase, "bead_reconcile.dispatch_wait_nudges", phaseStart, traceSessionSnapshotFields(dispatchSessionBeads))
 	// Patrol-tick fallback for the supervisor nudge dispatcher: ensures
 	// queued items get delivered even if the wake socket missed the
 	// enqueue (process race during supervisor restart, listener crash).
-	phaseStart = time.Now()
+	phaseStart = startTickPhase()
 	cr.nudgeDispatchTick(ctx)
-	recordPhase(TraceSiteControllerTickPhase, "bead_reconcile.nudge_dispatch_tick", phaseStart, nil)
+	trace.RecordTickPhase(TraceSiteControllerTickPhase, "bead_reconcile.nudge_dispatch_tick", phaseStart, nil)
 
 	// Idle recovery: re-nudge pool slots that are running but never claimed
 	// either their assigned/ready-routed trigger bead or the one ready graph-v2
@@ -2672,7 +2661,7 @@ func (cr *CityRuntime) beadReconcileTick(ctx context.Context, result DesiredStat
 	// flips to in_progress and stops matching), persists its bounded
 	// observe→nudge→backoff state on the session bead, and never spams a tick.
 	// See nudgeStalledPoolClaims for the full invariant.
-	phaseStart = time.Now()
+	phaseStart = startTickPhase()
 	// The idle-claim nudge lane reads idle-claim marker keys that session.Info
 	// does not project, so it needs raw beads. Now that the snapshot no longer
 	// holds a raw half, this lane does its own loadSessionBeads edge read every
@@ -2723,7 +2712,7 @@ func (cr *CityRuntime) beadReconcileTick(ctx context.Context, result DesiredStat
 			cr.stdout,
 		)
 	}
-	recordPhase(TraceSiteControllerTickPhase, "bead_reconcile.nudge_stalled_pool_claims", phaseStart, nil)
+	trace.RecordTickPhase(TraceSiteControllerTickPhase, "bead_reconcile.nudge_stalled_pool_claims", phaseStart, nil)
 }
 
 // recordReconcileTraceInputs records the per-template baseline, the cycle input
@@ -2739,12 +2728,11 @@ func (cr *CityRuntime) recordReconcileTraceInputs(
 	traceWorkRequested map[string]bool,
 	readyWaitSet map[string]bool,
 	result DesiredStateResult,
-	recordPhase func(TraceSiteCode, string, time.Time, map[string]any),
 ) {
 	if trace == nil {
 		return
 	}
-	phaseStart := time.Now()
+	phaseStart := startTickPhase()
 	templateNames := make(map[string]struct{})
 	openCounts := make(map[string]int)
 	desiredCounts := make(map[string]int)
@@ -2832,7 +2820,7 @@ func (cr *CityRuntime) recordReconcileTraceInputs(
 			"sling_query":         agent.SlingQuery,
 		})
 	}
-	recordPhase(TraceSiteControllerTickPhase, "bead_reconcile.record_trace_input_summary", phaseStart, map[string]any{
+	trace.RecordTickPhase(TraceSiteControllerTickPhase, "bead_reconcile.record_trace_input_summary", phaseStart, map[string]any{
 		"template_count": len(templateNames),
 		"open_count":     len(openInfos),
 	})
@@ -2852,12 +2840,11 @@ func (cr *CityRuntime) recordReconcileTraceInputs(
 func (cr *CityRuntime) recordReconcileTraceResults(
 	trace *sessionReconcilerTraceCycle,
 	postTickInfos []sessionpkg.Info,
-	recordPhase func(TraceSiteCode, string, time.Time, map[string]any),
 ) {
 	if trace == nil {
 		return
 	}
-	phaseStart := time.Now()
+	phaseStart := startTickPhase()
 	for _, info := range postTickInfos {
 		template := normalizedSessionTemplateInfo(info, cr.cfg)
 		if template == "" {
@@ -2868,7 +2855,7 @@ func (cr *CityRuntime) recordReconcileTraceResults(
 			"sleep_reason": info.SleepReason,
 		})
 	}
-	recordPhase(TraceSiteControllerTickPhase, "bead_reconcile.record_trace_session_results", phaseStart, map[string]any{
+	trace.RecordTickPhase(TraceSiteControllerTickPhase, "bead_reconcile.record_trace_session_results", phaseStart, map[string]any{
 		"open_count": len(postTickInfos),
 	})
 }

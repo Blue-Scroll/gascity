@@ -13455,7 +13455,7 @@ func TestBuildDesiredState_AsleepNamedAliasHolderStaysSingle(t *testing.T) {
 // attributable from a trace instead of requiring an instrumented rebuild.
 func TestBuildDesiredStateRecordsDemandSubPhases(t *testing.T) {
 	// The non-tick path passes no trace; the recorder must be nil-safe.
-	recordDemandSubPhase(nil, "demand_snapshot.collect_open_session_beads", time.Now(), nil)
+	recordDemandSubPhase(nil, "demand_snapshot.collect_open_session_beads", startTickPhase(), nil)
 
 	cityDir := t.TempDir()
 	tracer := newSessionReconcilerTracer(cityDir, "trace-town", io.Discard)

@@ -373,8 +373,8 @@ func buildDesiredState(
 // store-contention regressions can be attributed without ad-hoc rebuilds.
 // RecordControllerOperation is nil-receiver-safe, so callers without an
 // active trace (e.g. buildDesiredState outside the tick) cost one branch.
-func recordDemandSubPhase(trace *sessionReconcilerTraceCycle, name string, start time.Time, fields map[string]any) {
-	trace.RecordControllerOperation(TraceSiteDemandSnapshot, TraceReasonRetained, TraceOutcomeComplete, name, time.Since(start), fields)
+func recordDemandSubPhase(trace *sessionReconcilerTraceCycle, name string, start tickPhaseStart, fields map[string]any) {
+	trace.RecordTickPhase(TraceSiteDemandSnapshot, name, start, fields)
 }
 
 func buildDesiredStateWithSessionBeads(
@@ -403,7 +403,7 @@ func buildDesiredStateWithSessionBeads(
 	// running sessions for each pool. A partial/failed collection is logged,
 	// not swallowed: undercounting running sessions can misclassify a pool as
 	// cold and trigger a spurious scale-from-zero probe.
-	subPhaseStart := time.Now()
+	subPhaseStart := startTickPhase()
 	allOpenSessionInfos, openSessionBeadsErr := collectAllOpenSessionInfos(cityPath, cfg, store, rigStores, suspendedRigPaths)
 	recordDemandSubPhase(trace, "demand_snapshot.collect_open_session_beads", subPhaseStart, map[string]any{
 		"beads":   len(allOpenSessionInfos),
@@ -711,7 +711,7 @@ func buildDesiredStateWithSessionBeads(
 	// second cache created below. See readyDemandCache.
 	assignedReadyCache := newReadyDemandCache()
 	if store != nil {
-		subPhaseStart = time.Now()
+		subPhaseStart = startTickPhase()
 		assignedWorkBeads, assignedWorkStores, assignedWorkStoreRefs, readyAssigned, storePartial = collectAssignedWorkBeadsWithStores(cityPath, cfg, store, rigStores, suspendedRigPaths, sessionBeads, assignedReadyCache)
 		recordDemandSubPhase(trace, "demand_snapshot.collect_assigned_work", subPhaseStart, map[string]any{
 			"beads":   len(assignedWorkBeads),
@@ -748,7 +748,7 @@ func buildDesiredStateWithSessionBeads(
 		// the worker work_query/claim path match gc.routed_to canonically by raw
 		// string, so the route must be canonicalized before demand is counted or
 		// the cold pool never wakes for it.
-		subPhaseStart = time.Now()
+		subPhaseStart = startTickPhase()
 		var unassignedRoutedPartial bool
 		unassignedRoutedBeads, unassignedRoutedStores, unassignedRoutedStoreRefs, unassignedRoutedPartial = collectOpenUnassignedRoutedWork(cityPath, cfg, store, rigStores, suspendedRigPaths, stderr)
 		canonicalizeLegacyBoundUnassignedRoutedWork(cfg, unassignedRoutedBeads, unassignedRoutedStores, stderr)
@@ -772,13 +772,13 @@ func buildDesiredStateWithSessionBeads(
 		recordDemandSubPhase(trace, "demand_snapshot.collect_unassigned_routed", subPhaseStart, map[string]any{
 			"beads": len(unassignedRoutedBeads),
 		})
-		subPhaseStart = time.Now()
+		subPhaseStart = startTickPhase()
 		scaleCheckCounts, poolScaleCheckPartialTemplates = evaluatePendingPoolsMap(cfg, pendingPools, stderr, trace)
 		recordDemandSubPhase(trace, "demand_snapshot.evaluate_pending_pools", subPhaseStart, map[string]any{
 			"pools": len(pendingPools),
 		})
 		if len(defaultScaleTargets) > 0 {
-			subPhaseStart = time.Now()
+			subPhaseStart = startTickPhase()
 			defaultCounts, defaultDemand, partialTemplates, errs := defaultScaleCheckCountsAndDemand(cfg, defaultScaleTargets, demandReadyCache)
 			recordDemandSubPhase(trace, "demand_snapshot.default_scale_demand", subPhaseStart, map[string]any{
 				"targets": len(defaultScaleTargets),
@@ -844,7 +844,7 @@ func buildDesiredStateWithSessionBeads(
 		if len(defaultNamedScaleTargets) > 0 {
 			var namedErrs []error
 			var partialTemplates map[string]bool
-			subPhaseStart = time.Now()
+			subPhaseStart = startTickPhase()
 			namedDefaultDemand, partialTemplates, namedErrs = defaultNamedSessionDemand(defaultNamedScaleTargets, cfg, cityName, demandReadyCache)
 			recordDemandSubPhase(trace, "demand_snapshot.named_session_demand", subPhaseStart, map[string]any{
 				"targets": len(defaultNamedScaleTargets),

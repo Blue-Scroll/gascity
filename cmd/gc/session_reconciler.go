@@ -1505,17 +1505,12 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 	assignedWorkDeferTr := reconcileOpts.assignedWorkDeferTr
 	freshGate := reconcileOpts.freshReassignGate
 	asyncStopTracker := reconcileOpts.asyncStopTracker
-	recordPhase := func(site TraceSiteCode, name string, start time.Time, fields map[string]any) {
-		if trace != nil {
-			trace.RecordControllerOperation(site, TraceReasonRetained, TraceOutcomeComplete, name, time.Since(start), fields)
-		}
-	}
-	phaseStart := time.Now()
+	phaseStart := startTickPhase()
 	deps := buildDepsMap(cfg)
 	if cityName == "" {
 		cityName = config.EffectiveCityName(cfg, "")
 	}
-	recordPhase(TraceSiteSessionReconcileBuildDeps, "session_reconcile.build_deps", phaseStart, map[string]any{
+	trace.RecordTickPhase(TraceSiteSessionReconcileBuildDeps, "session_reconcile.build_deps", phaseStart, map[string]any{
 		"dependency_template_count": len(deps),
 	})
 
@@ -1524,7 +1519,7 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 	// feed (ReconcileSession{Info, Circuit}) carries the session's domain
 	// projection paired with its persisted circuit-breaker cluster, read once per
 	// tick from the same bead — no per-iteration codec call, no store Get.
-	phaseStart = time.Now()
+	phaseStart = startTickPhase()
 	// Phase 0a: heal expired held/quarantine timers — fold, no raw mirror. The
 	// fold advances rows[i].Info so the snapshot build below projects the healed
 	// values without re-reading the bead (the coherence the old raw mirror
@@ -1539,16 +1534,16 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 			cityPath, store, rigStores, sp, cfg, cityName, rows, clk.Now().UTC(), stderr,
 		)
 	}
-	recordPhase(TraceSiteSessionReconcileHealRetire, "session_reconcile.heal_and_retire_duplicates", phaseStart, map[string]any{
+	trace.RecordTickPhase(TraceSiteSessionReconcileHealRetire, "session_reconcile.heal_and_retire_duplicates", phaseStart, map[string]any{
 		"session_count": len(rows),
 	})
 
 	// Topo-order rows by template dependencies (reads Info.Template, the verbatim
 	// raw mirror — byte-identical to the old topoOrder over beads). orderedRows is
 	// the tick's typed working set; there is no raw-bead working set any more.
-	phaseStart = time.Now()
+	phaseStart = startTickPhase()
 	orderedRows := topoOrderRows(rows, deps)
-	recordPhase(TraceSiteSessionReconcileTopoOrder, "session_reconcile.topo_order", phaseStart, map[string]any{
+	trace.RecordTickPhase(TraceSiteSessionReconcileTopoOrder, "session_reconcile.topo_order", phaseStart, map[string]any{
 		"ordered_session_count": len(orderedRows),
 	})
 
@@ -1578,7 +1573,7 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 	infoByID := tick.infoByID
 	orderedIDs := tick.orderedIDs
 
-	phaseStart = time.Now()
+	phaseStart = startTickPhase()
 	cbNow := clk.Now().UTC()
 	cbCfg, cbEnabled := sessionCircuitBreakerConfigFromCity(cfg)
 	var cb *sessionCircuitBreaker
@@ -1636,7 +1631,7 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 		}
 		cb.pruneIdle(cbNow)
 	}
-	recordPhase(TraceSiteSessionReconcileCircuitBreaker, "session_reconcile.circuit_breaker_restore", phaseStart, map[string]any{
+	trace.RecordTickPhase(TraceSiteSessionReconcileCircuitBreaker, "session_reconcile.circuit_breaker_restore", phaseStart, map[string]any{
 		"enabled":       cbEnabled,
 		"session_count": len(orderedRows),
 	})
@@ -1703,7 +1698,7 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 		}
 		return rollbackPendingCreate(info, sessFront, clk.Now().UTC(), stderr)
 	}
-	phaseStart = time.Now()
+	phaseStart = startTickPhase()
 	for i := range orderedRows {
 		if ctx != nil && ctx.Err() != nil {
 			return 0
@@ -3519,7 +3514,7 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 		// divergences instead of incrementing counters nothing can read.
 		fmt.Fprintf(stderr, "session reconciler: %s\n", convergeShadowMetrics.snapshot().operatorSummary()) //nolint:errcheck // best-effort operator log
 	}
-	recordPhase(TraceSiteSessionReconcileForwardPass, "session_reconcile.forward_pass", phaseStart, map[string]any{
+	trace.RecordTickPhase(TraceSiteSessionReconcileForwardPass, "session_reconcile.forward_pass", phaseStart, map[string]any{
 		"ordered_session_count":  len(orderedRows),
 		"wake_target_count":      len(wakeTargets),
 		"rollback_count":         rollbacksThisTick,
@@ -3538,7 +3533,7 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 	// (Step 6d): every forward-pass writer now folds its own mutation onto the
 	// snapshot via write-returns-Info (STEP6-PREPASS-AUDIT groups 1-12), so the
 	// snapshot is already coherent here without re-projecting the raw beads.
-	phaseStart = time.Now()
+	phaseStart = startTickPhase()
 	// Build the awake-scan domain from the coherent typed snapshot in orderedIDs
 	// (topo) order — load-bearing: ComputeAwakeSet resolves SessionName
 	// last-write-wins over a non-unique key, so map iteration order must not leak
@@ -3602,7 +3597,7 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 
 	idleProbeTargets := selectIdleProbeTargets(wakeTargets, wakeEvals, dt, infoByID)
 	launchIdleProbes(ctx, idleProbeTargets, wakeTargets, dt, sp, clk, infoByID)
-	recordPhase(TraceSiteSessionReconcileAwakeSet, "session_reconcile.compute_awake_set_and_idle_probes", phaseStart, map[string]any{
+	trace.RecordTickPhase(TraceSiteSessionReconcileAwakeSet, "session_reconcile.compute_awake_set_and_idle_probes", phaseStart, map[string]any{
 		"wake_target_count":      len(wakeTargets),
 		"idle_probe_target_cnt":  len(idleProbeTargets),
 		"awake_decision_count":   len(awakeDecisions),
@@ -3610,7 +3605,7 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 		"assigned_work_bead_cnt": len(assignedWorkBeads),
 	})
 
-	phaseStart = time.Now()
+	phaseStart = startTickPhase()
 	for _, target := range wakeTargets {
 		if ctx != nil && ctx.Err() != nil {
 			return 0
@@ -3972,7 +3967,7 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 			}
 		}
 	}
-	recordPhase(TraceSiteSessionReconcileWakeSleep, "session_reconcile.apply_wake_sleep_decisions", phaseStart, map[string]any{
+	trace.RecordTickPhase(TraceSiteSessionReconcileWakeSleep, "session_reconcile.apply_wake_sleep_decisions", phaseStart, map[string]any{
 		"wake_target_count":     len(wakeTargets),
 		"start_candidate_count": len(startCandidates),
 	})
@@ -3989,7 +3984,7 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 		return 0
 	}
 
-	phaseStart = time.Now()
+	phaseStart = startTickPhase()
 	plannedWakes := executePlannedStartsTraced(
 		ctx, startCandidates, cfg, desiredState, sp, store, cityName,
 		cityPath,
@@ -3997,7 +3992,7 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 		effectiveStartOptions...,
 	)
 	startedThisTick = plannedWakes
-	recordPhase(TraceSiteSessionReconcileStartExecution, "session_reconcile.execute_planned_starts", phaseStart, map[string]any{
+	trace.RecordTickPhase(TraceSiteSessionReconcileStartExecution, "session_reconcile.execute_planned_starts", phaseStart, map[string]any{
 		"start_candidate_count": len(startCandidates),
 		"planned_wake_count":    plannedWakes,
 	})
@@ -4010,14 +4005,14 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 	// typed snapshot (write-returns-Info keeps it current through Phase 1), not
 	// the raw working beads — so it observes the same post-forward-pass state the
 	// old &orderedBeads[i] aliases carried, without holding a raw pointer map.
-	phaseStart = time.Now()
+	phaseStart = startTickPhase()
 	infoLookup := func(id string) (sessionpkg.Info, bool) {
 		info, ok := infoByID[id]
 		return info, ok
 	}
 	advanceSessionDrainsWithSessionsTraced(dt, sp, store, infoLookup, wakeEvals, cfg, clk, trace)
 	clearMissingIdleProbes(dt, infoByID)
-	recordPhase(TraceSiteSessionReconcileDrainAdvance, "session_reconcile.advance_drains", phaseStart, map[string]any{
+	trace.RecordTickPhase(TraceSiteSessionReconcileDrainAdvance, "session_reconcile.advance_drains", phaseStart, map[string]any{
 		"ordered_session_count": len(orderedRows),
 		"wake_eval_count":       len(wakeEvals),
 	})
@@ -4205,14 +4200,12 @@ func assignedWorkExistsForSession(
 // judged to still have work, so the session bead never closes and the pool
 // controller respawns a fresh session onto the same still-open step forever.
 //
-// This is a deliberately SEPARATE chain from sessionHasOpenAssignedWorkForReachableStore,
-// not a shared-helper change: sessionHasOpenAssignedWorkForTier and
-// sessionHasOpenAssignedWispWork (the functions that would otherwise need the
-// exclusion) are also called from the awake-work chain
-// (sessionHasInProgressAssignedWorkForTier), which gates unrelated decisions
-// (config-drift drain deferral, the max-session-age timer, the pool-slot-freeable
-// check, wake-on-assigned-work). None of those should start ignoring a session's
-// own drain step — only the drain-ack close decision should. Use this function
+// This is a deliberately SEPARATE entry point from
+// sessionHasOpenAssignedWorkForReachableStore. Both read through
+// workAssignment.AssignedToInStatuses and differ only in the filter they put on
+// what comes back, so the drain-step exclusion lives in this chain's filter and
+// in nothing shared. No other gate should start ignoring a session's own drain
+// step. Only the drain-ack close decision should. Use this function
 // (and closeSessionBeadIfReachableStoreUnassigned's excludeOwnDrainStep=true form)
 // ONLY from the drain-ack finalize path.
 func sessionHasOpenAssignedWorkForReachableStoreForCloseGate(
@@ -4236,48 +4229,22 @@ func sessionHasAssignedWorkInStoreByIdentifiersForStatusesForCloseGate(store bea
 	if store == nil {
 		return false, nil
 	}
-	seen := make(map[string]struct{}, len(identifiers))
-	for _, status := range statuses {
-		for _, assignee := range identifiers {
-			if assignee == "" {
-				continue
-			}
-			key := status + "\x00" + assignee
-			if _, ok := seen[key]; ok {
-				continue
-			}
-			seen[key] = struct{}{}
-			if has, err := sessionHasOpenAssignedWorkForTierForCloseGate(store, assignee, status, beads.TierIssues, true); err != nil || has {
-				return has, err
-			}
-			if has, err := sessionHasOpenAssignedWispWorkForCloseGate(store, assignee, status); err != nil || has {
-				return has, err
-			}
+	wa := workAssignmentForStore(beads.WorkStore{Store: store})
+	// One live read per identity, like the general probe, but with no cache
+	// fast path: the cached wisp answer is built on wa.HasNonSessionWork, which
+	// does not skip the session's own drain step, and drain-ack is rare enough
+	// that a live read is cheap. The filter below is what keeps the drain-step
+	// exclusion out of the general probe's other callers.
+	for _, assignee := range compactSessionAssignmentIdentifiers(identifiers) {
+		items, err := wa.AssignedToInStatuses(assignee, statuses)
+		if err != nil {
+			return false, err
+		}
+		if hasNonSessionNonOwnDrainStepWork(store, items) {
+			return true, nil
 		}
 	}
 	return false, nil
-}
-
-// sessionHasOpenAssignedWorkForTierForCloseGate mirrors sessionHasOpenAssignedWorkForTier
-// but filters through hasNonSessionNonOwnDrainStepWork instead of the shared
-// wa.HasNonSessionWork, so the drain-step exclusion cannot leak into
-// sessionHasOpenAssignedWorkForTier's other caller (the awake-work chain).
-func sessionHasOpenAssignedWorkForTierForCloseGate(store beads.Store, assignee, status string, tierMode beads.TierMode, live bool) (bool, error) {
-	wa := workAssignmentForStore(beads.WorkStore{Store: store})
-	items, err := wa.OpenAssignedTo(assignee, status, tierMode, live)
-	if err != nil {
-		return false, err
-	}
-	return hasNonSessionNonOwnDrainStepWork(store, items), nil
-}
-
-// sessionHasOpenAssignedWispWorkForCloseGate mirrors sessionHasOpenAssignedWispWork
-// for the close gate. It intentionally skips the CachedOpenAssignedWisps fast
-// path: that cache is a positive-only accelerator built on the shared
-// wa.HasNonSessionWork filter, and drain-ack is not a hot loop, so the extra
-// live read here is cheap and keeps the exclusion correct rather than stale.
-func sessionHasOpenAssignedWispWorkForCloseGate(store beads.Store, assignee, status string) (bool, error) {
-	return sessionHasOpenAssignedWorkForTierForCloseGate(store, assignee, status, beads.TierWisps, true)
 }
 
 // hasNonSessionNonOwnDrainStepWork is wa.HasNonSessionWork plus the own-drain-step
@@ -4904,27 +4871,36 @@ func sessionHasOpenAssignedWorkInStoreByIdentifiers(store beads.Store, identifie
 	return sessionHasAssignedWorkInStoreByIdentifiersForStatuses(store, identifiers, []string{"open", "in_progress"})
 }
 
+// sessionHasAssignedWorkInStoreByIdentifiersForStatuses is the one-store
+// existence probe behind every "does this session still hold work?" gate
+// except the drain-ack close gate (which has its own form below). It costs one
+// live read per identity, across both tiers and all the given statuses (see
+// workAssignment.AssignedToInStatuses). Keep it that way: this probe runs for
+// every session, on every store leg, several times a tick, so each extra read
+// here is paid many times over.
 func sessionHasAssignedWorkInStoreByIdentifiersForStatuses(store beads.Store, identifiers []string, statuses []string) (bool, error) {
 	if store == nil {
 		return false, nil
 	}
-	seen := make(map[string]struct{}, len(identifiers))
-	for _, status := range statuses {
-		for _, assignee := range identifiers {
-			if assignee == "" {
-				continue
+	identifiers = compactSessionAssignmentIdentifiers(identifiers)
+	wa := workAssignmentForStore(beads.WorkStore{Store: store})
+	// A cached wisp hit answers yes with no store round trip. The cache can
+	// only ever say yes here: a miss may be stale, so "no work" always comes
+	// from the live read below.
+	for _, assignee := range identifiers {
+		for _, status := range statuses {
+			if items, ok := wa.CachedOpenAssignedWisps(assignee, status); ok && wa.HasNonSessionWork(items) {
+				return true, nil
 			}
-			key := status + "\x00" + assignee
-			if _, ok := seen[key]; ok {
-				continue
-			}
-			seen[key] = struct{}{}
-			if has, err := sessionHasOpenAssignedWorkForTier(store, assignee, status, beads.TierIssues, true); err != nil || has {
-				return has, err
-			}
-			if has, err := sessionHasOpenAssignedWispWork(store, assignee, status); err != nil || has {
-				return has, err
-			}
+		}
+	}
+	for _, assignee := range identifiers {
+		items, err := wa.AssignedToInStatuses(assignee, statuses)
+		if err != nil {
+			return false, err
+		}
+		if wa.HasNonSessionWork(items) {
+			return true, nil
 		}
 	}
 	return false, nil

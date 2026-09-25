@@ -607,7 +607,7 @@ func TestReconcileTraceResultsObservePostTickValues(t *testing.T) {
 	// Production flow: after the reconciler's writeback, the RESULTS recorder reads
 	// the post-tick carrier (sessionBeads.OpenInfos()).
 	cr := &CityRuntime{cfg: cfg}
-	cr.recordReconcileTraceResults(cycle, snap.OpenInfos(), func(TraceSiteCode, string, time.Time, map[string]any) {})
+	cr.recordReconcileTraceResults(cycle, snap.OpenInfos())
 
 	// Find the RESULTS record for the loser bead (by id-derived post-tick lookup:
 	// the retired loser's session_name is now "", so assert NO result record still

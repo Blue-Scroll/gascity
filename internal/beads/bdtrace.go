@@ -250,7 +250,8 @@ func captureBDTraceCallers() []string {
 
 // TraceBDCall appends a JSONL record describing one bd subprocess
 // invocation to the file pointed to by the GC_BD_TRACE_JSON env var. When
-// GC_BD_TRACE_JSON is unset the call is a no-op.
+// GC_BD_TRACE_JSON is unset it writes nothing (it still counts the call on
+// the bd exec meter).
 //
 // Designed to capture every bd subprocess spawned by gas city
 // application code (BdStore chokepoint, doctor checks, gc bd
@@ -264,8 +265,12 @@ func captureBDTraceCallers() []string {
 // which the existing line-format trace in bdstore.go uses). The two
 // formats are incompatible, so separating the env vars lets operators
 // enable one, the other, or both independently. When GC_BD_TRACE_JSON
-// is unset, TraceBDCall returns immediately and is effectively a no-op.
+// is unset, TraceBDCall writes nothing.
+//
+// It always counts the call on the bd exec meter (bd_exec_meter.go), whether
+// or not the JSONL trace is on.
 func TraceBDCall(source, dir string, args []string, start time.Time, exitCode int, err error) {
+	noteBDExec(time.Since(start))
 	path := strings.TrimSpace(os.Getenv("GC_BD_TRACE_JSON"))
 	if path == "" {
 		return
