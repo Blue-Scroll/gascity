@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { getCached, getCachedFetchedAt, setCached } from '../api/cache';
+import { REQUEST_BUDGET_MS } from '../api/requestBudget';
 
 interface UseCachedDataResult<T> {
   data: T | undefined;
@@ -38,6 +39,22 @@ export interface UseCachedDataOptions<T> {
   onError?: (error: unknown) => void;
 }
 
+/** The fetch in flight. `runId` matches runIdRef while its result may land. */
+interface ActiveFetch {
+  runId: number;
+  controller: AbortController;
+  startedAt: number;
+}
+
+/** The one fetch queued behind the active one, and everyone waiting on it. */
+interface QueuedFetch<T> {
+  fetch: CachedDataFetcher<T>;
+  /** A full refresh() asked for it. A cheapRefresh() never downgrades that. */
+  full: boolean;
+  done: Promise<void>;
+  resolveDone: () => void;
+}
+
 /**
  * Stale-while-revalidate fetch hook. On mount:
  *   - If the cache has the key: seed state with cached data and
@@ -48,7 +65,20 @@ export interface UseCachedDataOptions<T> {
  * key and refetch. `fetcher` is captured in a ref so callers don't
  * need to memoize it to avoid refetch loops — refetches only fire
  * on key change or explicit refresh(). The fetcher receives a signal
- * that aborts when its run is superseded or the hook unmounts.
+ * that aborts when the key changes, the hook unmounts, or the fetch is
+ * replaced as hung.
+ *
+ * One fetch runs at a time. A refresh that arrives while a fetch is in
+ * flight does not abort it: it waits, and ONE more fetch runs after that
+ * fetch lands, however many refreshes arrived meanwhile. Pages refresh on
+ * every live event, every few seconds on a busy town, and some lists take
+ * longer than that. When each refresh aborted the one before, a slow list
+ * never landed at all, and the aborted requests kept running on the server
+ * (hq-subxy4). The returned promise settles when the fetch that covers the
+ * call has landed.
+ *
+ * A fetch older than REQUEST_BUDGET_MS counts as hung, so a refresh replaces
+ * it instead of queueing behind something that may never settle.
  */
 export function useCachedData<T>(
   key: string,
@@ -66,49 +96,32 @@ export function useCachedData<T>(
   const currentKeyRef = useRef(key);
   currentKeyRef.current = key;
   const runIdRef = useRef(0);
-  const activeControllerRef = useRef<AbortController | null>(null);
+  const activeRef = useRef<ActiveFetch | null>(null);
+  const queuedRef = useRef<QueuedFetch<T> | null>(null);
 
   const [data, setData] = useState<T | undefined>(() => getCached<T>(key));
   const [loading, setLoading] = useState<boolean>(() => getCached<T>(key) === undefined);
   const [error, setError] = useState<string | null>(null);
   const [fetchedAt, setFetchedAt] = useState<string | undefined>(() => getCachedFetchedAt(key));
 
-  const runFetcher = useCallback(
-    async (fetch: CachedDataFetcher<T>) => {
+  // Starts a fetch now, replacing (and aborting) any fetch still marked
+  // active. Callers only do that for a hung fetch or a new key.
+  const startFetch = useCallback(
+    async (fetch: CachedDataFetcher<T>): Promise<void> => {
       const runId = runIdRef.current + 1;
       runIdRef.current = runId;
-      activeControllerRef.current?.abort();
+      activeRef.current?.controller.abort();
       const controller = new AbortController();
-      activeControllerRef.current = controller;
+      activeRef.current = { runId, controller, startedAt: Date.now() };
       const cacheKey = key;
       setLoading(true);
       setError(null);
       try {
         const fresh = await fetch(controller.signal);
-        const isLatestRun = runIdRef.current === runId;
-        const isActiveKey = currentKeyRef.current === cacheKey;
-        if (isLatestRun && isActiveKey) {
+        if (runIdRef.current === runId && currentKeyRef.current === cacheKey) {
           setCached(cacheKey, fresh);
           setData(fresh);
           setFetchedAt(getCachedFetchedAt(cacheKey));
-        } else if (isActiveKey) {
-          // First-paint rescue: a busy SSE stream can re-fire refresh()
-          // faster than a slow fetch (e.g. the beads board's per-type
-          // task query) completes, so every run is superseded before it
-          // lands and the latest-run guard never sets data — the panel
-          // stays empty forever. Seed from this superseded-but-current
-          // run only while data is still undefined; once any result has
-          // landed, latest-run-wins resumes and a stale slow fetch never
-          // clobbers fresher data.
-          setData((prev) => (prev === undefined ? fresh : prev));
-          // Mirror the data adoption for provenance. The rescue skips setCached
-          // (a superseded slow fetch must not become the authoritative cache
-          // value), so getCachedFetchedAt is undefined on a cold first paint —
-          // the exact SSE-storm case this rescue exists for. Stamp the rescued
-          // result as-of-now (same clock setCached uses) so fetchedAt never
-          // stays undefined while data is shown, while a kept prev or a real
-          // cache write keeps its own timestamp.
-          setFetchedAt((prev) => prev ?? getCachedFetchedAt(cacheKey) ?? new Date().toISOString());
         }
       } catch (err) {
         if (runIdRef.current === runId) {
@@ -116,27 +129,60 @@ export function useCachedData<T>(
           onErrorRef.current?.(err);
         }
       } finally {
-        if (activeControllerRef.current === controller) {
-          activeControllerRef.current = null;
+        if (runIdRef.current === runId) {
+          activeRef.current = null;
+          setLoading(false);
+          const queued = queuedRef.current;
+          if (queued !== null) {
+            queuedRef.current = null;
+            void startFetch(queued.fetch).then(queued.resolveDone);
+          }
         }
-        if (runIdRef.current === runId) setLoading(false);
       }
     },
     [key],
   );
 
+  const requestFetch = useCallback(
+    (fetch: CachedDataFetcher<T>, full: boolean): Promise<void> => {
+      const active = activeRef.current;
+      if (active === null || Date.now() - active.startedAt >= REQUEST_BUDGET_MS) {
+        return startFetch(fetch);
+      }
+      const queued = queuedRef.current;
+      if (queued !== null) {
+        // The latest ask wins, except that a cheap one never replaces a full one.
+        if (full || !queued.full) {
+          queued.fetch = fetch;
+          queued.full = full;
+        }
+        return queued.done;
+      }
+      let resolveDone!: () => void;
+      const done = new Promise<void>((resolve) => {
+        resolveDone = resolve;
+      });
+      queuedRef.current = { fetch, full, done, resolveDone };
+      return done;
+    },
+    [startFetch],
+  );
+
   // Explicit refresh prefers the bypass fetcher when configured;
   // mount-effect always uses the cheap primary fetcher.
   const refresh = useCallback(
-    () => runFetcher(refreshFetcherRef.current ?? fetcherRef.current),
-    [runFetcher],
+    () => requestFetch(refreshFetcherRef.current ?? fetcherRef.current, true),
+    [requestFetch],
   );
   // Cheap refresh prefers the SSE fetcher, then the primary refresh fetcher,
   // then the cheap primary fetcher — so it is always a no-config superset.
   const cheapRefresh = useCallback(
     () =>
-      runFetcher(sseRefreshFetcherRef.current ?? refreshFetcherRef.current ?? fetcherRef.current),
-    [runFetcher],
+      requestFetch(
+        sseRefreshFetcherRef.current ?? refreshFetcherRef.current ?? fetcherRef.current,
+        false,
+      ),
+    [requestFetch],
   );
 
   useEffect(() => {
@@ -144,13 +190,16 @@ export function useCachedData<T>(
     setData(cached);
     setLoading(cached === undefined);
     setFetchedAt(getCachedFetchedAt(key));
-    void runFetcher(fetcherRef.current);
+    void startFetch(fetcherRef.current);
     return () => {
       runIdRef.current += 1;
-      activeControllerRef.current?.abort();
-      activeControllerRef.current = null;
+      activeRef.current?.controller.abort();
+      activeRef.current = null;
+      // Nothing will run the queued fetch for this key, so release its waiters.
+      queuedRef.current?.resolveDone();
+      queuedRef.current = null;
     };
-  }, [key, runFetcher]);
+  }, [key, startFetch]);
 
   return { data, loading, error, fetchedAt, refresh, cheapRefresh };
 }

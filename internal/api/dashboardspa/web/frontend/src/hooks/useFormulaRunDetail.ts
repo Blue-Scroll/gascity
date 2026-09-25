@@ -79,8 +79,10 @@ export function useFormulaRunDetail(
   const key = formulaRunDetailCacheKey(runId, scopeKind, scopeRef);
   // F4: the loader polls warming 503s for up to ~180s (the just-slung
   // deep-link grace window). Each fetcher invocation gets a generation; a
-  // newer invocation (key change, manual refresh, nudge) or unmount
-  // supersedes older polls via keepPolling, so a superseded poll stops
+  // newer invocation or unmount supersedes older polls via keepPolling. A
+  // newer invocation is a key change, or a refresh once the poll has run past
+  // useCachedData's request budget (a refresh before that waits for the poll
+  // to settle). A superseded poll stops
   // issuing GETs and its warming signal can never overwrite the current
   // load's state. The settled poll clears its own warming signal so the
   // failed/ready states never carry stale interim copy.

@@ -74,6 +74,7 @@ import type {
   StreamSessionData,
   WorkflowSnapshotResponse,
 } from 'gas-city-dashboard-shared/gc-supervisor';
+import { REQUEST_BUDGET_MS } from '../api/requestBudget';
 import { SupervisorApiError, unwrapSupervisorResult, type SupervisorResult } from './errors';
 import {
   SUPERVISOR_PROXY_BASE_URL,
@@ -82,7 +83,7 @@ import {
   supervisorUrl,
 } from './url';
 
-export const SUPERVISOR_REQUEST_TIMEOUT_MS = 60_000;
+export const SUPERVISOR_REQUEST_TIMEOUT_MS = REQUEST_BUDGET_MS;
 export const GC_MUTATION_HEADERS = {
   'X-GC-Request': 'dashboard',
 } as const;

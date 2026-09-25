@@ -453,10 +453,10 @@ function usePoll(
   pausedRef: MutableRefObject<boolean>,
 ) {
   useEffect(() => {
-    // A fixed interval can supersede every response that takes longer than the
-    // cadence because useCachedData publishes only its latest run. Keep one
-    // timer instead: poll after settlement, or elect a recovery attempt after
-    // the supervisor request budget if a broken fetch never settles.
+    // Poll after settlement, not on a fixed interval, so a response slower than
+    // the cadence is never followed by a queued refresh. If a fetch never
+    // settles, elect a recovery attempt after the supervisor request budget:
+    // useCachedData lets a refresh replace a fetch that old.
     let stopped = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
 
