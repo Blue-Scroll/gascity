@@ -379,6 +379,12 @@ describe('FormulaRunDetailPage', () => {
     // ignored; an identity-less (ambient) event matches, mirroring the
     // non-terminal ambient behavior after load — a root bead's own events may
     // carry no run identity.
+    //
+    // The refresh waits for the load in flight and runs once it lands
+    // (useCachedData never cuts a load off for a refresh, hq-subxy4), so the
+    // second GET is counted after the first load resolves. The "other run is
+    // ignored" half is its own test below: here the queue would fold a wrong
+    // match into the same second GET and hide it.
     const initialLoad = deferred<FormulaRunDetail>();
     loadSupervisorFormulaRunDetail.mockReturnValue(initialLoad.promise);
 
@@ -389,24 +395,83 @@ describe('FormulaRunDetailPage', () => {
     act(() => requireRunDetailStream().fail());
     expect(loadSupervisorFormulaRunDetail).toHaveBeenCalledTimes(1);
 
-    // Another run's event: no refresh.
-    cityStream.dispatch('event', {
-      type: `${GC_EVENT_PREFIX.bead}updated`,
-      payload: { bead: { metadata: { 'gc.run_id': 'other-run' } } },
-    });
-    await Promise.resolve();
-    expect(loadSupervisorFormulaRunDetail).toHaveBeenCalledTimes(1);
-
-    // This run's event: the detail refresh fires even though no detail ever
-    // loaded.
+    // This run's event: it asks for a detail refresh even though no detail
+    // ever loaded. The refresh waits for the first load instead of starting a
+    // second GET beside it.
     cityStream.dispatch('event', {
       type: `${GC_EVENT_PREFIX.bead}updated`,
       payload: { bead: { metadata: { 'gc.run_id': 'gc-adopt-pr-active' } } },
     });
-    await waitFor(() => expect(loadSupervisorFormulaRunDetail).toHaveBeenCalledTimes(2));
+    await Promise.resolve();
+    expect(loadSupervisorFormulaRunDetail).toHaveBeenCalledTimes(1);
 
     initialLoad.resolve(detail);
+    await waitFor(() => expect(loadSupervisorFormulaRunDetail).toHaveBeenCalledTimes(2));
     await screen.findByRole('heading', { name: /adopt pr #42/i });
+  });
+
+  it('ignores another run’s events while this run has not loaded yet (F4)', async () => {
+    // The other half of the ROUTE-runId anchor: an event that names a
+    // DIFFERENT run must not refresh this page. A wrong match would queue a
+    // refresh that runs once the first load lands, so the count is read after
+    // that load.
+    const initialLoad = deferred<FormulaRunDetail>();
+    loadSupervisorFormulaRunDetail.mockReturnValue(initialLoad.promise);
+
+    renderPage();
+    const cityStream = requireCityEventSource();
+    act(() => requireRunDetailStream().fail());
+
+    cityStream.dispatch('event', {
+      type: `${GC_EVENT_PREFIX.bead}updated`,
+      payload: { bead: { metadata: { 'gc.run_id': 'other-run' } } },
+    });
+    initialLoad.resolve(detail);
+    await screen.findByRole('heading', { name: /adopt pr #42/i });
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    expect(loadSupervisorFormulaRunDetail).toHaveBeenCalledTimes(1);
+  });
+
+  it('folds three live events during one slow load into exactly one more load, run after it lands (hq-subxy4)', async () => {
+    // Each event reaches the refresh: the clock steps past the event hook's
+    // coalesce window between them, so its throttle swallows none of them.
+    // The load in flight is never cut off, and ONE more load covers all three
+    // events. It starts only after the first load lands, so it reads whatever
+    // the events announced.
+    vi.useFakeTimers({ toFake: ['Date'] });
+    try {
+      const initialLoad = deferred<FormulaRunDetail>();
+      const followUpLoad = deferred<FormulaRunDetail>();
+      loadSupervisorFormulaRunDetail
+        .mockReturnValueOnce(initialLoad.promise)
+        .mockReturnValueOnce(followUpLoad.promise);
+
+      renderPage();
+      const cityStream = requireCityEventSource();
+      act(() => requireRunDetailStream().fail());
+
+      for (let i = 0; i < 3; i += 1) {
+        vi.setSystemTime(Date.now() + 3_000);
+        cityStream.dispatch('event', {
+          type: `${GC_EVENT_PREFIX.bead}updated`,
+          payload: { bead: { metadata: { 'gc.run_id': 'gc-adopt-pr-active' } } },
+        });
+      }
+      await Promise.resolve();
+      expect(loadSupervisorFormulaRunDetail).toHaveBeenCalledTimes(1);
+
+      initialLoad.resolve(detail);
+      await waitFor(() => expect(loadSupervisorFormulaRunDetail).toHaveBeenCalledTimes(2));
+
+      followUpLoad.resolve({ ...detail, title: 'Adopt PR #42, rebased' });
+      await screen.findByRole('heading', { name: /adopt pr #42, rebased/i });
+      expect(loadSupervisorFormulaRunDetail).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('recovers a failed warming load when the run’s bead events later arrive (F4)', async () => {
