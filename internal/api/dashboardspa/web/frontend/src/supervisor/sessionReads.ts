@@ -27,6 +27,17 @@ export async function listSupervisorSessions(): Promise<SupervisorSessionList> {
   return supervisorApi().listSessions(activeCityOrThrow('list supervisor sessions'));
 }
 
+/**
+ * Whether a session row carries its id. While the bead store is slow, GET
+ * /sessions answers at once with the live sessions and marks the list partial
+ * (vn-fzant5y). Those rows have no id yet, because the id lives on the session
+ * bead. Use them to show who is running. Never use one to open, peek at or
+ * link a session: check this first.
+ */
+export function hasSessionId(session: SupervisorSession): boolean {
+  return session.id !== '';
+}
+
 export async function fetchSupervisorSessionTranscript(
   sessionId: string,
 ): Promise<SessionTranscriptView> {
@@ -80,8 +91,9 @@ export async function fetchStructuredTranscriptPage(
       ...(opts.includeThinking ? { include_thinking: true } : {}),
     },
   );
-  const pagination = (transcript as { pagination?: { has_older_messages?: boolean; total_message_count?: number } })
-    .pagination;
+  const pagination = (
+    transcript as { pagination?: { has_older_messages?: boolean; total_message_count?: number } }
+  ).pagination;
   return {
     event: structuredTranscriptOrNull(transcript),
     hasOlder: pagination?.has_older_messages ?? false,
@@ -122,7 +134,8 @@ export function structuredTranscriptOrNull(
 }
 
 export function normalizeSessions(list: ListBodySessionResponse): DashboardSession[] {
-  return (list.items ?? []).map(normalizeSession);
+  // A row with no id cannot be joined to anything; the list is already partial.
+  return (list.items ?? []).filter(hasSessionId).map(normalizeSession);
 }
 
 function normalizeSession(session: SessionResponse): DashboardSession {

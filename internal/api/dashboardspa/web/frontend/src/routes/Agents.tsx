@@ -29,6 +29,7 @@ import { useNow } from '../contexts/NowContext';
 import { READ_ONLY_CONTROL_TITLE, ReadOnlyBadge, useReadOnly } from '../contexts/ReadOnlyContext';
 import { useCachedData } from '../hooks/useCachedData';
 import { useGcEventRefresh } from '../hooks/useGcEvents';
+import { useRefreshWhilePartial } from '../hooks/useRefreshWhilePartial';
 import { formatRelative } from '../hooks/time';
 import {
   attachCommand,
@@ -103,7 +104,10 @@ const AGENT_SEARCH_FIELDS = (a: SupervisorAgent): ReadonlyArray<string> =>
 
 export function AgentsPage() {
   const attention = useAttentionModel();
-  const { data, loading, error, refresh } = useCachedData('agents', listSupervisorAgents);
+  const { data, loading, error, refresh, fetchedAt } = useCachedData(
+    'agents',
+    listSupervisorAgents,
+  );
   // The sessions list feeds "Workers active" below. A row's own way into its
   // pane (the session link, Peek, a pending ask) reads session.id off the
   // agent row through agentSessionId, and uses this list only as the fallback
@@ -117,6 +121,14 @@ export function AgentsPage() {
   // The beads churn to zero within seconds and aren't reliably aggregated, so a
   // worker with no captured bead is the common (and still-valid) case.
   const beadsCache = useCachedData('beads:in-flight', () => listSupervisorBeads());
+  // While the bead store is slow, both lists answer at once with live names
+  // and say they are partial. Ask again until the details land (vn-fzant5y).
+  useRefreshWhilePartial(data?.partial === true, fetchedAt, refresh);
+  useRefreshWhilePartial(
+    sessionsCache.data?.partial === true,
+    sessionsCache.fetchedAt,
+    sessionsCache.refresh,
+  );
   const rows = useMemo<SupervisorAgent[]>(() => data?.items ?? [], [data]);
   const fallbackSessionIds = useMemo(
     () => sessionIdsByName(sessionsCache.data?.items ?? []),
@@ -517,8 +529,11 @@ export function AgentsPage() {
             )}
             <PartialDataNotice
               show={data?.partial === true}
-              label="roster partial"
-              title={data?.partial_errors?.join('\n') ?? 'one or more agent backends unavailable'}
+              label="details loading"
+              title={
+                data?.partial_errors?.join('\n') ??
+                'the bead store is slow; details are still loading'
+              }
             />
             <Button size="sm" onClick={() => void refresh()} disabled={loading}>
               {loading ? 'Refreshing' : 'Refresh'}
