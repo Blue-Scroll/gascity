@@ -59,6 +59,11 @@ jobs:
         # The chaos tests are here because they pull a seat out of the desired
         # set and expect a drain, so they are the ones the spawn grace can break.
         run: go test ./cmd/gc/ -run 'TestPoolSpawnGrace|TestPoolSeatInSpawnGrace|TestSessionLifecycleChaosPendingInteraction' -count=1 -v
+      - name: Unit tests, the nudge sweep borrows the store and prunes gone shadows (hq-ga1qga)
+        # The supervisor tick opened a fresh store every pass for dead-letter
+        # rows it could never prune. These pin the borrow, the open gate and
+        # the prune, plus the older sweep and open-count tests they sit beside.
+        run: go test ./cmd/gc/ -run 'TestPruneDeadQueuedNudges|TestNudgeMaintenanceSkipsStoreOpen|TestRunNudgeQueueMaintenanceSweep|TestNudgePollHelpers' -count=1 -v
       - name: Unit tests, worktree spawn guard and pool-name identity (vn-rm9u8g)
         run: |
           go test ./internal/workdir/ -run 'TestValidateAncestorWorktreesNotStale|TestValidateNotNestedInSessionWorktree|TestValidateSpawnTarget' -count=1 -v
