@@ -572,12 +572,13 @@ type managedDoltPreflightOrderDispatcher struct {
 	store beads.Store
 }
 
-func (d *managedDoltPreflightOrderDispatcher) dispatch(context.Context, string, time.Time) {
+func (d *managedDoltPreflightOrderDispatcher) dispatch(context.Context, string, time.Time) orderDispatchReport {
 	_, _ = d.store.ListByLabel(labelOrderTracking, 0, beads.IncludeClosed)
 	_, _ = d.store.Create(beads.Bead{
 		Title:  "order:preflight-due",
 		Labels: []string{"order-run:preflight-due", labelOrderTracking},
 	})
+	return orderDispatchReport{}
 }
 
 func (d *managedDoltPreflightOrderDispatcher) drain(context.Context) bool {
@@ -1478,12 +1479,13 @@ type recordingOrderDispatcher struct {
 	drainCtxErr error
 }
 
-func (r *recordingOrderDispatcher) dispatch(ctx context.Context, cityRoot string, now time.Time) {
+func (r *recordingOrderDispatcher) dispatch(ctx context.Context, cityRoot string, now time.Time) orderDispatchReport {
 	r.calls.Add(1)
 	r.called.Store(true)
 	if r.onDispatch != nil {
 		r.onDispatch(ctx, cityRoot, now)
 	}
+	return orderDispatchReport{}
 }
 
 func (r *recordingOrderDispatcher) drain(ctx context.Context) bool {
@@ -1507,7 +1509,9 @@ func newBlockingOrderDispatcher() *blockingOrderDispatcher {
 	}
 }
 
-func (b *blockingOrderDispatcher) dispatch(context.Context, string, time.Time) {}
+func (b *blockingOrderDispatcher) dispatch(context.Context, string, time.Time) orderDispatchReport {
+	return orderDispatchReport{}
+}
 
 func (b *blockingOrderDispatcher) drain(ctx context.Context) bool {
 	b.mu.Lock()

@@ -119,7 +119,9 @@ var (
 //
 // dispatch runs trigger evaluation synchronously, then spawns a goroutine
 // per due order's dispatch action. The tracking bead is created before the
-// goroutine launches to prevent re-fire on the next tick.
+// goroutine launches to prevent re-fire on the next tick. It returns a
+// report of where its time went, which the tick writes onto the
+// dispatch_orders trace record.
 //
 // drain waits for all in-flight dispatch goroutines spawned by prior
 // dispatch calls to complete, bounded by ctx. It returns true when all
@@ -127,8 +129,91 @@ var (
 // config reload to ensure tracking bead outcome metadata is persisted
 // before the dispatcher is replaced or discarded.
 type orderDispatcher interface {
-	dispatch(ctx context.Context, cityPath string, now time.Time)
+	dispatch(ctx context.Context, cityPath string, now time.Time) orderDispatchReport
 	drain(ctx context.Context) bool
+}
+
+// orderDispatchReport says where one dispatch call spent its time, so a slow
+// dispatch_orders record names its cost instead of only its size (hq-mb1gvr).
+// The zero value is an honest report of a call that did nothing.
+type orderDispatchReport struct {
+	// orders is how many orders the dispatcher holds. candidates passed the
+	// rig check and the first open-work gate, due were due and past the
+	// second gate, and fired got a slot in this tick's budget.
+	orders, candidates, due, fired int
+
+	// gateTimeouts counts open-work gates that ran out of orderGateTimeout.
+	gateTimeouts int
+
+	// passes times each pass of the call: gates, condition_checks, due_pass
+	// and launch.
+	passes tickPhaseParts
+
+	// orderCost is the time each order spent in the two serial passes (gates
+	// and due_pass), where one slow order holds up every order after it.
+	orderCost map[string]time.Duration
+}
+
+// orderDispatchSlowestShown is how many of the slowest orders a report names.
+const orderDispatchSlowestShown = 3
+
+// addTo writes the report into a dispatch_orders record's fields.
+func (r orderDispatchReport) addTo(fields tickPhaseParts) {
+	fields["orders"] = r.orders
+	fields["candidates"] = r.candidates
+	fields["due"] = r.due
+	fields["fired"] = r.fired
+	fields["gate_timeouts"] = r.gateTimeouts
+	for k, v := range r.passes {
+		fields[k] = v
+	}
+	if slowest := r.slowestOrders(); slowest != "" {
+		fields["slowest_orders"] = slowest
+	}
+}
+
+// slowestOrders names the orders that cost the most, slowest first, as
+// "name=1234ms,name=567ms". It is empty when no order was timed.
+func (r orderDispatchReport) slowestOrders() string {
+	names := make([]string, 0, len(r.orderCost))
+	for name := range r.orderCost {
+		names = append(names, name)
+	}
+	sort.Slice(names, func(i, j int) bool {
+		if r.orderCost[names[i]] != r.orderCost[names[j]] {
+			return r.orderCost[names[i]] > r.orderCost[names[j]]
+		}
+		return names[i] < names[j]
+	})
+	if len(names) > orderDispatchSlowestShown {
+		names = names[:orderDispatchSlowestShown]
+	}
+	shown := make([]string, 0, len(names))
+	for _, name := range names {
+		shown = append(shown, fmt.Sprintf("%s=%dms", name, r.orderCost[name].Milliseconds()))
+	}
+	return strings.Join(shown, ",")
+}
+
+// orderCostClock charges wall time to whichever order a serial loop is on.
+// Call next at the top of each iteration and stop after the loop, so an
+// iteration that ends in `continue` is still charged in full.
+type orderCostClock struct {
+	cost  map[string]time.Duration
+	name  string
+	start time.Time
+}
+
+func (c *orderCostClock) next(name string) {
+	c.stop()
+	c.name, c.start = name, time.Now()
+}
+
+func (c *orderCostClock) stop() {
+	if c.name != "" {
+		c.cost[c.name] += time.Since(c.start)
+		c.name = ""
+	}
 }
 
 // ExecRunner runs a shell command with context, working directory, and
@@ -623,14 +708,14 @@ func (m *memoryOrderDispatcher) prefetchConditionResults(candidates []*orderDisp
 	wg.Wait()
 }
 
-func (m *memoryOrderDispatcher) dispatch(ctx context.Context, cityPath string, now time.Time) {
+func (m *memoryOrderDispatcher) dispatch(ctx context.Context, cityPath string, now time.Time) (report orderDispatchReport) {
 	// Skip all order dispatch when the city is suspended. Use the
 	// dispatcher's in-scope city path so suspension state resolves
 	// against the controlled city rather than the process cwd.
 	if m.cfg != nil {
 		st, _ := loadSuspensionState(fsys.OSFS{}, m.cityPath)
 		if citySuspendedWithState(m.cfg, st) {
-			return
+			return report
 		}
 	}
 
@@ -658,8 +743,12 @@ func (m *memoryOrderDispatcher) dispatch(ctx context.Context, cityPath string, n
 	trackingIndex := newOrderDispatchTrackingIndex(m.stderr)
 
 	total := len(m.aa)
+	report.orders = total
+	report.passes = tickPhaseParts{}
+	report.orderCost = make(map[string]time.Duration, total)
+	clock := &orderCostClock{cost: report.orderCost}
 	if total == 0 {
-		return
+		return report
 	}
 	start := 0
 	if m.maxDispatchesPerTick > 0 {
@@ -674,9 +763,11 @@ func (m *memoryOrderDispatcher) dispatch(ctx context.Context, cityPath string, n
 	// store — so doing it for every order costs the tick nothing and gives the
 	// parallel pass its complete work list.
 	candidates := make([]*orderDispatchCandidate, 0, total)
+	gatesStart := startTickPhase()
 	for offset := 0; offset < total; offset++ {
 		idx := (start + offset) % total
 		a := m.aa[idx]
+		clock.next(a.ScopedName())
 		// Skip orders targeting suspended rigs.
 		if m.orderRigSuspended(a) {
 			continue
@@ -722,6 +813,9 @@ func (m *memoryOrderDispatcher) dispatch(ctx context.Context, cityPath string, n
 				return trackingIndex.hasOpenTracking(storesForGate, storeKeysForGate, scoped)
 			})
 			if err != nil {
+				if errors.Is(err, errGateTimeout) {
+					report.gateTimeouts++
+				}
 				if m.gateFailClosed(ctx, a, scoped, err) {
 					if errors.Is(err, errGateTimeout) {
 						// Anchor to actual wall clock after the gate consumed orderGateTimeout;
@@ -748,8 +842,11 @@ func (m *memoryOrderDispatcher) dispatch(ctx context.Context, cityPath string, n
 		cand.triggerOpts.ConditionCtx = ctx
 		candidates = append(candidates, cand)
 	}
+	clock.stop()
+	report.passes.record("gates", gatesStart)
+	report.candidates = len(candidates)
 
-	m.prefetchConditionResults(candidates, now)
+	report.passes.time("condition_checks", func() { m.prefetchConditionResults(candidates, now) })
 
 	// Phase 2a: the due pass, in rotation order, over the same per-order state
 	// phase 1 resolved. It fires nothing. It builds this tick's complete list
@@ -766,7 +863,9 @@ func (m *memoryOrderDispatcher) dispatch(ctx context.Context, cityPath string, n
 	// beads and two runs in one tick. The gates cannot catch that: they read
 	// the store as it was before this tick wrote anything.
 	dueSeen := make(map[string]bool, len(candidates))
+	duePassStart := startTickPhase()
 	for _, cand := range candidates {
+		clock.next(cand.scoped)
 		a := cand.order
 		storesForGate, storeKeysForGate := cand.gateStores, cand.gateStoreKeys
 		scoped := cand.scoped
@@ -875,6 +974,9 @@ func (m *memoryOrderDispatcher) dispatch(ctx context.Context, cityPath string, n
 				return trackingIndex.hasOpenWork(storesForGate, storeKeysForGate, scoped, m.wispRootHasOpenWork, m.hasOpenWorkStrict)
 			})
 			if err != nil {
+				if errors.Is(err, errGateTimeout) {
+					report.gateTimeouts++
+				}
 				if m.gateFailClosed(ctx, a, scoped, err) {
 					if errors.Is(err, errGateTimeout) {
 						// Anchor to actual wall clock after the gate consumed orderGateTimeout;
@@ -913,9 +1015,16 @@ func (m *memoryOrderDispatcher) dispatch(ctx context.Context, cityPath string, n
 		due = append(due, cand)
 	}
 
+	clock.stop()
+	report.passes.record("due_pass", duePassStart)
+	report.due = len(due)
+
 	// Phase 2b: spend the budget on the orders whose own schedule is most
 	// broken. Phase 3 writes their tracking beads at once.
-	m.writeTrackingAndLaunch(ctx, cityPath, m.pickDispatchBudget(due, total), &inFlight)
+	fires := m.pickDispatchBudget(due, total)
+	report.fired = len(fires)
+	report.passes.time("launch", func() { m.writeTrackingAndLaunch(ctx, cityPath, fires, &inFlight) })
+	return report
 }
 
 // orderDispatchUrgencyBaseline is the score of an order that is due right now,

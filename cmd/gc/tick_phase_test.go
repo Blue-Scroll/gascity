@@ -32,3 +32,35 @@ func TestTickPhaseWithBDCost(t *testing.T) {
 		t.Fatalf("caller map was changed: %#v", fields)
 	}
 }
+
+// TestTickPhasePartsTimesEachPart proves a named part records its own time and
+// its own bd calls, under keys that cannot collide with the phase's bd_calls
+// and bd_ms, and that RecordTickPhase's copy keeps every part.
+func TestTickPhasePartsTimesEachPart(t *testing.T) {
+	t.Setenv("GC_BD_TRACE_JSON", "")
+	phase := startTickPhase()
+	parts := tickPhaseParts{}
+	parts.time("quiet", func() {})
+	parts.time("busy", func() {
+		for range 3 {
+			beads.TraceBDCall("go:test", t.TempDir(), []string{"list"}, time.Now(), 0, nil)
+		}
+	})
+
+	if calls, _ := parts["busy_bd_calls"].(int64); calls < 3 {
+		t.Fatalf("busy_bd_calls = %v, want at least 3", parts["busy_bd_calls"])
+	}
+	if _, ok := parts["quiet_ms"].(int64); !ok {
+		t.Fatalf("quiet_ms missing or not int64: %#v", parts)
+	}
+	if _, ok := parts["quiet_bd_calls"].(int64); !ok {
+		t.Fatalf("quiet_bd_calls missing or not int64: %#v", parts)
+	}
+
+	got := phase.withBDCost(parts)
+	for _, key := range []string{"quiet_ms", "busy_ms", "busy_bd_calls", "bd_calls", "bd_ms"} {
+		if _, ok := got[key]; !ok {
+			t.Fatalf("record lost %s: %#v", key, got)
+		}
+	}
+}
