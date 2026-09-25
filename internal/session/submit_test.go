@@ -371,6 +371,49 @@ func TestSubmitDefaultToRunningGeminiSessionWaitsForIdleNudge(t *testing.T) {
 	}
 }
 
+// A person's message to a live claude pane is typed at once. The idle wait
+// (Nudge) held a dashboard send to a busy agent for 11 to 15 seconds
+// (vn-c5j2a29); Claude Code queues typed input by itself, so the wait bought
+// nothing. The wrapped alias proves the rule follows the family, not the name.
+func TestSubmitDefaultToRunningClaudeSessionNudgesImmediately(t *testing.T) {
+	for _, provider := range []string{"claude", "claude-opus-high"} {
+		t.Run(provider, func(t *testing.T) {
+			store := beads.NewMemStore()
+			sp := runtime.NewFake()
+			mgr := NewManagerWithOptions(store, sp)
+
+			info, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "helper", Title: "", Command: "claude", WorkDir: t.TempDir(), Provider: provider, Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual", "builtin_ancestor": "claude"}})
+			if err != nil {
+				t.Fatalf("Create: %v", err)
+			}
+
+			outcome, err := mgr.Submit(context.Background(), info.ID, "hello", BuildResumeCommand(info), runtime.Config{WorkDir: info.WorkDir}, SubmitIntentDefault)
+			if err != nil {
+				t.Fatalf("Submit(default): %v", err)
+			}
+			if outcome.Queued {
+				t.Fatal("Submit(default) unexpectedly queued")
+			}
+
+			var sawNudge, sawNudgeNow bool
+			for _, call := range sp.Calls {
+				if call.Method == "Nudge" && call.Name == info.SessionName && call.Message == "hello" {
+					sawNudge = true
+				}
+				if call.Method == "NudgeNow" && call.Name == info.SessionName && call.Message == "hello" {
+					sawNudgeNow = true
+				}
+			}
+			if !sawNudgeNow {
+				t.Fatalf("calls = %#v, want NudgeNow(hello)", sp.Calls)
+			}
+			if sawNudge {
+				t.Fatalf("calls = %#v, did not want the idle-wait Nudge(hello)", sp.Calls)
+			}
+		})
+	}
+}
+
 func TestSubmitDefaultConfirmsLiveCreatingSession(t *testing.T) {
 	store := beads.NewMemStore()
 	sp := runtime.NewFake()
