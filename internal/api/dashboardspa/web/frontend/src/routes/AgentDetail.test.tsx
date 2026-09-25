@@ -3,6 +3,7 @@ import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from 'vitest';
 import { NowProvider } from '../contexts/NowContext';
 import { reportClientError } from '../lib/clientErrorReporting';
+import type * as SessionReads from '../supervisor/sessionReads';
 import { AgentDetailPage } from './AgentDetail';
 
 vi.mock('../api/client', () => ({
@@ -30,7 +31,11 @@ const mockListSupervisorBeads = vi.hoisted(() => vi.fn());
 const mockListSupervisorMail = vi.hoisted(() => vi.fn());
 const mockUseVisibleRefresh = vi.hoisted(() => vi.fn());
 
-vi.mock('../supervisor/sessionReads', () => ({
+// Keep the real module and swap out only the reads that hit the network. A
+// pure helper the page uses (hasSessionId) then stays real, so adding one
+// does not silently turn into `undefined` here and hide every session.
+vi.mock('../supervisor/sessionReads', async (importOriginal) => ({
+  ...(await importOriginal<typeof SessionReads>()),
   listSupervisorSessions: mockListSupervisorSessions,
   fetchSupervisorSessionTranscript: vi.fn(async () => ({
     turns: [],
