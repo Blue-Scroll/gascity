@@ -38,7 +38,12 @@ import {
 } from '../supervisor/agentPending';
 import { listSupervisorSessions } from '../supervisor/sessionReads';
 import { listSupervisorBeads } from '../supervisor/beadReads';
-import { listSupervisorAgents, type SupervisorAgent } from '../supervisor/agentReads';
+import {
+  agentSessionId,
+  listSupervisorAgents,
+  sessionIdsByName,
+  type SupervisorAgent,
+} from '../supervisor/agentReads';
 import {
   agentProject,
   cleanWorkerName,
@@ -99,11 +104,11 @@ const AGENT_SEARCH_FIELDS = (a: SupervisorAgent): ReadonlyArray<string> =>
 export function AgentsPage() {
   const attention = useAttentionModel();
   const { data, loading, error, refresh } = useCachedData('agents', listSupervisorAgents);
-  // The supervisor's AgentResponse.session (SessionInfo) carries only
-  // `name`/`attached`/`last_activity` — NOT the session id. Peek needs
-  // the session id (gc-XXX format) per SESSION_ID_RE on the backend.
-  // Fetch the sessions list in parallel so we can map agent.session.name
-  // -> session.id at peek time.
+  // The sessions list feeds "Workers active" below. A row's own way into its
+  // pane (the session link, Peek, a pending ask) reads session.id off the
+  // agent row through agentSessionId, and uses this list only as the fallback
+  // for a row with no id. That list can take over a minute on a busy town, so
+  // nothing a row needs may wait on it (hq-subxy4).
   const sessionsCache = useCachedData('sessions', listSupervisorSessions);
   // The "Workers active" section is SESSION-driven: it counts the live worker
   // sessions (stable across the bead churn), grouped by rig. Beads are fetched
@@ -113,22 +118,23 @@ export function AgentsPage() {
   // worker with no captured bead is the common (and still-valid) case.
   const beadsCache = useCachedData('beads:in-flight', () => listSupervisorBeads());
   const rows = useMemo<SupervisorAgent[]>(() => data?.items ?? [], [data]);
-  const sessionIds = useMemo(
-    () => (sessionsCache.data?.items ?? []).map((session) => session.id).sort(),
+  const fallbackSessionIds = useMemo(
+    () => sessionIdsByName(sessionsCache.data?.items ?? []),
     [sessionsCache.data],
   );
-  const agentNames = useMemo(() => rows.map((agent) => agent.name).sort(), [rows]);
-  const pendingCache = useCachedData(
-    `agent-pending:${agentNames.join(',')}:${sessionIds.join(',')}`,
-    () => listAgentPendingInteractions(rows, sessionsCache.data?.items ?? []),
+  // Keyed on each agent's session id, so a new or replaced session asks
+  // again. With ids on the rows the key settles when the agents list lands.
+  const pendingKey = useMemo(
+    () =>
+      rows
+        .map((agent) => `${agent.name}=${agentSessionId(agent, fallbackSessionIds) ?? ''}`)
+        .sort()
+        .join(','),
+    [rows, fallbackSessionIds],
   );
-  const sessionsById = useMemo(() => {
-    const map = new Map<string, string>();
-    for (const s of sessionsCache.data?.items ?? []) {
-      if (s.session_name) map.set(s.session_name, s.id);
-    }
-    return map;
-  }, [sessionsCache.data]);
+  const pendingCache = useCachedData(`agent-pending:${pendingKey}`, () =>
+    listAgentPendingInteractions(rows, fallbackSessionIds),
+  );
   const pendingByAgent = useMemo(() => {
     const map = new Map<string, AgentPendingInteraction>();
     for (const pending of pendingCache.data ?? []) {
@@ -162,8 +168,7 @@ export function AgentsPage() {
   const [search, setSearch] = useState('');
   const [rigFilter, setRigFilter] = useState('');
 
-  // Peek key is the agent alias (`name`); modal resolves the live session
-  // by mapping agent.session.name -> session.id via the sessions cache.
+  // Peek key is the agent alias (`name`); the modal opens that agent's session.
   const [peekAlias, setPeekAlias] = useState<string | null>(null);
   const [responseMessage, setResponseMessage] = useState<string | null>(null);
   const [responseError, setResponseError] = useState<string | null>(null);
@@ -175,11 +180,10 @@ export function AgentsPage() {
     () => (peekAlias === null ? null : (rows.find((a) => a.name === peekAlias) ?? null)),
     [rows, peekAlias],
   );
-  const peekSessionId = useMemo(() => {
-    const sessionName = peekAgent?.session?.name;
-    if (!sessionName) return null;
-    return sessionsById.get(sessionName) ?? null;
-  }, [peekAgent, sessionsById]);
+  const peekSessionId = useMemo(
+    () => (peekAgent === null ? null : (agentSessionId(peekAgent, fallbackSessionIds) ?? null)),
+    [peekAgent, fallbackSessionIds],
+  );
 
   const sseState = useGcEventRefresh(
     [GC_EVENT_PREFIX.session, GC_EVENT_PREFIX.bead, 'agent.'],
@@ -303,11 +307,9 @@ export function AgentsPage() {
             ? `${r.name} — configured but not running; detail will show no live session`
             : `Open drilldown for ${r.name}`;
           const linkColor = orphan ? 'text-fg-muted' : 'text-fg';
-          // The live session, reachable straight from the roster. The id is
-          // what every session endpoint takes; the roster only carries the tmux
-          // name, so it is resolved through the sessions list.
+          // The live session, reachable straight from the roster.
           const tmuxSession = r.session?.name ?? '';
-          const sessionId = tmuxSession ? (sessionsById.get(tmuxSession) ?? '') : '';
+          const sessionId = agentSessionId(r, fallbackSessionIds) ?? '';
           const showSession = sessionId !== '';
           const showTerminal = terminalServed && tmuxSession !== '';
           return (
@@ -484,12 +486,12 @@ export function AgentsPage() {
       },
     ],
     [
+      fallbackSessionIds,
       handlePendingResponse,
       now,
       pendingByAgent,
       readOnly,
       responding,
-      sessionsById,
       terminalServed,
     ],
   );
@@ -611,12 +613,9 @@ export function AgentsPage() {
         onClose={() => setPeekAlias(null)}
         title={peekAgent?.name ?? peekAlias ?? 'Transcript'}
         caption={
-          // SessionInfo on the supervisor side carries only name/attached/
-          // last_activity — no session id — so we resolve agent.session.name
-          // -> session.id through the sessions cache. If sessions hasn't
-          // loaded yet (or the agent's session is missing from it), surface
-          // that explicitly instead of letting peek hit the route with an
-          // invalid id and degrade to "invalid session id".
+          // A row with no session.id falls back to the sessions list. While
+          // that list is loading, or when it has no match, say so instead of
+          // letting peek hit the route with an invalid id.
           peekAgent && peekAgent.session && !peekSessionId
             ? sessionsCache.loading
               ? 'Resolving session…'

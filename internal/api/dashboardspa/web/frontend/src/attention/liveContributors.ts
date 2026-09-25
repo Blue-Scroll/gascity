@@ -5,6 +5,7 @@ import { getActiveCity } from '../api/cityBase';
 import { type OperatorConfig } from '../contexts/OperatorConfigContext';
 import { useCachedData } from '../hooks/useCachedData';
 import { listAgentPendingInteractions } from '../supervisor/agentPending';
+import { agentsLackSessionIds, sessionIdsByName } from '../supervisor/agentReads';
 import { listSupervisorBeads } from '../supervisor/beadReads';
 import {
   SupervisorApiError,
@@ -119,16 +120,19 @@ async function fetchAgentsAttention(cityName: string | null): Promise<AgentsAtte
   if (cityName === null) return {};
   try {
     const list = await supervisorApi().listAgents(cityName);
+    const items = list.items ?? [];
     const facts: AgentsAttentionFacts = {
-      items: list.items ?? [],
+      items,
       partial: list.partial === true,
     };
     try {
-      const sessions = await supervisorApi().listSessions(cityName);
-      facts.pendingInteractions = await listAgentPendingInteractions(
-        list.items ?? [],
-        sessions.items ?? [],
-      );
+      // Every page runs this, so skip the sessions list when each live row
+      // carries its own session id. That list is slow on a busy town, and
+      // asking for it here slowed every other read on the page (hq-subxy4).
+      const fallbackIds = agentsLackSessionIds(items)
+        ? sessionIdsByName((await supervisorApi().listSessions(cityName)).items ?? [])
+        : undefined;
+      facts.pendingInteractions = await listAgentPendingInteractions(items, fallbackIds);
     } catch (err) {
       facts.pendingError = formatApiError(err, 'agent pending state unavailable');
     }
@@ -235,11 +239,7 @@ function abortReason(signal: AbortSignal): unknown {
   return signal.reason ?? new DOMException('The operation was aborted', 'AbortError');
 }
 
-async function listDecisionBeads(
-  cityName: string,
-  decisionLabel: string,
-  signal?: AbortSignal,
-) {
+async function listDecisionBeads(cityName: string, decisionLabel: string, signal?: AbortSignal) {
   return supervisorApi().listBeads(
     cityName,
     {

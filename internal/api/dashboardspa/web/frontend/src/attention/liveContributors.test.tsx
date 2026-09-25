@@ -338,6 +338,37 @@ describe('useLiveAttentionContributors', () => {
     expect(mockApi.doltTrend).toHaveBeenCalledTimes(1);
   });
 
+  it('asks each session for a pending ask by the id on the agent row, with no sessions list (hq-subxy4)', async () => {
+    mockSupervisorApi.listAgents.mockResolvedValue({
+      total: 1,
+      items: [
+        {
+          available: true,
+          name: 'reviewer',
+          running: true,
+          state: 'failed',
+          suspended: false,
+          session: {
+            attached: true,
+            id: 'gc-9001',
+            last_activity: '2026-05-29T20:00:00.000Z',
+            name: 'reviewer',
+          },
+        },
+      ],
+    });
+
+    const { result } = renderHook(() => useLiveAttentionContributors(testOperator, undefined));
+
+    await waitFor(() => {
+      expect(composeAttention(result.current).byDomain.agents.attention).toBe(1);
+    });
+    expect(mockSupervisorApi.sessionPending).toHaveBeenCalledWith('test-city', 'gc-9001');
+    // Every page runs this read, and on a busy town the sessions list took
+    // over a minute. With the id on the row there is nothing to look up.
+    expect(mockSupervisorApi.listSessions).not.toHaveBeenCalled();
+  });
+
   it('uses one captured city for every bead-attention read', async () => {
     mockSupervisorApi.listBeads.mockResolvedValue({ total: 0, items: [] });
     setActiveCity('later-city');
