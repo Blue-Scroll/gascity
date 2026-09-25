@@ -106,9 +106,9 @@ type Server struct {
 	storeHealthComputer func(ctx context.Context) (*StatusStoreHealth, error)
 	storeHealthFlight   singleflight.Group
 
-	// sessionListFlight lets identical GET /sessions requests that arrive
-	// together share one build. See humaHandleSessionList.
-	sessionListFlight singleflight.Group
+	// listBuildFlight lets identical /agents and /sessions requests that
+	// arrive together share one build. See shareListBuild.
+	listBuildFlight singleflight.Group
 
 	// componentVersions caches the dolt engine and bd CLI versions the
 	// supervisor drives for /v0/status. Binary versions are immutable for

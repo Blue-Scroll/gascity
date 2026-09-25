@@ -19,30 +19,13 @@ import (
 // agent-get). Split out of huma_handlers_sessions.go to isolate read-side
 // logic from mutations and streaming.
 
-// humaHandleSessionList serves GET /sessions. Identical requests that arrive
-// while one is being built wait for that build and share it. A build makes
-// runtime calls for every active session, and a dashboard asks again on every
-// session or bead event. On the town those copies piled up: a list that takes
-// about 1.5s alone took 15s to 2 minutes each, so no copy ever answered the
-// page that asked (hq-subxy4).
+// humaHandleSessionList serves GET /sessions. Overlapping identical requests
+// share one build (shareListBuild): a build makes runtime calls for every
+// active session, and dashboards ask again on every session or bead event.
 func (s *Server) humaHandleSessionList(_ context.Context, input *SessionListInput) (*ListOutput[sessionResponse], error) {
-	v, err, shared := s.sessionListFlight.Do(cacheKeyFor("sessions", input), func() (any, error) {
+	return shareListBuild(&s.listBuildFlight, cacheKeyFor("sessions", input), func() (*ListOutput[sessionResponse], error) {
 		return s.buildSessionList(input)
 	})
-	if err != nil {
-		return nil, err
-	}
-	out := v.(*ListOutput[sessionResponse])
-	if !shared {
-		return out, nil
-	}
-	// Every sharer gets its own copy, so one caller can never change what
-	// another one serves. The response cache clones its hits the same way.
-	body, ok := cloneCachedValue[ListBody[sessionResponse]](out.Body)
-	if !ok {
-		return nil, apierr.Internal.Msg("copying a shared session list failed")
-	}
-	return &ListOutput[sessionResponse]{Index: out.Index, CacheAgeS: out.CacheAgeS, Body: body}, nil
 }
 
 // buildSessionList does the work of one GET /sessions request.
