@@ -269,7 +269,32 @@ export function Composer({
         </ul>
       )}
 
-      <div className="flex items-end gap-1 px-1 py-1">
+      {/* The message box has a row to itself, the full width of the screen. On a
+          phone every button beside it takes width from what is being typed, so
+          the buttons sit on the row below: attach and model on the left, stop
+          and send on the right, where a thumb finds send. */}
+      <div className="px-3 pt-1">
+        <textarea
+          data-composer-input
+          ref={box}
+          value={text}
+          onChange={(e) => setText(e.target.value)}
+          onPaste={(e) => {
+            // Every file on the clipboard, not just the first — pasting two
+            // screenshots should attach two.
+            const files = canAttach ? Array.from(e.clipboardData.files) : [];
+            if (files.length > 0) {
+              e.preventDefault();
+              stage(files);
+            }
+          }}
+          rows={1}
+          placeholder="Message…"
+          className="block max-h-36 min-h-11 w-full resize-none bg-transparent py-2 text-body text-fg placeholder:text-fg-faint focus:outline-none"
+        />
+      </div>
+
+      <div aria-label="Message actions" role="group" className="flex items-center gap-1 px-1 pb-1">
         {canAttach && (
           <>
             <button
@@ -295,24 +320,6 @@ export function Composer({
             />
           </>
         )}
-        <textarea
-          data-composer-input
-          ref={box}
-          value={text}
-          onChange={(e) => setText(e.target.value)}
-          onPaste={(e) => {
-            // Every file on the clipboard, not just the first — pasting two
-            // screenshots should attach two.
-            const files = canAttach ? Array.from(e.clipboardData.files) : [];
-            if (files.length > 0) {
-              e.preventDefault();
-              stage(files);
-            }
-          }}
-          rows={1}
-          placeholder="Message…"
-          className="max-h-36 min-h-11 flex-1 resize-none bg-transparent py-2 text-body text-fg placeholder:text-fg-faint focus:outline-none"
-        />
         <button
           type="button"
           aria-label="Choose model and effort"
@@ -323,36 +330,38 @@ export function Composer({
           {(model ?? 'model').replace(/^claude-/, '').slice(0, 9)}
           {effort !== 'normal' ? ` · ${effortLabel}` : ''}
         </button>
-        {/* Stop is its own control, not a replacement for send: it is drawn as
-            a square in a ring so it reads as "stop", and it only appears while
-            there is a run to stop. Send keeps its arrow either way. */}
-        {running && (
+        <div className="ml-auto flex items-center gap-1">
+          {/* Stop is its own control, not a replacement for send: it is drawn as
+              a square in a ring so it reads as "stop", and it only appears while
+              there is a run to stop. Send keeps its arrow either way. */}
+          {running && (
+            <button
+              type="button"
+              aria-label="Stop the current run"
+              title="Interrupt the run with whatever is typed"
+              onMouseDown={keepFocus}
+              className={`${icon} text-warn`}
+              onClick={() => void act('interrupt')}
+            >
+              <svg viewBox="0 0 24 24" className="h-6 w-6" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
+                <circle cx="12" cy="12" r="9" />
+                <rect x="9" y="9" width="6" height="6" rx="1" fill="currentColor" stroke="none" />
+              </svg>
+            </button>
+          )}
           <button
             type="button"
-            aria-label="Stop the current run"
-            title="Interrupt the run with whatever is typed"
+            aria-label="Send"
             onMouseDown={keepFocus}
-            className={`${icon} text-warn`}
-            onClick={() => void act('interrupt')}
+            className={`${icon} ${sendable ? 'text-fg' : 'text-fg-faint'}`}
+            onClick={() => void act('send')}
+            disabled={busy || !sendable}
           >
-            <svg viewBox="0 0 24 24" className="h-6 w-6" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
-              <circle cx="12" cy="12" r="9" />
-              <rect x="9" y="9" width="6" height="6" rx="1" fill="currentColor" stroke="none" />
+            <svg viewBox="0 0 24 24" className="h-6 w-6" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+              <path d="M12 19V5M5 12l7-7 7 7" />
             </svg>
           </button>
-        )}
-        <button
-          type="button"
-          aria-label="Send"
-          onMouseDown={keepFocus}
-          className={`${icon} ${sendable ? 'text-fg' : 'text-fg-faint'}`}
-          onClick={() => void act('send')}
-          disabled={busy || !sendable}
-        >
-          <svg viewBox="0 0 24 24" className="h-6 w-6" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-            <path d="M12 19V5M5 12l7-7 7 7" />
-          </svg>
-        </button>
+        </div>
       </div>
     </div>
   );

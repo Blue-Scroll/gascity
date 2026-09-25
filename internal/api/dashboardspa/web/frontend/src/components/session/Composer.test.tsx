@@ -155,3 +155,36 @@ describe('Composer "/" list', () => {
     expect(fetchMock.mock.calls.some(([u]) => String(u).startsWith('/commands'))).toBe(false);
   });
 });
+
+// Casey, 2026-09-25, on a phone: the message box is the full width of the
+// screen, and the attach and model buttons sit on a row below it.
+describe('Composer layout', () => {
+  it('gives the message box a row to itself, with every button on the row below', async () => {
+    serve({ '/upload': () => json({ ok: true }) });
+    render(
+      <Composer
+        sessionId="gc-1"
+        tmuxSession=""
+        running
+        model={null}
+        onSend={vi.fn().mockResolvedValue(undefined)}
+        onInterrupt={vi.fn().mockResolvedValue(undefined)}
+        onNotice={vi.fn()}
+      />,
+    );
+    const attach = await screen.findByRole('button', { name: 'Attach files' });
+    const box = screen.getByPlaceholderText('Message…');
+    const actions = screen.getByRole('group', { name: 'Message actions' });
+    for (const button of [
+      attach,
+      screen.getByRole('button', { name: 'Choose model and effort' }),
+      screen.getByRole('button', { name: 'Stop the current run' }),
+      screen.getByRole('button', { name: 'Send' }),
+    ]) {
+      expect(actions.contains(button)).toBe(true);
+    }
+    expect(box.parentElement!.children).toHaveLength(1);
+    expect(box.className.split(' ')).toContain('w-full');
+    expect(box.compareDocumentPosition(actions) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+});

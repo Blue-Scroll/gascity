@@ -41,6 +41,7 @@ export type PaneKey =
   | 'c-c'
   | 'c-b'
   | 'c-s'
+  | 'c-x'
   | 'c-o'
   | 'c-r'
   | 'c-l'

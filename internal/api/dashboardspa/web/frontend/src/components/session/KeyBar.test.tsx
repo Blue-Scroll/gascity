@@ -25,13 +25,14 @@ function sentKeys(): string[] {
 }
 
 describe('KeyBar', () => {
-  it('sends ctrl+c, ctrl+s and ctrl+b to the pane by their allowlist names', async () => {
+  it('sends ctrl+c, ctrl+s, ctrl+b and ctrl+x to the pane by their allowlist names', async () => {
     fetchMock.mockImplementation(async () => ok());
     render(<KeyBar session="agent__x" readOnly={false} onNotice={vi.fn()} />);
     fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
     fireEvent.click(screen.getByRole('button', { name: 'Stash prompt' }));
     fireEvent.click(screen.getByRole('button', { name: 'Send to background' }));
-    await waitFor(() => expect(sentKeys()).toEqual(['c-c', 'c-s', 'c-b']));
+    fireEvent.click(screen.getByRole('button', { name: 'Stop or delete' }));
+    await waitFor(() => expect(sentKeys()).toEqual(['c-c', 'c-s', 'c-b', 'c-x']));
     const body = JSON.parse(String((fetchMock.mock.calls[0]![1] as RequestInit).body)) as {
       session: string;
     };
@@ -43,6 +44,7 @@ describe('KeyBar', () => {
     expect(screen.getByRole('button', { name: 'Cancel' }).textContent).toBe('^C');
     expect(screen.getByRole('button', { name: 'Stash prompt' }).textContent).toBe('^S');
     expect(screen.getByRole('button', { name: 'Send to background' }).textContent).toBe('^B');
+    expect(screen.getByRole('button', { name: 'Stop or delete' }).textContent).toBe('^X');
   });
 
   it('says what the key did once the pane took it', async () => {

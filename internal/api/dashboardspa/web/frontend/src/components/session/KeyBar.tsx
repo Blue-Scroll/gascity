@@ -16,12 +16,17 @@ import { READ_ONLY_CONTROL_TITLE } from '../../contexts/ReadOnlyContext';
 // the keys go to the same pane either way.
 //
 // The ctrl keys come first, and the bar wraps instead of scrolling sideways. A
-// key pushed off the right edge of a phone is a key nobody finds.
+// key pushed off the right edge of a phone is a key nobody finds. These eleven
+// fit one row on a phone 360px wide or more; a new key can push the last one
+// onto a second row, so measure at 390px after adding one.
 const BAR: ReadonlyArray<{ key: PaneKey; label: string; hint: string }> = [
   { key: 'escape', label: 'Esc', hint: 'Interrupt' },
   { key: 'c-c', label: '^C', hint: 'Cancel' },
   { key: 'c-s', label: '^S', hint: 'Stash prompt' },
   { key: 'c-b', label: '^B', hint: 'Send to background' },
+  // Claude Code stops or deletes the picked item on ^X. It also starts its ctrl+x
+  // chords, so a key sent after it is read as the chord's second key.
+  { key: 'c-x', label: '^X', hint: 'Stop or delete' },
   { key: 'c-o', label: '^O', hint: 'Expand output' },
   { key: 'btab', label: '⇧⇥', hint: 'Cycle permission mode' },
   { key: 'tab', label: '⇥', hint: 'Complete' },
@@ -56,7 +61,7 @@ export function KeyBar({
   );
 
   return (
-    <div className="flex flex-wrap gap-1 px-3 py-1">
+    <div className="flex flex-wrap gap-1 px-2 py-1">
       {BAR.map((b) => (
         <button
           key={b.key}
@@ -66,7 +71,7 @@ export function KeyBar({
           disabled={readOnly}
           aria-label={b.hint}
           title={readOnly ? READ_ONLY_CONTROL_TITLE : b.hint}
-          className="shrink-0 rounded-md bg-surface px-2 py-1.5 font-mono text-body text-fg active:bg-surface-tint disabled:opacity-50"
+          className="shrink-0 rounded-md bg-surface px-1.5 py-1.5 font-mono text-body text-fg active:bg-surface-tint disabled:opacity-50"
         >
           {b.label}
         </button>
