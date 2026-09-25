@@ -5,7 +5,6 @@ import (
 	"errors"
 	"log"
 	"net/http"
-	"strings"
 	"time"
 
 	"github.com/danielgtaylor/huma/v2"
@@ -194,16 +193,9 @@ func (s *Server) agentListResponse(row agentListRow, cfg *config.City, sp runtim
 	var lastActivity *time.Time
 	sessionID := ""
 	if running {
-		si := &sessionInfo{Name: sessionName}
-		if t, err := sp.GetLastActivity(sessionName); err == nil && !t.IsZero() {
-			si.LastActivity = &t
-			lastActivity = &t
-		}
-		si.Attached = sp.IsAttached(sessionName)
-		resp.Session = si
-		if id, err := sp.GetMeta(sessionName, "GC_SESSION_ID"); err == nil {
-			sessionID = strings.TrimSpace(id)
-		}
+		resp.Session = runningSessionInfo(sp, sessionName)
+		lastActivity = resp.Session.LastActivity
+		sessionID = resp.Session.ID
 	}
 
 	resp.ActiveBead = activeBeads.lookup(ea.rig, sessionID, sessionName, ea.qualifiedName)
@@ -317,16 +309,9 @@ func (s *Server) agentByName(name string) (*IndexOutput[agentResponse], error) {
 	var lastActivity *time.Time
 	sessionID := ""
 	if running {
-		si := &sessionInfo{Name: sessionName}
-		if t, err := sp.GetLastActivity(sessionName); err == nil && !t.IsZero() {
-			si.LastActivity = &t
-			lastActivity = &t
-		}
-		si.Attached = sp.IsAttached(sessionName)
-		resp.Session = si
-		if id, err := sp.GetMeta(sessionName, "GC_SESSION_ID"); err == nil {
-			sessionID = strings.TrimSpace(id)
-		}
+		resp.Session = runningSessionInfo(sp, sessionName)
+		lastActivity = resp.Session.LastActivity
+		sessionID = resp.Session.ID
 	}
 
 	resp.ActiveBead = s.findLiveActiveBeadForAssignees(agentCfg.Dir, sessionID, sessionName, name)

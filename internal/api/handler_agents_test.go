@@ -528,6 +528,82 @@ func TestAgentGetActiveBeadUsesSessionIDOwnership(t *testing.T) {
 	}
 }
 
+// The dashboard links an agent row to its live pane with session.id. Before
+// this field it had to wait on the sessions list, which never answered on a
+// busy town, so the link never showed (hq-subxy4). Decode into a wire-shaped
+// struct, not agentResponse, so a renamed JSON tag fails here.
+func TestAgentListAndGetCarrySessionID(t *testing.T) {
+	type wireAgent struct {
+		Name    string `json:"name"`
+		Session *struct {
+			ID   *string `json:"id"`
+			Name string  `json:"name"`
+		} `json:"session"`
+	}
+	get := func(t *testing.T, state *fakeState, path string, out any) {
+		t.Helper()
+		h := newTestCityHandlerWith(t, state, New(state))
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest("GET", cityURL(state, path), nil))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("GET %s: status = %d: %s", path, rec.Code, rec.Body.String())
+		}
+		if err := json.NewDecoder(rec.Body).Decode(out); err != nil {
+			t.Fatalf("GET %s: decode: %v", path, err)
+		}
+	}
+	start := func(t *testing.T, state *fakeState, sessionID string) {
+		t.Helper()
+		if err := state.sp.Start(context.Background(), "myrig--worker", runtime.Config{}); err != nil {
+			t.Fatalf("Start: %v", err)
+		}
+		if sessionID == "" {
+			return
+		}
+		if err := state.sp.SetMeta("myrig--worker", "GC_SESSION_ID", sessionID); err != nil {
+			t.Fatalf("SetMeta(GC_SESSION_ID): %v", err)
+		}
+	}
+
+	t.Run("running session with an id", func(t *testing.T) {
+		state := newFakeState(t)
+		start(t, state, " mc-session \n")
+
+		var list struct {
+			Items []wireAgent `json:"items"`
+		}
+		get(t, state, "/agents", &list)
+		if len(list.Items) != 1 || list.Items[0].Session == nil || list.Items[0].Session.ID == nil {
+			t.Fatalf("list: want one agent with session.id, got %+v", list.Items)
+		}
+		if got := *list.Items[0].Session.ID; got != "mc-session" {
+			t.Errorf("list: session.id = %q, want %q (trimmed GC_SESSION_ID)", got, "mc-session")
+		}
+
+		var one wireAgent
+		get(t, state, "/agent/myrig/worker", &one)
+		if one.Session == nil || one.Session.ID == nil || *one.Session.ID != "mc-session" {
+			t.Errorf("get: session = %+v, want session.id %q", one.Session, "mc-session")
+		}
+	})
+
+	t.Run("running session with no id omits the field", func(t *testing.T) {
+		state := newFakeState(t)
+		start(t, state, "")
+
+		var list struct {
+			Items []wireAgent `json:"items"`
+		}
+		get(t, state, "/agents", &list)
+		if len(list.Items) != 1 || list.Items[0].Session == nil {
+			t.Fatalf("list: want one agent with a session, got %+v", list.Items)
+		}
+		if list.Items[0].Session.ID != nil {
+			t.Errorf("list: session.id = %q, want the field left out", *list.Items[0].Session.ID)
+		}
+	})
+}
+
 func TestAgentListActiveBeadUsesCachedLookup(t *testing.T) {
 	state := newFakeState(t)
 	sessionName := "myrig--worker"

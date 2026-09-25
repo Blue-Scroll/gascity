@@ -12,6 +12,7 @@ import (
 	"github.com/gastownhall/gascity/internal/agentutil"
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
+	"github.com/gastownhall/gascity/internal/runtime"
 	workdirutil "github.com/gastownhall/gascity/internal/workdir"
 )
 
@@ -78,9 +79,29 @@ type agentResponse struct {
 }
 
 type sessionInfo struct {
+	// ID is the session bead id that every /session/{id} route takes.
+	// A client uses it to open the live pane straight from an agent row,
+	// with no sessions list in between. That list can take a minute on a
+	// busy town, and the link waited on it (hq-subxy4). Empty when the
+	// runtime session carries no GC_SESSION_ID.
+	ID           string     `json:"id,omitempty"`
 	Name         string     `json:"name"`
 	LastActivity *time.Time `json:"last_activity,omitempty"`
 	Attached     bool       `json:"attached"`
+}
+
+// runningSessionInfo reads what an agent row shows about its live session.
+// Call it only for a running session: every read is a runtime call.
+func runningSessionInfo(sp runtime.Provider, sessionName string) *sessionInfo {
+	si := &sessionInfo{Name: sessionName}
+	if t, err := sp.GetLastActivity(sessionName); err == nil && !t.IsZero() {
+		si.LastActivity = &t
+	}
+	si.Attached = sp.IsAttached(sessionName)
+	if id, err := sp.GetMeta(sessionName, "GC_SESSION_ID"); err == nil {
+		si.ID = strings.TrimSpace(id)
+	}
+	return si
 }
 
 // expandedAgent holds a single (possibly pool-expanded) agent identity.

@@ -3161,6 +3161,7 @@ export type SessionDrainAckedWithAssignedWorkPayload = {
 
 export type SessionInfo = {
     attached: boolean;
+    id?: string;
     last_activity?: string;
     name: string;
 };
