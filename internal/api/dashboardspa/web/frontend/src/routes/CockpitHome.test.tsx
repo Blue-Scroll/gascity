@@ -597,4 +597,48 @@ describe('<CockpitHomePage>', () => {
     await act(() => vi.advanceTimersByTimeAsync(15_000));
     expect(mocks.cityUsage).toHaveBeenCalledTimes(2);
   });
+
+  it('shows a disabled "Mayor not running" button when no mayor session runs', async () => {
+    render(router(<CockpitHomePage />));
+
+    const button = await screen.findByRole('button', { name: 'Mayor not running' });
+    expect((button as HTMLButtonElement).disabled).toBe(true);
+    expect(screen.queryByRole('link', { name: 'Mayor' })).toBeNull();
+  });
+
+  it('draws the page before a slow sessions list lands, then links the mayor', async () => {
+    const slow = deferred<unknown>();
+    mocks.listSessions.mockReturnValue(slow.promise);
+
+    render(router(<CockpitHomePage />));
+
+    // The page is up while the sessions list is still out.
+    expect(await screen.findByRole('status', { name: 'model calls today: 42' })).toBeTruthy();
+    const waiting = screen.getByRole('button', { name: 'Mayor' });
+    expect(waiting.getAttribute('aria-busy')).toBe('true');
+
+    await act(async () => {
+      slow.resolve({
+        items: [
+          {
+            id: 'hq-eh0ta',
+            session_name: 'gastown__mayor',
+            title: 'gastown.mayor',
+            provider: 'claude',
+            template: 'gastown.mayor',
+            state: 'active',
+            attached: false,
+            running: true,
+            created_at: '2026-09-25T10:00:00Z',
+          },
+        ],
+        total: 1,
+      });
+    });
+
+    const link = await screen.findByRole('link', { name: 'Mayor' });
+    expect(link.getAttribute('href')).toBe(
+      '/session/hq-eh0ta?back=%2F&label=Mayor&tmux=gastown__mayor',
+    );
+  });
 });
