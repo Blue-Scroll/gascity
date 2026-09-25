@@ -68,10 +68,12 @@ jobs:
         run: |
           go test ./internal/workdir/ -run 'TestValidateAncestorWorktreesNotStale|TestValidateNotNestedInSessionWorktree|TestValidateSpawnTarget' -count=1 -v
           go test ./internal/config/ -run 'TestValidateSemanticsNamepool|TestValidateSemanticsSameNamepoolNameInTwoRigsIsFine|TestLoadReportsNamepoolCollisionFromDisk' -count=1 -v
-      - name: Unit tests, the agent and session lists read each bead store once (hq-xujh6g)
+      - name: Unit tests, the agent and session lists read each bead store once and never wait on a slow one (hq-xujh6g, vn-fzant5y)
         # The agent list once ran one store query per agent and took 8 minutes
-        # on a 419-slot town. These pin one read per store per request.
-        run: go test ./internal/api/ -run 'TestAgentList|ActiveBead|TestHandleSessionList|TestSessionList' -count=1 -v
+        # on a 419-slot town. These pin one read per store per request. The
+        # BoundedListBuild and ListBuilds tests pin the 1s answer while the
+        # store is slow, and that a panic in a build cannot stop the supervisor.
+        run: go test ./internal/api/ -run 'TestAgentList|ActiveBead|TestHandleSessionList|TestSessionList|TestBoundedListBuild|TestListBuilds' -count=1 -v
       - name: Unit tests — spawn-storm detector counts resets, not runs (hq-2yztr2)
         run: |
           # The detector is a shell script and needs jq. Say so here rather

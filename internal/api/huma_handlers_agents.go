@@ -15,9 +15,11 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-// humaHandleAgentList is the Huma-typed handler for GET /v0/agents.
-// Overlapping identical requests share one build (shareListBuild). The
-// response cache below only helps a request that arrives after a build has
+// humaHandleAgentList is the Huma-typed handler for GET /v0/agents. It
+// answers through boundedListBuild, so a slow bead store never holds the
+// roster back: the phone page shows who is running at once, and the bead
+// details fill in when the store read lands (vn-fzant5y). The response cache
+// in buildAgentList only helps a request that arrives after a build has
 // finished; on the town a crowd of requests arrived together, missed it, and
 // each built its own list for minutes (hq-subxy4).
 func (s *Server) humaHandleAgentList(ctx context.Context, input *AgentListInput) (*ListOutput[agentResponse], error) {
@@ -25,13 +27,66 @@ func (s *Server) humaHandleAgentList(ctx context.Context, input *AgentListInput)
 	if bp.isBlocking() {
 		waitForChange(ctx, s.state.EventProvider(), bp)
 	}
-	return shareListBuild(&s.listBuildFlight, cacheKeyFor("agents", input), func() (*ListOutput[agentResponse], error) {
-		return s.buildAgentList(input), nil
-	})
+	return boundedListBuild(&s.listBuilds, cacheKeyFor("agents", input),
+		func() (*ListOutput[agentResponse], error) { return s.buildAgentList(input), nil },
+		func() *ListOutput[agentResponse] { return s.agentListFromRuntime(input) })
 }
 
-// buildAgentList does the work of one GET /agents request.
+// buildAgentList does the work of one full GET /agents request. It reads the
+// bead store, so call it through boundedListBuild.
 func (s *Server) buildAgentList(input *AgentListInput) *ListOutput[agentResponse] {
+	index := s.latestIndex()
+	cacheKey := ""
+	if !input.Peek {
+		// Cache key derived from input struct tags — adding a new query
+		// param to AgentListInput automatically participates in the key.
+		cacheKey = cacheKeyFor("agents", input)
+		if body, ok := cachedResponseAs[ListBody[agentResponse]](s, cacheKey, index); ok {
+			return &ListOutput[agentResponse]{
+				Index: index,
+				Body:  body,
+			}
+		}
+	}
+
+	// Computed after the cache-hit return so a cached response never pays
+	// for the store reads.
+	body := s.agentListBody(input, &agentStoreReads{
+		graphWork:   s.graphActiveWorkBySession(),
+		activeBeads: s.newActiveBeadIndex(),
+	})
+	if cacheKey != "" {
+		s.storeResponse(cacheKey, index, body)
+	}
+	return &ListOutput[agentResponse]{
+		Index: index,
+		Body:  body,
+	}
+}
+
+// agentListFromRuntime is GET /agents built from config and the runtime
+// alone. It never reads the bead store, so it is what boundedListBuild
+// answers while the store is slow. It is never put in the response cache: it
+// is missing details a full list has.
+func (s *Server) agentListFromRuntime(input *AgentListInput) *ListOutput[agentResponse] {
+	return &ListOutput[agentResponse]{
+		Index: s.latestIndex(),
+		Body:  s.agentListBody(input, nil),
+	}
+}
+
+// agentStoreReads is what the agent rows read from the bead store: active
+// graph-resident work by session name (nil on a single-store city), and each
+// rig's in-progress beads. A nil *agentStoreReads builds the rows without the
+// store; see agentListFromRuntime.
+type agentStoreReads struct {
+	graphWork   map[string]graphAgentWork
+	activeBeads *activeBeadIndex
+}
+
+// agentListBody builds the GET /agents rows. reads is nil for the store-free
+// list.
+func (s *Server) agentListBody(input *AgentListInput, reads *agentStoreReads) ListBody[agentResponse] {
 	cfg := s.state.Config()
 	sp := s.state.SessionProvider()
 	cityName := s.state.CityName()
@@ -46,25 +101,10 @@ func (s *Server) buildAgentList(input *AgentListInput) *ListOutput[agentResponse
 		rawCfg = rcp.RawConfig()
 	}
 
-	index := s.latestIndex()
-	cacheKey := ""
-	if !wantPeek {
-		// Cache key derived from input struct tags — adding a new query
-		// param to AgentListInput automatically participates in the key.
-		cacheKey = cacheKeyFor("agents", input)
-		if body, ok := cachedResponseAs[ListBody[agentResponse]](s, cacheKey, index); ok {
-			return &ListOutput[agentResponse]{
-				Index: index,
-				Body:  body,
-			}
-		}
+	var graphWork map[string]graphAgentWork
+	if reads != nil {
+		graphWork = reads.graphWork
 	}
-
-	// Active graph-resident work, indexed once per request by agent session
-	// name (nil on a single-store city). Computed after the cache-hit return
-	// so a cached response never pays for the graph-store list.
-	graphWork := s.graphActiveWorkBySession()
-	activeBeads := s.newActiveBeadIndex()
 	runningSessions := &runningSessionsOnce{sp: sp}
 
 	// Pass 1, in order and cheap: expand pools and apply the filters.
@@ -115,7 +155,7 @@ func (s *Server) buildAgentList(input *AgentListInput) *ListOutput[agentResponse
 	group.SetLimit(agentListRowConcurrency)
 	for i := range rows {
 		group.Go(func() error {
-			agents[i] = s.agentListResponse(rows[i], cfg, sp, activeBeads, wantPeek)
+			agents[i] = s.agentListResponse(rows[i], cfg, sp, reads, wantPeek)
 			return nil
 		})
 	}
@@ -124,16 +164,7 @@ func (s *Server) buildAgentList(input *AgentListInput) *ListOutput[agentResponse
 	if agents == nil {
 		agents = []agentResponse{}
 	}
-
-	body := ListBody[agentResponse]{Items: agents, Total: len(agents)}
-	if cacheKey != "" {
-		s.storeResponse(cacheKey, index, body)
-	}
-
-	return &ListOutput[agentResponse]{
-		Index: index,
-		Body:  body,
-	}
+	return ListBody[agentResponse]{Items: agents, Total: len(agents)}
 }
 
 // agentListRowConcurrency bounds how many agent rows build at once. A running
@@ -155,8 +186,9 @@ type agentListRow struct {
 }
 
 // agentListResponse builds one row of GET /v0/agents. It runs on many
-// goroutines at once, so it must only read shared state.
-func (s *Server) agentListResponse(row agentListRow, cfg *config.City, sp runtime.Provider, activeBeads *activeBeadIndex, wantPeek bool) agentResponse {
+// goroutines at once, so it must only read shared state. With a nil reads it
+// makes no bead store call at all.
+func (s *Server) agentListResponse(row agentListRow, cfg *config.City, sp runtime.Provider, reads *agentStoreReads, wantPeek bool) agentResponse {
 	ea, sessionName, running := row.ea, row.sessionName, row.running
 	effectiveRunning := running || row.hasGraphWork
 
@@ -208,7 +240,9 @@ func (s *Server) agentListResponse(row agentListRow, cfg *config.City, sp runtim
 		sessionID = resp.Session.ID
 	}
 
-	resp.ActiveBead = activeBeads.lookup(ea.rig, sessionID, sessionName, ea.qualifiedName)
+	if reads != nil {
+		resp.ActiveBead = reads.activeBeads.lookup(ea.rig, sessionID, sessionName, ea.qualifiedName)
+	}
 	// A relocated-graph wisp names its assignee after the session, not
 	// the work store, so the work-store lookup above misses it. Fall
 	// back to the graph bead and use its timestamp as the activity
@@ -224,6 +258,12 @@ func (s *Server) agentListResponse(row agentListRow, cfg *config.City, sp runtim
 	}
 	quarantined := s.state.IsQuarantined(sessionName)
 	resp.State = computeAgentState(suspended, quarantined, effectiveRunning, resp.ActiveBead, lastActivity)
+	if reads == nil && resp.State == "idle" {
+		// computeAgentState reads "no active bead" as idle. Without a store
+		// read the bead is unknown, not absent, so a live agent says
+		// "running": true, and it makes no claim about the agent's work.
+		resp.State = "running"
+	}
 
 	if wantPeek && running {
 		if output, err := sp.Peek(sessionName, 5); err == nil {
@@ -231,7 +271,9 @@ func (s *Server) agentListResponse(row agentListRow, cfg *config.City, sp runtim
 		}
 	}
 
-	if running && provider == "claude" && canAttributeSession(row.agent, ea.qualifiedName, cfg, s.state.CityPath()) {
+	// enrichSessionMeta resolves the session id through the bead store, so
+	// the store-free list leaves model and context for the full list.
+	if reads != nil && running && provider == "claude" && canAttributeSession(row.agent, ea.qualifiedName, cfg, s.state.CityPath()) {
 		s.enrichSessionMeta(&resp, row.agent, ea.qualifiedName)
 	}
 	return resp
