@@ -1,0 +1,1 @@
+import{r}from"./index-D6x0sM-j.js";function f(t,s,e,o){const n=new URLSearchParams;s&&n.set("back",s),e&&n.set("label",e),o&&n.set("tmux",o);const i=n.toString();return`/session/${encodeURIComponent(t)}${i?`?${i}`:""}`}const c=3e3;function a(t,s,e){r.useEffect(()=>{if(!t)return;const o=setTimeout(()=>{e()},c);return()=>clearTimeout(o)},[t,s,e])}export{f as s,a as u};
