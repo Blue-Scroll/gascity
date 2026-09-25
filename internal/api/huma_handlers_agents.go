@@ -12,6 +12,8 @@ import (
 	"github.com/danielgtaylor/huma/v2/sse"
 	"github.com/gastownhall/gascity/internal/api/apierr"
 	"github.com/gastownhall/gascity/internal/config"
+	"github.com/gastownhall/gascity/internal/runtime"
+	"golang.org/x/sync/errgroup"
 )
 
 // humaHandleAgentList is the Huma-typed handler for GET /v0/agents.
@@ -53,8 +55,12 @@ func (s *Server) humaHandleAgentList(ctx context.Context, input *AgentListInput)
 	// name (nil on a single-store city). Computed after the cache-hit return
 	// so a cached response never pays for the graph-store list.
 	graphWork := s.graphActiveWorkBySession()
+	activeBeads := s.newActiveBeadIndex()
 
-	var agents []agentResponse
+	// Pass 1, in order and cheap: expand pools and apply the filters.
+	// IsRunning reads the provider's cached session list, so no row here
+	// costs a runtime call.
+	var rows []agentListRow
 	for _, a := range cfg.Agents {
 		// Provenance is a property of the declared agent, shared by every
 		// pool-expanded instance, so compute it once per source agent.
@@ -83,86 +89,28 @@ func (s *Server) humaHandleAgentList(ctx context.Context, input *AgentListInput)
 			if input.Running == "false" && effectiveRunning {
 				continue
 			}
-
-			suspended := ea.suspended
-			if v, err := sp.GetMeta(sessionName, "suspended"); err == nil && v == "true" {
-				suspended = true
-			}
-
-			provider, displayName := resolveProviderInfo(ea.provider, cfg)
-
-			available := true
-			var unavailableReason string
-			if suspended {
-				available = false
-				unavailableReason = "agent is suspended"
-			} else if provider != "" {
-				if !s.cachedLookPath(providerPathCheck(provider, cfg)) {
-					available = false
-					unavailableReason = "provider '" + provider + "' not found in PATH"
-				}
-			}
-
-			resp := agentResponse{
-				Name:              ea.qualifiedName,
-				Description:       ea.description,
-				Running:           effectiveRunning,
-				Suspended:         suspended,
-				Rig:               ea.rig,
-				Pool:              ea.pool,
-				Provider:          provider,
-				DisplayName:       displayName,
-				Available:         available,
-				UnavailableReason: unavailableReason,
-				PackDerived:       packDerived,
-				Pack:              pack,
-			}
-
-			var lastActivity *time.Time
-			sessionID := ""
-			if running {
-				si := &sessionInfo{Name: sessionName}
-				if t, err := sp.GetLastActivity(sessionName); err == nil && !t.IsZero() {
-					si.LastActivity = &t
-					lastActivity = &t
-				}
-				si.Attached = sp.IsAttached(sessionName)
-				resp.Session = si
-				if id, err := sp.GetMeta(sessionName, "GC_SESSION_ID"); err == nil {
-					sessionID = strings.TrimSpace(id)
-				}
-			}
-
-			resp.ActiveBead = s.findActiveBeadForAssignees(ea.rig, sessionID, sessionName, ea.qualifiedName)
-			// A relocated-graph wisp names its assignee after the session, not
-			// the work store, so the work-store lookup above misses it. Fall
-			// back to the graph bead and use its timestamp as the activity
-			// signal so the state reads "working", not "stopped".
-			if hasGraphWork {
-				if resp.ActiveBead == "" {
-					resp.ActiveBead = gw.beadID
-				}
-				if lastActivity == nil {
-					la := gw.lastActivity
-					lastActivity = &la
-				}
-			}
-			quarantined := s.state.IsQuarantined(sessionName)
-			resp.State = computeAgentState(suspended, quarantined, effectiveRunning, resp.ActiveBead, lastActivity)
-
-			if wantPeek && running {
-				if output, err := sp.Peek(sessionName, 5); err == nil {
-					resp.LastOutput = output
-				}
-			}
-
-			if running && provider == "claude" && canAttributeSession(a, ea.qualifiedName, cfg, s.state.CityPath()) {
-				s.enrichSessionMeta(&resp, a, ea.qualifiedName)
-			}
-
-			agents = append(agents, resp)
+			rows = append(rows, agentListRow{
+				agent: a, ea: ea, sessionName: sessionName,
+				running: running, graphWork: gw, hasGraphWork: hasGraphWork,
+				pack: pack, packDerived: packDerived,
+			})
 		}
 	}
+
+	// Pass 2, in parallel: every row makes runtime calls (tmux on this
+	// town, about 20ms each under load), and a town has hundreds of pool
+	// slots. Run in series, that alone was several seconds. Each goroutine
+	// fills only its own slot, so the output order stays the config order.
+	agents := make([]agentResponse, len(rows))
+	group := new(errgroup.Group)
+	group.SetLimit(agentListRowConcurrency)
+	for i := range rows {
+		group.Go(func() error {
+			agents[i] = s.agentListResponse(rows[i], cfg, sp, activeBeads, wantPeek)
+			return nil
+		})
+	}
+	_ = group.Wait()
 
 	if agents == nil {
 		agents = []agentResponse{}
@@ -177,6 +125,108 @@ func (s *Server) humaHandleAgentList(ctx context.Context, input *AgentListInput)
 		Index: index,
 		Body:  body,
 	}, nil
+}
+
+// agentListRowConcurrency bounds how many agent rows build at once. Each row
+// makes a few runtime calls (tmux execs on this town), so a small pool cuts
+// the wall time without flooding the provider.
+const agentListRowConcurrency = 16
+
+// agentListRow is one agent that passed the list filters, with what pass 1
+// already learned about it.
+type agentListRow struct {
+	agent        config.Agent
+	ea           expandedAgent
+	sessionName  string
+	running      bool
+	graphWork    graphAgentWork
+	hasGraphWork bool
+	pack         string
+	packDerived  bool
+}
+
+// agentListResponse builds one row of GET /v0/agents. It runs on many
+// goroutines at once, so it must only read shared state.
+func (s *Server) agentListResponse(row agentListRow, cfg *config.City, sp runtime.Provider, activeBeads *activeBeadIndex, wantPeek bool) agentResponse {
+	ea, sessionName, running := row.ea, row.sessionName, row.running
+	effectiveRunning := running || row.hasGraphWork
+
+	suspended := ea.suspended
+	if v, err := sp.GetMeta(sessionName, "suspended"); err == nil && v == "true" {
+		suspended = true
+	}
+
+	provider, displayName := resolveProviderInfo(ea.provider, cfg)
+
+	available := true
+	var unavailableReason string
+	if suspended {
+		available = false
+		unavailableReason = "agent is suspended"
+	} else if provider != "" {
+		if !s.cachedLookPath(providerPathCheck(provider, cfg)) {
+			available = false
+			unavailableReason = "provider '" + provider + "' not found in PATH"
+		}
+	}
+
+	resp := agentResponse{
+		Name:              ea.qualifiedName,
+		Description:       ea.description,
+		Running:           effectiveRunning,
+		Suspended:         suspended,
+		Rig:               ea.rig,
+		Pool:              ea.pool,
+		Provider:          provider,
+		DisplayName:       displayName,
+		Available:         available,
+		UnavailableReason: unavailableReason,
+		PackDerived:       row.packDerived,
+		Pack:              row.pack,
+	}
+
+	var lastActivity *time.Time
+	sessionID := ""
+	if running {
+		si := &sessionInfo{Name: sessionName}
+		if t, err := sp.GetLastActivity(sessionName); err == nil && !t.IsZero() {
+			si.LastActivity = &t
+			lastActivity = &t
+		}
+		si.Attached = sp.IsAttached(sessionName)
+		resp.Session = si
+		if id, err := sp.GetMeta(sessionName, "GC_SESSION_ID"); err == nil {
+			sessionID = strings.TrimSpace(id)
+		}
+	}
+
+	resp.ActiveBead = activeBeads.lookup(ea.rig, sessionID, sessionName, ea.qualifiedName)
+	// A relocated-graph wisp names its assignee after the session, not
+	// the work store, so the work-store lookup above misses it. Fall
+	// back to the graph bead and use its timestamp as the activity
+	// signal so the state reads "working", not "stopped".
+	if row.hasGraphWork {
+		if resp.ActiveBead == "" {
+			resp.ActiveBead = row.graphWork.beadID
+		}
+		if lastActivity == nil {
+			la := row.graphWork.lastActivity
+			lastActivity = &la
+		}
+	}
+	quarantined := s.state.IsQuarantined(sessionName)
+	resp.State = computeAgentState(suspended, quarantined, effectiveRunning, resp.ActiveBead, lastActivity)
+
+	if wantPeek && running {
+		if output, err := sp.Peek(sessionName, 5); err == nil {
+			resp.LastOutput = output
+		}
+	}
+
+	if running && provider == "claude" && canAttributeSession(row.agent, ea.qualifiedName, cfg, s.state.CityPath()) {
+		s.enrichSessionMeta(&resp, row.agent, ea.qualifiedName)
+	}
+	return resp
 }
 
 // humaHandleAgent is the Huma-typed handler for

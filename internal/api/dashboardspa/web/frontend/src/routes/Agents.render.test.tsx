@@ -36,6 +36,8 @@ const fetchUrls = () => fetchCalls.map((call) => call.url);
 interface StubFetchOptions {
   agentsPayload?: unknown;
   agentsStatus?: number;
+  // The agents request never answers, like a slow supervisor on a big town.
+  agentsNeverAnswer?: boolean;
 }
 
 // Minimal fetch stub that mimics the surface the AgentsPage hits: dashboard
@@ -53,6 +55,7 @@ function stubFetch(options: StubFetchOptions = {}) {
         throw new Error('old dashboard agents roster route should not be called');
       }
       if (url === '/v0/city/test-city/agents' && method === 'GET') {
+        if (options.agentsNeverAnswer) return new Promise<Response>(() => {});
         return jsonResponse(
           options.agentsPayload ?? {
             items: [
@@ -294,6 +297,39 @@ describe('AgentsPage (post-ay6 regressions)', () => {
     fireEvent.click(runningCheckbox);
     const sleepingLink = await screen.findByRole('link', { name: /polecat-2/i });
     expect(sleepingLink.textContent).toBe('gascity-packs · polecat-2');
+  });
+
+  it('says it is loading, not that the town is empty, while the first agents answer is on its way', async () => {
+    vi.unstubAllGlobals();
+    stubFetch({ agentsNeverAnswer: true });
+
+    const { container } = render(
+      <MemoryRouter future={{ v7_relativeSplatPath: true, v7_startTransition: true }}>
+        <NowProvider intervalMs={1_000_000}>
+          <AgentsPage />
+        </NowProvider>
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => expect(fetchUrls()).toContain('/v0/city/test-city/agents'));
+    expect(container.textContent).toContain('Loading agents.');
+    expect(container.textContent).not.toContain('No agents configured.');
+  });
+
+  it('says the town has no agents only once an empty answer has arrived', async () => {
+    vi.unstubAllGlobals();
+    stubFetch({ agentsPayload: { items: [], total: 0 } });
+
+    const { container } = render(
+      <MemoryRouter future={{ v7_relativeSplatPath: true, v7_startTransition: true }}>
+        <NowProvider intervalMs={1_000_000}>
+          <AgentsPage />
+        </NowProvider>
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => expect(container.textContent).toContain('No agents configured.'));
+    expect(container.textContent).not.toContain('Loading agents.');
   });
 
   it('renders a genuine supervisor agents failure as operator-safe unavailable copy', async () => {

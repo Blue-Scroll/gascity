@@ -261,12 +261,19 @@ export function AgentsPage() {
       attentionDataProps(resourceAttentionSeverity(attention, 'agents', agent.name)),
     [attention],
   );
+  // Three different reasons the table can be empty, and each one says so.
+  // A slow first answer must never read as an empty town: on a big town the
+  // first fetch has taken minutes, and "No agents configured." sat on screen
+  // the whole time (hq-xujh6g).
   const rosterUnavailable = error !== null && rows.length === 0;
+  const rosterLoading = !rosterUnavailable && data === undefined;
   const emptyMessage = rosterUnavailable
     ? 'Agent roster unavailable.'
-    : rows.length === 0
-      ? 'No agents configured.'
-      : 'No agents match the current search or filter.';
+    : rosterLoading
+      ? ROSTER_LOADING_MESSAGE
+      : rows.length === 0
+        ? 'No agents configured.'
+        : 'No agents match the current search or filter.';
 
   const columns = useMemo<ReadonlyArray<TableColumn<SupervisorAgent>>>(
     () => [
@@ -476,14 +483,28 @@ export function AgentsPage() {
         className: 'w-80',
       },
     ],
-    [handlePendingResponse, now, pendingByAgent, readOnly, responding, sessionsById, terminalServed],
+    [
+      handlePendingResponse,
+      now,
+      pendingByAgent,
+      readOnly,
+      responding,
+      sessionsById,
+      terminalServed,
+    ],
   );
 
   return (
     <section>
       <PageHeader
         title="Agents"
-        synopsis={rosterUnavailable ? 'Agent roster unavailable.' : synopsis}
+        synopsis={
+          rosterUnavailable
+            ? 'Agent roster unavailable.'
+            : rosterLoading
+              ? ROSTER_LOADING_MESSAGE
+              : synopsis
+        }
         meta={
           <>
             <SseIndicator state={sseState} />
@@ -727,6 +748,9 @@ function stateBucket(agent: SupervisorAgent): SynopsisBucket {
       return 'idle';
   }
 }
+
+// Shown in the header and the table until the first agents answer arrives.
+export const ROSTER_LOADING_MESSAGE = 'Loading agents.';
 
 export function buildAgentSynopsis(rows: ReadonlyArray<SupervisorAgent>): string {
   if (rows.length === 0) return 'No agents configured.';

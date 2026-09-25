@@ -1,0 +1,1 @@
+import{r as n}from"./index-DsYFOoit.js";const u=new Map;function f(t,r){let e=u.get(t);return e===void 0&&(e=r().catch(()=>!1),u.set(t,e)),e}function i(t,r){const[e,a]=n.useState(null);return n.useEffect(()=>{let s=!0;return f(t,r).then(c=>{s&&a(c)}),()=>{s=!1}},[t,r]),e}export{i as u};

@@ -4,11 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -33,14 +35,19 @@ func (p partialAgentSessionLister) ListRunning(prefix string) ([]string, error) 
 	return filtered, p.err
 }
 
+// activeBeadQueryStore records every in_progress List, so a test can count
+// how many store reads the active-bead lookup cost.
 type activeBeadQueryStore struct {
 	beads.Store
+	mu      sync.Mutex
 	queries []beads.ListQuery
 }
 
 func (s *activeBeadQueryStore) List(query beads.ListQuery) ([]beads.Bead, error) {
-	if query.Assignee != "" && query.Status == "in_progress" {
+	if query.Status == "in_progress" {
+		s.mu.Lock()
 		s.queries = append(s.queries, query)
+		s.mu.Unlock()
 	}
 	return s.Store.List(query)
 }
@@ -571,6 +578,81 @@ func TestAgentListActiveBeadUsesCachedLookup(t *testing.T) {
 	}
 	if store.queries[0].Live {
 		t.Fatal("agent list active-bead lookup should stay cached")
+	}
+}
+
+// TestAgentListReadsEachStoreOnceForActiveBeads pins the fix for hq-xujh6g.
+// The list used to run one store query per assignee per agent, and a town
+// with 419 pool slots took 8 minutes to answer. Now a whole list costs one
+// in_progress read per store, however many agents there are, and each agent
+// still gets the same bead the old newest-first Limit 1 query returned.
+func TestAgentListReadsEachStoreOnceForActiveBeads(t *testing.T) {
+	state := newFakeState(t)
+	state.cfg.Agents = []config.Agent{{
+		Name:              "polecat",
+		Dir:               "myrig",
+		MinActiveSessions: intPtr(1), MaxActiveSessions: intPtr(40), ScaleCheck: "echo 40",
+	}}
+	store := &activeBeadQueryStore{Store: beads.NewMemStore()}
+	state.stores["myrig"] = store
+
+	status := "in_progress"
+	holdBead := func(assignee, title string) {
+		t.Helper()
+		b, err := store.Store.Create(beads.Bead{Title: title})
+		if err != nil {
+			t.Fatalf("Create(%s): %v", title, err)
+		}
+		if err := store.Store.Update(b.ID, beads.UpdateOpts{Status: &status, Assignee: &assignee}); err != nil {
+			t.Fatalf("Update(%s): %v", title, err)
+		}
+	}
+	// polecat-2 holds two beads, so the pick between them matters.
+	// polecat-7 is not running and still reports the bead it holds.
+	holdBead("myrig/polecat-2", "older work")
+	holdBead("myrig/polecat-2", "newer work")
+	holdBead("myrig/polecat-7", "stranded work")
+	holdBead("somebody-else", "not an agent")
+
+	want := map[string]string{}
+	for _, name := range []string{"myrig/polecat-2", "myrig/polecat-7"} {
+		got, err := store.Store.List(beads.ListQuery{
+			Assignee: name, Status: "in_progress", Limit: 1, Sort: beads.SortCreatedDesc,
+		})
+		if err != nil || len(got) != 1 {
+			t.Fatalf("old-style lookup for %s = %v, %v", name, got, err)
+		}
+		want[name] = got[0].ID
+	}
+
+	srv := New(state)
+	h := newTestCityHandlerWith(t, state, srv)
+	req := httptest.NewRequest("GET", cityURL(state, "/agents"), nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	var resp struct {
+		Items []agentResponse `json:"items"`
+		Total int             `json:"total"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.Total != 40 {
+		t.Fatalf("Total = %d, want 40", resp.Total)
+	}
+	for i, item := range resp.Items {
+		if wantName := fmt.Sprintf("myrig/polecat-%d", i+1); item.Name != wantName {
+			t.Fatalf("Items[%d].Name = %q, want %q (rows must keep config order)", i, item.Name, wantName)
+		}
+		if got := item.ActiveBead; got != want[item.Name] {
+			t.Errorf("%s active_bead = %q, want %q", item.Name, got, want[item.Name])
+		}
+	}
+	if len(store.queries) != 1 {
+		t.Fatalf("in_progress store reads = %d, want 1 for the whole list", len(store.queries))
 	}
 }
 
