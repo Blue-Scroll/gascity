@@ -967,8 +967,9 @@ func workQueryHasReadyWork(output string) bool {
 
 // filterUnreadyHookCandidates strips beads from work_query output that fail
 // bd ready semantics: future defer_until, any open blocking dep in the row's
-// blocked_by array, the row's own is_blocked / status=="blocked" marker, or a
-// canonical dispatch hold label. The work_query is expected to gate these, but
+// blocked_by array, the row's own is_blocked / status=="blocked" marker, a
+// canonical dispatch hold label, or a graph.v2 workflow root (a latch, never
+// work). The work_query is expected to gate most of these, but
 // defensive filtering here prevents a single broken query from cascading into
 // agent action on a bead it cannot progress.
 // Pure function over JSON; takes time.Time so tests stay deterministic.
@@ -1004,6 +1005,9 @@ func filterUnreadyHookCandidates(output string, now time.Time) string {
 			continue
 		}
 		if isHeldHookCandidate(obj) {
+			continue
+		}
+		if isGraphWorkflowRootHookCandidate(obj) {
 			continue
 		}
 		filtered = append(filtered, obj)
@@ -1112,6 +1116,28 @@ func isHeldHookCandidate(item map[string]any) bool {
 		}
 	}
 	return false
+}
+
+// isGraphWorkflowRootHookCandidate reports whether item is the root of a
+// graph.v2 workflow. The root is a latch, and its steps are the work (see
+// isGraphWorkflowRootContract). The generated query cannot exclude it, because
+// bd has no flag to exclude a metadata value, so the hook drops it here, in the
+// one seam every hook path runs through. demandRowServable refuses the same
+// row, so the controller never spawns a seat for it either.
+//
+// This covers an already-held root too: a session that claimed one before this
+// filter existed is not served it again as its existing assignment, and moves
+// on to real work instead of sitting on the latch.
+func isGraphWorkflowRootHookCandidate(item map[string]any) bool {
+	metadata, ok := item["metadata"].(map[string]any)
+	if !ok {
+		return false
+	}
+	contract, ok := metadata[beadmeta.FormulaContractMetadataKey].(string)
+	if !ok {
+		return false
+	}
+	return isGraphWorkflowRootContract(contract)
 }
 
 // isClosedHookCandidate reports whether item is a closed bead. Defense-in-depth

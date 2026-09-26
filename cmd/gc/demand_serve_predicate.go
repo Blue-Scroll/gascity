@@ -23,6 +23,11 @@ package main
 // Each one spawns a seat, the seat's hook reads empty, it drains, and the
 // controller counts the row again on the next tick. Forever.
 //
+// A fourth class came later, from the other direction: a graph.v2 workflow
+// ROOT was counted AND served, so every plan run spawned one extra seat to hold
+// a latch bead with no work behind it. Both sides now refuse it; see
+// isGraphWorkflowRootContract.
+//
 // This file is the one predicate both sides now answer with. The serving rules
 // come from internal/config — the same value the shell flags are rendered from —
 // so a flag the query gains cannot silently fail to reach the controller. The
@@ -63,10 +68,39 @@ func demandServableForTemplates(cfg *config.City, b beads.Bead, templates map[st
 	return "", false
 }
 
+// isGraphWorkflowRootContract reports whether a gc.formula_contract value marks
+// the root of a graph.v2 workflow. Only the compiler's root step carries that
+// key (internal/formula/compile.go); the steps under it never do.
+//
+// Such a root is a latch, not work. Its steps are the work: each one is its own
+// routed, Ready-visible task, the first of them wakes the pool, and the
+// workflow-finalize step closes the root. A worker that claims the root holds a
+// bead it may never close, and the step claimer has already been handed every
+// step in the continuation group, so the root claimer is a whole session with
+// nothing to do (vn-rfn0d9g: one plan run cost five extra sessions this way).
+//
+// So neither side serves it: the controller does not count it as demand
+// (demandRowServable) and the hook never hands it out
+// (isGraphWorkflowRootHookCandidate). The root still carries gc.routed_to,
+// because recovery and the API read the route from it.
+//
+// This is narrower than isCanonicalWorkflowRoot on purpose. A bead marked only
+// gc.kind=workflow can be a root-only wisp whose root IS the work, so the
+// graph.v2 contract is the one mark that proves "the steps are the work".
+func isGraphWorkflowRootContract(contract string) bool {
+	return strings.EqualFold(strings.TrimSpace(contract), beadmeta.FormulaContractGraphV2)
+}
+
 // demandRowServable applies the route-independent half of the Tier-3 serving
 // rules to one row: the exclusions a worker's query enforces regardless of which
 // template it is asking for.
 func demandRowServable(b beads.Bead) bool {
+	// ROOT: the hook drops a graph.v2 root before it serves anything
+	// (isGraphWorkflowRootHookCandidate), so counting one would spawn a seat
+	// that reads empty and drains.
+	if isGraphWorkflowRootContract(b.Metadata[beadmeta.FormulaContractMetadataKey]) {
+		return false
+	}
 	rules := config.PoolDemandServeRulesForQuery()
 	if rules.RequireUnassigned && strings.TrimSpace(b.Assignee) != "" {
 		return false

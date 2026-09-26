@@ -6554,6 +6554,62 @@ esac
 	}
 }
 
+// TestEffectiveOnBootLeavesGraphWorkflowRootsInProgress is the vn-rfn0d9g
+// regression. A graph.v2 root is in_progress and ownerless for its whole run, so
+// it matched every recovery read. Reopening it made the latch look like ready
+// work, and each controller restart spawned a session to claim it. The step
+// beside it is real work and must still be reopened.
+func TestEffectiveOnBootLeavesGraphWorkflowRootsInProgress(t *testing.T) {
+	a := Agent{
+		Name:              "dog-1",
+		Dir:               "hello-world",
+		MinActiveSessions: ptrInt(0), MaxActiveSessions: ptrInt(5),
+		PoolName: "hello-world/dog",
+	}
+
+	log := runLifecycleHookCommand(t, a.EffectiveOnBoot(), `#!/bin/sh
+set -eu
+case "$1" in
+  list)
+    printf '%s\n' "$*" >> "$BD_LOG"
+    case "$*" in
+      *"--metadata-field gc.run_target=hello-world/dog"*) printf '[{"id":"ga-legacy-root","metadata":{"gc.kind":"workflow","gc.formula_contract":"graph.v2","gc.run_target":"hello-world/dog"}}]' ;;
+      *"--metadata-field gc.routed_to=hello-world/dog"*) printf '[{"id":"ga-root","metadata":{"gc.kind":"workflow","gc.formula_contract":"graph.v2","gc.routed_to":"hello-world/dog"}},{"id":"ga-step","metadata":{"gc.routed_to":"hello-world/dog"}}]' ;;
+      *) printf '[]' ;;
+    esac
+    ;;
+  query)
+    printf '%s\n' "$*" >> "$BD_LOG"
+    printf '[{"id":"ga-wisp-root","assignee":"","metadata":{"gc.kind":"workflow","gc.formula_contract":"graph.v2","gc.routed_to":"hello-world/dog"}}]'
+    ;;
+  update)
+    printf '%s\n' "$*" >> "$BD_LOG"
+    ;;
+  *)
+    exit 1
+    ;;
+esac
+`)
+	if !strings.Contains(log, "update ga-step --status open") {
+		t.Fatalf("hook log = %q, want the ownerless step reopened (the root filter must not swallow real work)", log)
+	}
+	// Each root below is absent from the updates only if its read really ran.
+	for _, read := range []string{
+		"list --metadata-field gc.routed_to=hello-world/dog",
+		"list --metadata-field gc.run_target=hello-world/dog",
+		"query --json ephemeral=true AND status=in_progress",
+	} {
+		if !strings.Contains(log, read) {
+			t.Fatalf("hook log = %q, want the recovery read %q to have run", log, read)
+		}
+	}
+	for _, root := range []string{"ga-root", "ga-legacy-root", "ga-wisp-root"} {
+		if strings.Contains(log, "update "+root+" ") {
+			t.Fatalf("hook log = %q, want graph.v2 root %s left in_progress, not reopened as pool work", log, root)
+		}
+	}
+}
+
 func TestEffectiveOnBootForBeadsBD105ReopensOwnerlessEphemeralRoutedWork(t *testing.T) {
 	a := Agent{
 		Name:              "dog-1",
