@@ -69,6 +69,27 @@ var hookClaimMutationTimeout = 10 * time.Second
 // GC_HOOK_CLAIM_WINDOW (resolveHookClaimWindow) still overrides this default.
 var hookClaimWindowDefault = hookWorkQueryTimeout + hookClaimMutationTimeout
 
+// hookClaimLiveParentWindowFactor stretches the claim window while the process
+// that started `gc hook --claim` is still its parent.
+//
+// The base window covers ONE work query. A claim runs more than one: with N
+// federated stores, one pass reads up to N+1 times (hookClaimReadsPerTick), and
+// a failed read is retried up to hookClaimQueryRetryAttempts more times. Each
+// read may honestly take the full hookWorkQueryTimeout. So under store load the
+// read alone can spend the whole base window, and the fence refused every claim
+// it had just found, with the parent still alive and waiting (vn-buvmt78: 3m1s
+// and 2m41s refusals against a 2m40s window, from a turn with a 10 minute tool
+// timeout). The fence's own retirement signal already names that shape as a
+// false refusal: claim_window_expired with parent_alive=true.
+//
+// A live parent is not proof the turn still listens: a provider host can stop
+// reading a slow command while it stays alive (ga-fylee, the codex exec host).
+// So a live parent buys MORE time, never unlimited time. 4x the default window
+// is 10m40s, just past the longest tool timeout a Claude Code turn can set (10
+// minutes). A parent-less claim (orphaned, or reparented to a subreaper) keeps
+// the base window.
+const hookClaimLiveParentWindowFactor = 4
+
 // hookClaimNonTurnEnvMarkers are the environment markers that prove a
 // `gc hook --claim` process is a provider CALLBACK rather than an agent turn.
 // gc sets all three itself: GC_HOOK_CALLBACK_LANE on every child of the managed
@@ -116,8 +137,8 @@ func resolveHookClaimWindow() time.Duration {
 
 // hookClaimWindowExpiry is the observation an expired claim window reports: how
 // old the invocation was, and whether its parent is still alive. A dead parent
-// (reparented to init) is the process-table signature of the orphaned tool call
-// this fence exists to stop.
+// (reparented to init or to a subreaper) is the process-table signature of the
+// orphaned tool call this fence exists to stop.
 type hookClaimWindowExpiry struct {
 	BeadID        string
 	InvocationAge time.Duration
@@ -183,12 +204,21 @@ type hookClaimOps struct {
 	Now                    func() time.Time
 	// InvokedAt is when this `gc hook --claim` invocation began, and ClaimWindow
 	// is how long after it a claim mutation may still run. Together they are the
-	// turn-binding fence: a claim reaching a CAS past InvokedAt+ClaimWindow has
-	// outlived the turn that asked for it. applyDefaults fills both, once per
-	// invocation, so every federated leg shares ONE window rather than getting a
-	// fresh one each time the loop copies the ops.
+	// turn-binding fence: a claim reaching a CAS past InvokedAt plus the window
+	// has outlived the turn that asked for it. ClaimWindow is the BASE window; a
+	// live parent stretches it (effectiveClaimWindow). applyDefaults fills both,
+	// once per invocation, so every federated leg shares ONE window rather than
+	// getting a fresh one each time the loop copies the ops.
 	InvokedAt   time.Time
 	ClaimWindow time.Duration
+	// ParentPID reads this process's current parent pid (os.Getppid), and
+	// InvokedParentPID is what it read when the invocation began. The parent is
+	// alive while the two still match. Comparing against the recorded pid, not
+	// against 1, is what catches an orphan reparented to a subreaper (a
+	// container init, systemd --user, tini), whose new parent is not pid 1.
+	// applyDefaults fills both, once per invocation, next to InvokedAt.
+	ParentPID        func() int
+	InvokedParentPID int
 	// ClassRoute is the relocated coordination-class binding these seams
 	// escalate to, or nil on a city that relocates nothing. It is not a seam:
 	// it is here so claimHookWorkWithRunner — the only caller that knows the
@@ -390,11 +420,47 @@ func (ops *hookClaimOps) applyDefaults() {
 	if ops.ClaimWindow <= 0 {
 		ops.ClaimWindow = resolveHookClaimWindow()
 	}
+	if ops.ParentPID == nil {
+		ops.ParentPID = os.Getppid
+	}
+	if ops.InvokedParentPID == 0 {
+		ops.InvokedParentPID = ops.ParentPID()
+	}
 }
 
 // claimWindowSpent reports whether this invocation's claim window has elapsed.
 func (ops *hookClaimOps) claimWindowSpent() bool {
-	return ops.invocationAge() > ops.claimWindowOrDefault()
+	return ops.invocationAge() > ops.effectiveClaimWindow()
+}
+
+// effectiveClaimWindow is the window the fence actually enforces: the base
+// window, stretched by hookClaimLiveParentWindowFactor while the invoking parent
+// is still alive. Every fence check and the claim-write deadline read this, so
+// they can never disagree about when the window closes.
+func (ops *hookClaimOps) effectiveClaimWindow() time.Duration {
+	base := ops.claimWindowOrDefault()
+	if ops.parentAlive() {
+		return base * hookClaimLiveParentWindowFactor
+	}
+	return base
+}
+
+// parentAlive reports whether the process that started this invocation is still
+// its parent. An orphan is reparented, so its parent pid changes: to 1 on a
+// plain host, or to a subreaper's pid inside a container.
+//
+// A direct-seam caller that never ran applyDefaults has no recorded parent, so
+// it falls back to the old "not pid 1" test rather than guessing.
+func (ops *hookClaimOps) parentAlive() bool {
+	readParent := os.Getppid
+	if ops.ParentPID != nil {
+		readParent = ops.ParentPID
+	}
+	current := readParent()
+	if current == 1 {
+		return false
+	}
+	return ops.InvokedParentPID == 0 || current == ops.InvokedParentPID
 }
 
 // invocationAge is how long this `gc hook --claim` invocation has been running.
@@ -422,7 +488,8 @@ func (ops *hookClaimOps) nowOrWallClock() time.Time {
 }
 
 // claimWindowOrDefault is ops.ClaimWindow with its default applied inline, for
-// the same reason nowOrWallClock exists.
+// the same reason nowOrWallClock exists. It is the BASE window; the fence
+// enforces effectiveClaimWindow.
 func (ops *hookClaimOps) claimWindowOrDefault() time.Duration {
 	if ops.ClaimWindow > 0 {
 		return ops.ClaimWindow
@@ -439,7 +506,7 @@ func (ops *hookClaimOps) claimWindowOrDefault() time.Duration {
 // lands late is exactly the parked claim the fence exists to prevent.
 func (ops *hookClaimOps) claimMutationContext() (context.Context, context.CancelFunc) {
 	budget := hookClaimMutationTimeout
-	if remaining := ops.claimWindowOrDefault() - ops.invocationAge(); remaining < budget {
+	if remaining := ops.effectiveClaimWindow() - ops.invocationAge(); remaining < budget {
 		budget = remaining
 	}
 	if budget <= 0 {
@@ -460,7 +527,7 @@ func (ops *hookClaimOps) claimMutationContext() (context.Context, context.Cancel
 // fence exists to end. The read-error arm refuses for the same reason.
 func refuseExpiredHookClaimWindow(candidateID string, ops hookClaimOps, stderr io.Writer) hookClaimResult {
 	age := ops.invocationAge()
-	parentAlive := os.Getppid() != 1
+	parentAlive := ops.parentAlive()
 	// The typed event is the durable record and the stderr line is commentary on
 	// it, so the event goes first — same rule as the unwind above, for the same
 	// reason: this path can be reached with a closed stderr.
@@ -471,7 +538,7 @@ func refuseExpiredHookClaimWindow(candidateID string, ops hookClaimOps, stderr i
 	})
 	_, _ = fmt.Fprintf(stderr,
 		"gc hook --claim: refusing to claim %s: the %s claim window is spent (invocation age %s, parent alive %t); the turn that invoked this claim is gone\n",
-		candidateID, ops.claimWindowOrDefault(), age.Round(time.Millisecond), parentAlive)
+		candidateID, ops.effectiveClaimWindow(), age.Round(time.Millisecond), parentAlive)
 	return hookClaimResult{terminal: true, code: 1}
 }
 
@@ -759,7 +826,7 @@ func writeHookClaimWorkResultForBead(result hookClaimJSONResult, bead beads.Bead
 	// route, so it takes the same unwind as an undelivered one.
 	if minted && ops.claimWindowSpent() {
 		cause := fmt.Sprintf("claim of %s landed after the %s claim window closed (invocation age %s); releasing it rather than parking it",
-			bead.ID, ops.claimWindowOrDefault(), ops.invocationAge().Round(time.Millisecond))
+			bead.ID, ops.effectiveClaimWindow(), ops.invocationAge().Round(time.Millisecond))
 		return unwindUndeliveredHookClaim(hookClaimReleaseReasonStraddled, cause, bead, opts, ops, dir, stderr)
 	}
 	result.RootBeadID = strings.TrimSpace(bead.Metadata[beadmeta.RootBeadIDMetadataKey])

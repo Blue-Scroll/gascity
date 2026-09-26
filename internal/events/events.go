@@ -58,7 +58,9 @@ const (
 	// claim command that outlived the agent turn that invoked it (an abandoned
 	// or killed provider tool call). No claim is minted. The payload's
 	// invocation_age_ms and parent_alive let the fleet distinguish honest slow
-	// stores from orphaned claimers reparented to init.
+	// stores from orphaned claimers. A live parent stretches the window
+	// (hookClaimLiveParentWindowFactor), so parent_alive=true here means even
+	// the stretched window ran out.
 	ExecutionClaimWindowExpired = "execution.claim_window_expired"
 	// ExecutionWorkAssociated records an authoritative association between a
 	// graph.v2 workflow run and one physical input work bead. Subject carries
