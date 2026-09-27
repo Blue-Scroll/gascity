@@ -6449,6 +6449,53 @@ esac
 	}
 }
 
+// TestEffectiveOnDeathReleasesAsTheDeadInstance pins vn-dk85wxz. The
+// controller runs on_death, and bd refuses to strip an in_progress claim held
+// by anyone but the actor (bd-98s5c). So the release must name the dead
+// instance as its actor, or every claimed bead fails to release. The fake bd
+// here refuses exactly as the real guard does: an update without
+// --actor <holder> is refused. Both branches are covered: a routed bead and
+// one that needs its route backfilled.
+func TestEffectiveOnDeathReleasesAsTheDeadInstance(t *testing.T) {
+	a := Agent{
+		Name:              "dog-1",
+		Dir:               "hello-world",
+		MinActiveSessions: ptrInt(0), MaxActiveSessions: ptrInt(5),
+		PoolName: "hello-world/dog",
+	}
+
+	log := runLifecycleHookCommand(t, a.EffectiveOnDeath(), `#!/bin/sh
+set -eu
+case "$1" in
+  list)
+    printf '[{"id":"ga-routed","metadata":{"gc.routed_to":"hello-world/dog"}},{"id":"ga-unrouted","metadata":{}}]'
+    ;;
+  query)
+    printf '[]'
+    ;;
+  update)
+    case " $* " in
+      *" --actor hello-world/dog-1 "*) printf 'RELEASED %s\n' "$2" >> "$BD_LOG" ;;
+      *) printf 'REFUSED %s\n' "$2" >> "$BD_LOG"
+         echo "cannot reassign $2: held by \"hello-world/dog-1\" (in_progress)" >&2
+         exit 1 ;;
+    esac
+    ;;
+  *)
+    exit 1
+    ;;
+esac
+`)
+	if strings.Contains(log, "REFUSED") {
+		t.Fatalf("hook log = %q, want every release to run as the dead instance", log)
+	}
+	for _, want := range []string{"RELEASED ga-routed", "RELEASED ga-unrouted"} {
+		if !strings.Contains(log, want) {
+			t.Fatalf("hook log = %q, want %q", log, want)
+		}
+	}
+}
+
 func TestEffectiveOnBootDefault(t *testing.T) {
 	a := Agent{
 		Name:              "dog",

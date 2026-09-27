@@ -1026,14 +1026,25 @@ func buildOnDeath(a *Agent, topo QueryTopology) string {
 		route = a.PoolName
 	}
 	_ = topo
+	holder := shellquote.Quote(a.QualifiedName())
 	ephemeralRead := bdQueryEphemeralStatusQuietShell("in_progress") + ` | ` +
-		`jq -r --arg assignee ` + shellquote.Quote(a.QualifiedName()) + ` '.[] | select((.assignee // "") == $assignee) | [.id, ` + jqMeta(beadmeta.RunTargetMetadataKey) + `, ` + jqMeta(beadmeta.RoutedToMetadataKey) + `] | @tsv' 2>/dev/null; `
+		`jq -r --arg assignee ` + holder + ` '.[] | select((.assignee // "") == $assignee) | [.id, ` + jqMeta(beadmeta.RunTargetMetadataKey) + `, ` + jqMeta(beadmeta.RoutedToMetadataKey) + `] | @tsv' 2>/dev/null; `
 	// Reset both assignee and status: clearing assignee alone leaves the bead
 	// invisible to every work_query tier (Tier 1 needs assignee match, Tiers
 	// 2/3 only match "ready" status). The next worker re-claims via Tier 3.
 	// If routed metadata is missing entirely, backfill the canonical
 	// gc.run_target route so reopened direct-assigned work does not stay
 	// invisible.
+	//
+	// Each release runs as the dead instance (--actor). The controller runs
+	// this hook, and bd refuses to strip an in_progress claim held by anyone
+	// but the actor (bd-98s5c, AssigneeNotStolen). Without --actor every
+	// release of a claimed bead failed with "cannot reassign ...: held by
+	// <this instance>", and the bead stayed claimed by a dead session until
+	// the reconciler's dead-assignee sweep reopened it (vn-dk85wxz). Acting
+	// as the holder, not --force, keeps the guard for the case that matters:
+	// if another actor took the bead after the list above, the write is still
+	// refused and their claim stands.
 	return `{ ` +
 		`bd list --assignee=` + a.QualifiedName() +
 		` --status=in_progress --json 2>/dev/null | ` +
@@ -1043,8 +1054,8 @@ func buildOnDeath(a *Agent, topo QueryTopology) string {
 		`while IFS="$(printf '\t')" read -r id run_target routed_to; do ` +
 		`[ -z "$id" ] && continue; ` +
 		`if [ -n "$run_target" ] || [ -n "$routed_to" ]; then ` +
-		`if ! err=$(bd update "$id" --assignee "" --status open 2>&1 >/dev/null); then printf 'gc-recovery: on_death release failed for %s: %s\n' "$id" "$err"; fi; ` +
-		`else if ! err=$(bd update "$id" --assignee "" --status open --set-metadata ` + shellquote.Quote(beadmeta.RunTargetMetadataKey+"="+route) + ` 2>&1 >/dev/null); then printf 'gc-recovery: on_death release failed for %s: %s\n' "$id" "$err"; fi; ` +
+		`if ! err=$(bd update "$id" --assignee "" --status open --actor ` + holder + ` 2>&1 >/dev/null); then printf 'gc-recovery: on_death release failed for %s: %s\n' "$id" "$err"; fi; ` +
+		`else if ! err=$(bd update "$id" --assignee "" --status open --set-metadata ` + shellquote.Quote(beadmeta.RunTargetMetadataKey+"="+route) + ` --actor ` + holder + ` 2>&1 >/dev/null); then printf 'gc-recovery: on_death release failed for %s: %s\n' "$id" "$err"; fi; ` +
 		`fi; ` +
 		`done`
 }
