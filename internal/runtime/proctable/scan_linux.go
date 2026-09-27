@@ -153,6 +153,15 @@ func parseEnvironFile(path string) (map[string]string, error) {
 }
 
 func isRootWithSessionID(root string, pid int, sessionID string) (bool, error) {
+	// A tmux process is never an agent root, even when it carries the session's
+	// GC_SESSION_ID. A tmux server keeps the environment of whichever command
+	// started it (a gc command run inside an agent's pane carries that agent's
+	// id), and it is PPID 1, which looks exactly like an escaped orphan.
+	// Treating it as a root once killed the server, and with it every session
+	// on the socket, each time that one agent restarted (vn-p4rwdst).
+	if isTmuxProcess(root, pid) {
+		return false, nil
+	}
 	ppid, ok, err := readParentPID(filepath.Join(root, strconv.Itoa(pid), "stat"))
 	if err != nil {
 		return false, err
@@ -169,13 +178,15 @@ func isRootWithSessionID(root string, pid int, sessionID string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	if parentEnv["GC_SESSION_ID"] == sessionID && isInfrastructureParent(root, ppid) {
+	if parentEnv["GC_SESSION_ID"] == sessionID && isTmuxProcess(root, ppid) {
 		return true, nil
 	}
 	return parentEnv["GC_SESSION_ID"] != sessionID, nil
 }
 
-func isInfrastructureParent(root string, pid int) bool {
+// isTmuxProcess reports whether pid is a tmux process, by its comm ("tmux: server"
+// for a server). An unreadable comm answers false.
+func isTmuxProcess(root string, pid int) bool {
 	data, err := os.ReadFile(filepath.Join(root, strconv.Itoa(pid), "comm"))
 	if err != nil {
 		return false

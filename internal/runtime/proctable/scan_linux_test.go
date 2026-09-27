@@ -171,3 +171,44 @@ func TestScanWithRootMissingEnvironSkipped(t *testing.T) {
 		t.Fatalf("got %d entries, want 0", len(got))
 	}
 }
+
+// setFakeProcParent rewrites pid's stat with the given parent and writes its
+// comm, for fixtures that need more than buildFakeProc's PPID-1 default.
+func setFakeProcParent(t *testing.T, root string, pid, ppid int, comm string) {
+	t.Helper()
+	dir := filepath.Join(root, strconv.Itoa(pid))
+	stat := strconv.Itoa(pid) + " (cmd) S " + strconv.Itoa(ppid) + " 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0"
+	if err := os.WriteFile(filepath.Join(dir, "stat"), []byte(stat), 0o644); err != nil {
+		t.Fatalf("write stat: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "comm"), []byte(comm+"\n"), 0o644); err != nil {
+		t.Fatalf("write comm: %v", err)
+	}
+}
+
+// The process table from vn-p4rwdst: a tmux server that carries the deacon's
+// GC_SESSION_ID and is PPID 1, the deacon's pane shell under it, and a real
+// escaped orphan. Only the server must drop out; killing it kills every
+// session on the socket.
+func TestScanWithRootNeverReturnsTheTmuxServer(t *testing.T) {
+	root := t.TempDir()
+	env := map[string]string{"GC_SESSION_ID": "ga-deacon"}
+	buildFakeProc(t, root, 100, env)
+	setFakeProcParent(t, root, 100, 1, "tmux: server")
+	buildFakeProc(t, root, 200, env)
+	setFakeProcParent(t, root, 200, 100, "zsh")
+	buildFakeProc(t, root, 300, env)
+	setFakeProcParent(t, root, 300, 1, "zsh")
+
+	got, err := scanWithRoot(root, "ga-deacon")
+	if err != nil {
+		t.Fatalf("scanWithRoot error: %v", err)
+	}
+	var pids []int
+	for _, r := range got {
+		pids = append(pids, r.PID)
+	}
+	if len(pids) != 2 || pids[0] != 200 || pids[1] != 300 {
+		t.Fatalf("scanWithRoot roots = %v, want [200 300] (pane under tmux + escaped orphan, never the tmux server 100)", pids)
+	}
+}

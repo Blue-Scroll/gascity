@@ -29,13 +29,10 @@ func ScanBySessionID(id string) ([]runtime.LiveRuntime, error) {
 			continue
 		}
 		sessionID := record.env["GC_SESSION_ID"]
-		if sessionID == "" {
-			continue
-		}
 		if id != "" && sessionID != id {
 			continue
 		}
-		if parent, ok := records[record.ppid]; ok && parent.env["GC_SESSION_ID"] == sessionID && !isInfrastructureCommand(parent.command) {
+		if !darwinScanRoot(records, record) {
 			continue
 		}
 		epoch, _ := strconv.Atoi(record.env["GC_RUNTIME_EPOCH"])
@@ -79,22 +76,7 @@ func IsScanRoot(pid int) bool {
 		return false
 	}
 	record, ok := records[pid]
-	if !ok {
-		return false
-	}
-	sessionID := record.env["GC_SESSION_ID"]
-	if sessionID == "" {
-		return false
-	}
-	parent, ok := records[record.ppid]
-	return !ok || parent.env["GC_SESSION_ID"] != sessionID || isInfrastructureCommand(parent.command)
-}
-
-type psRecord struct {
-	pid     int
-	ppid    int
-	command string
-	env     map[string]string
+	return ok && darwinScanRoot(records, record)
 }
 
 func psRecords() (map[int]psRecord, error) {

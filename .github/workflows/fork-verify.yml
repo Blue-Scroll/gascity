@@ -74,6 +74,11 @@ jobs:
         # BoundedListBuild and ListBuilds tests pin the 1s answer while the
         # store is slow, and that a panic in a build cannot stop the supervisor.
         run: go test ./internal/api/ -run 'TestAgentList|ActiveBead|TestHandleSessionList|TestSessionList|TestBoundedListBuild|TestListBuilds' -count=1 -v
+      - name: Unit tests, the orphan scan never names a tmux server as an agent (vn-p4rwdst)
+        # A tmux server can carry an agent's GC_SESSION_ID and is PPID 1, so
+        # the orphan kill once took the whole socket down with it. The linux
+        # case runs only here: no town Mac can run a linux-tagged test.
+        run: go test ./internal/runtime/proctable/ -run 'TestScanWithRoot|TestDarwinScanRoot|TestDarwinPSCommand' -count=1 -v
       - name: Unit tests — spawn-storm detector counts resets, not runs (hq-2yztr2)
         run: |
           # The detector is a shell script and needs jq. Say so here rather
