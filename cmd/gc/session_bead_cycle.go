@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/gastownhall/gascity/internal/beadmeta"
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/runtime"
@@ -61,6 +62,11 @@ const (
 	freshCycleRefused
 	// freshCycleRan: the session was killed and primed for a fresh wake.
 	freshCycleRan
+	// freshCycleAdopted: the session claimed the new bead itself and is
+	// already working it, so there was nothing to hand over. The session was
+	// NOT touched. The caller records the new bead as the current one, so the
+	// next tick does not see the same divergence again.
+	freshCycleAdopted
 )
 
 // freshReassignGate is the memory the fresh-mode reassign check keeps between
@@ -166,35 +172,11 @@ func proveFreshReassign(
 	if prev == "" {
 		return false, "no recorded bead to compare against"
 	}
-	plan, err := assignedWorkPlanForSessionInfo(cityPath, cfg, store, rigStores, info)
+	bead, found, err := readBeadForSession(cityPath, cfg, store, rigStores, info, prev)
 	if err != nil {
-		return false, fmt.Sprintf("could not plan a read of %s: %v", prev, err)
-	}
-	var (
-		bead  beads.Bead
-		found bool
-	)
-	res, err := storeref.Walk(plan, func(leg storeref.Leg) (bool, error) {
-		if leg.Store == nil {
-			return false, nil
-		}
-		b, getErr := leg.Store.Get(prev)
-		if getErr != nil {
-			if errors.Is(getErr, beads.ErrNotFound) {
-				return false, nil
-			}
-			return false, getErr
-		}
-		bead, found = b, true
-		return true, nil
-	})
-	if err != nil {
-		return false, fmt.Sprintf("could not read %s: %v", prev, err)
+		return false, err.Error()
 	}
 	if !found {
-		if err := assignedWorkScanComplete(res); err != nil {
-			return false, fmt.Sprintf("could not read %s: %v", prev, err)
-		}
 		if gate.missedAgain(name, prev) {
 			return true, fmt.Sprintf("%s was found in no store on two ticks in a row", prev)
 		}
@@ -216,6 +198,101 @@ func proveFreshReassign(
 	return true, fmt.Sprintf("%s is now assigned to %s", prev, assignee)
 }
 
+// readBeadForSession reads one bead straight from the stores the session can
+// reach. found=false with a nil error means every store answered and none
+// holds the bead. A failed read, or a scan that could not reach every store,
+// is an error: "not found" is only an answer when the scan was complete.
+func readBeadForSession(
+	cityPath string,
+	cfg *config.City,
+	store beads.Store,
+	rigStores map[string]beads.Store,
+	info sessionpkg.Info,
+	beadID string,
+) (beads.Bead, bool, error) {
+	plan, err := assignedWorkPlanForSessionInfo(cityPath, cfg, store, rigStores, info)
+	if err != nil {
+		return beads.Bead{}, false, fmt.Errorf("could not plan a read of %s: %w", beadID, err)
+	}
+	var (
+		bead  beads.Bead
+		found bool
+	)
+	res, err := storeref.Walk(plan, func(leg storeref.Leg) (bool, error) {
+		if leg.Store == nil {
+			return false, nil
+		}
+		b, getErr := leg.Store.Get(beadID)
+		if getErr != nil {
+			if errors.Is(getErr, beads.ErrNotFound) {
+				return false, nil
+			}
+			return false, getErr
+		}
+		bead, found = b, true
+		return true, nil
+	})
+	if err != nil {
+		return beads.Bead{}, false, fmt.Errorf("could not read %s: %w", beadID, err)
+	}
+	if !found {
+		if err := assignedWorkScanComplete(res); err != nil {
+			return beads.Bead{}, false, fmt.Errorf("could not read %s: %w", beadID, err)
+		}
+	}
+	return bead, found, nil
+}
+
+// sessionAlreadyWorksBead reports whether a live session claimed newBeadID
+// itself and is working it right now. Then a fresh cycle has nothing to hand
+// over: it would only kill the session in the middle of that work.
+//
+// Why: a pool worker closes one bead and claims its next one with
+// `gc hook --claim`, all in one conversation. The claim stamps the bead with
+// gc.session_id = this session. On the next tick the recorded bead is closed,
+// which proveFreshReassign counts as proof of a reassignment, so the cycle
+// killed the worker a few minutes into work it had chosen itself. Measured
+// 2026-09-24 to 09-27: 50 of 81 pool cycles were this, most 3 to 20 minutes
+// in, one 6h37m in, and 6 of the 7 beads the witness had to salvage by hand
+// in that window were among them (vn-maw725j).
+//
+// The proof is all three: the bead is in_progress, it is assigned to this
+// session, and its gc.session_id is this session's own bead ID. A real
+// reassignment (#1893) points the assignee at a bead nobody here claimed, so
+// it carries no gc.session_id, or another session's. Patrol wisps carry none
+// either, so named-session patrol cycles are unchanged.
+//
+// A bead no store holds proves nothing either way, so it answers false and the
+// usual proof decides. A failed read is returned as an error: the caller must
+// not kill a session on a read it could not finish.
+func sessionAlreadyWorksBead(
+	cityPath string,
+	cfg *config.City,
+	store beads.Store,
+	rigStores map[string]beads.Store,
+	info sessionpkg.Info,
+	newBeadID string,
+) (bool, error) {
+	sessionID := strings.TrimSpace(info.ID)
+	if sessionID == "" {
+		return false, nil
+	}
+	bead, found, err := readBeadForSession(cityPath, cfg, store, rigStores, info, newBeadID)
+	if err != nil || !found {
+		return false, err
+	}
+	if bead.Status != "in_progress" || strings.TrimSpace(bead.Metadata[beadmeta.SessionIDMetadataKey]) != sessionID {
+		return false, nil
+	}
+	assignee := strings.TrimSpace(bead.Assignee)
+	for _, id := range sessionAssignmentIdentifiersForConfigInfo(info, cfg) {
+		if id != "" && id == assignee {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 // cycleAliveSessionForFreshReassign tears down a live wake_mode=fresh
 // session whose assigned bead has changed, then primes the bead so the
 // next reconciler tick wakes the session on a brand-new conversation.
@@ -229,6 +306,10 @@ func proveFreshReassign(
 // has really left it. A different anchor on one tick is only a suspicion.
 // When the proof fails it refuses, logs why once per refusal, and returns
 // freshCycleRefused.
+//
+// It also kills nothing when the session already claimed the new bead itself
+// (sessionAlreadyWorksBead). It returns freshCycleAdopted then, and the
+// caller records the new bead as the current one.
 //
 // The teardown path mirrors the agent-initiated restart handoff
 // (`gc runtime request-restart`): kill the process, reset the named-session
@@ -262,6 +343,34 @@ func cycleAliveSessionForFreshReassign(
 		return freshCycleFailed, nil
 	}
 	prevBeadID := strings.TrimSpace(info.CurrentlyProcessingBeadID)
+	working, err := sessionAlreadyWorksBead(cityPath, cfg, store, rigStores, info, newBeadID)
+	if err != nil {
+		why := err.Error()
+		if gate.firstRefusal(name, prevBeadID+" -> "+newBeadID+": "+why) && stderr != nil {
+			fmt.Fprintf(stderr, "session reconciler: not cycling fresh-mode session '%s' for bead reassign %s -> %s: %s\n", name, prevBeadID, newBeadID, why) //nolint:errcheck
+		}
+		if trace != nil {
+			trace.RecordDecision(TraceSiteReconcilerBeadReassignCycle, TraceReasonFreshCycleUnproven, TraceOutcomeSkipped, tp.TemplateName, name, traceRecordPayload{
+				"previous_bead_id": prevBeadID,
+				"new_bead_id":      newBeadID,
+				"why":              why,
+			})
+		}
+		return freshCycleRefused, nil
+	}
+	if working {
+		if stdout != nil {
+			fmt.Fprintf(stdout, "Not cycling fresh-mode session '%s': it claimed %s itself and is working it (was %s)\n", name, newBeadID, prevBeadID) //nolint:errcheck
+		}
+		if trace != nil {
+			trace.RecordDecision(TraceSiteReconcilerBeadReassignCycle, TraceReasonFreshCycleSelfClaimed, TraceOutcomeSkipped, tp.TemplateName, name, traceRecordPayload{
+				"previous_bead_id": prevBeadID,
+				"new_bead_id":      newBeadID,
+			})
+		}
+		gate.forget(name)
+		return freshCycleAdopted, nil
+	}
 	proven, why := proveFreshReassign(cityPath, cfg, store, rigStores, info, name, gate)
 	if !proven {
 		if gate.firstRefusal(name, prevBeadID+" -> "+newBeadID+": "+why) && stderr != nil {

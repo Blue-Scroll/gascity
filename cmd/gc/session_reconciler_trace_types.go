@@ -189,6 +189,7 @@ const (
 	TraceReasonAssignedWork                  TraceReasonCode = "assigned_work"
 	TraceReasonFreshCycle                    TraceReasonCode = "fresh_cycle"
 	TraceReasonFreshCycleUnproven            TraceReasonCode = "fresh_cycle_unproven"
+	TraceReasonFreshCycleSelfClaimed         TraceReasonCode = "fresh_cycle_self_claimed"
 	TraceReasonScaleCheck                    TraceReasonCode = "scale_check"
 	TraceReasonStart                         TraceReasonCode = "start"
 

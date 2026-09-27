@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/gastownhall/gascity/internal/beadmeta"
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/runtime"
@@ -451,4 +452,55 @@ func TestReconcileSessionBeads_FreshReassign_OneMissWithoutGateNeverCycles(t *te
 	reconcileSessionBeadsWithAssignedWork(env, []beads.Bead{session}, list)
 
 	assertFreshSessionNotCycled(t, env, session, sessionName, "wb-burned")
+}
+
+// stampClaimSession writes the gc.session_id stamp that `gc hook --claim`
+// leaves on a bead a session claimed itself.
+func stampClaimSession(t *testing.T, env *restartRequestTestEnv, beadID, sessionID string) {
+	t.Helper()
+	if err := env.store.Update(beadID, beads.UpdateOpts{Metadata: map[string]string{beadmeta.SessionIDMetadataKey: sessionID}}); err != nil {
+		t.Fatalf("stamp %s on %s: %v", beadmeta.SessionIDMetadataKey, beadID, err)
+	}
+}
+
+// TestReconcileSessionBeads_FreshReassign_SelfClaimedNextBeadDoesNotCycle
+// replays 2026-09-27 06:48Z (vn-maw725j). A worker closed its bead and claimed
+// the next one itself, in the same conversation. Its recorded bead is closed,
+// which alone reads as proof of a reassignment, and the old code killed the
+// worker 3 minutes into the new bead. The new bead carries this session's own
+// claim stamp, so nothing was handed over: keep the session and record the
+// new bead as current.
+func TestReconcileSessionBeads_FreshReassign_SelfClaimedNextBeadDoesNotCycle(t *testing.T) {
+	env, session, sessionName := freshReassignRefinery(t, func(env *restartRequestTestEnv) string {
+		return putReassignWorkBead(t, env, "closed", "refinery").ID
+	})
+	next := putReassignWorkBead(t, env, "in_progress", "refinery")
+	stampClaimSession(t, env, next.ID, session.ID)
+	list := []beads.Bead{{ID: next.ID, Title: "next", Type: "task", Status: "in_progress", Assignee: "refinery"}}
+
+	reconcileSessionBeadsWithAssignedWork(env, []beads.Bead{session}, list, withFreshReassignGate(newFreshReassignGate()))
+
+	assertFreshSessionNotCycled(t, env, session, sessionName, next.ID)
+	if !strings.Contains(env.stdout.String(), "claimed "+next.ID+" itself") {
+		t.Fatalf("stdout does not say why the cycle was skipped: %q", env.stdout.String())
+	}
+}
+
+// TestReconcileSessionBeads_FreshReassign_BeadClaimedByAnotherSessionCycles
+// keeps the guard narrow: an in-progress bead stamped by a DIFFERENT session
+// was claimed elsewhere and handed to this one. That is a real reassignment,
+// so the cycle still runs.
+func TestReconcileSessionBeads_FreshReassign_BeadClaimedByAnotherSessionCycles(t *testing.T) {
+	env, session, sessionName := freshReassignRefinery(t, func(env *restartRequestTestEnv) string {
+		return putReassignWorkBead(t, env, "closed", "refinery").ID
+	})
+	next := putReassignWorkBead(t, env, "in_progress", "refinery")
+	stampClaimSession(t, env, next.ID, "some-other-session")
+	list := []beads.Bead{{ID: next.ID, Title: "next", Type: "task", Status: "in_progress", Assignee: "refinery"}}
+
+	reconcileSessionBeadsWithAssignedWork(env, []beads.Bead{session}, list, withFreshReassignGate(newFreshReassignGate()))
+
+	if env.sp.IsRunning(sessionName) {
+		t.Fatalf("session should have been cycled; stdout=%q stderr=%q", env.stdout.String(), env.stderr.String())
+	}
 }
