@@ -87,31 +87,61 @@ jobs:
           go test ./examples/gastown/ -run 'TestSpawnStorm' -count=1 -v
 
   dashboard:
-    # The dashboard gc embeds (internal/api/dashboardspa). `verify` above builds
-    # Go only, so without this job a dashboard change could go green with a page
-    # that does not typecheck, a failing vitest, or a dist/ that no longer matches
-    # its sources. dist/ is what the gc binary actually serves, so a stale one
-    # ships the old page with no error anywhere.
+    # The dashboard gc embeds (internal/api/dashboardspa). Since phone dashboard
+    # F1 (vn-9kvo79d) the page is FROZEN on this fork. It moved to its own repo,
+    # Blue-Scroll/gascity-dashboard, so web/ and dist/ must not change here.
     #
-    # These are upstream's "Dashboard SPA" checks plus `make dashboard-ci`,
-    # without the browser e2e. The job runs on every branch. A red here on a
-    # branch that never touched the dashboard means town's own dist/ or API
-    # client has drifted from its sources, and that is worth knowing too.
+    # This job checks two things:
+    #   1. web/ and dist/ still have the git tree hashes PAGE_FROZEN pins.
+    #   2. The Go around the page still passes: the embedded handler (and its
+    #      helper-path 404) and the BFF.
+    #
+    # It used to also run npm ci, vitest and `make dashboard-ci`. They were
+    # dropped on purpose (design T45). `make dashboard-ci` fails when the page's
+    # generated API client differs from one made fresh from openapi.json. With
+    # the page frozen, the only fix for that is an edit under web/, which check 1
+    # refuses. So every gc change to the API spec, and every upstream merge,
+    # would go red with no way to go green. Do not add them back while
+    # PAGE_FROZEN exists.
+    #
+    # The cost, said plainly: while frozen, a gc API change leaves gc's own
+    # embedded page one change behind. The page in gascity-dashboard is the one
+    # that keeps up.
+    #
+    # D1 deletes PAGE_FROZEN and swaps check 1 for a merge-base diff against
+    # upstream, in the same commit.
     if: ${{ github.repository != 'gastownhall/gascity' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - name: The page is frozen (web/ and dist/ match PAGE_FROZEN, vn-9kvo79d)
+        # No history is needed: `git rev-parse HEAD:<path>` reads the tree hash
+        # straight from the checked-out commit.
+        run: |
+          pin=internal/api/dashboardspa/PAGE_FROZEN
+          if [ ! -f "$pin" ]; then
+            echo "::error file=$pin::$pin is missing. Only D1 may delete it, in the same commit that replaces this step."
+            exit 1
+          fi
+          fail=0
+          for key in web dist; do
+            want=$(awk -v k="$key" '$1 == k && $2 == "=" { print $3 }' "$pin")
+            if ! printf '%s' "$want" | grep -Eq '^[0-9a-f]{40}$'; then
+              echo "::error file=$pin::$pin must have exactly one '$key = <40 hex>' line."
+              fail=1
+              continue
+            fi
+            have=$(git rev-parse "HEAD:internal/api/dashboardspa/$key")
+            if [ "$have" = "$want" ]; then
+              echo "ok: $key/ is still the frozen tree $want"
+            else
+              echo "::error::internal/api/dashboardspa/$key/ changed (tree $have, frozen at $want). The page is frozen on this fork: make page changes in Blue-Scroll/gascity-dashboard, and keep town's $key/ as it is when taking upstream."
+              fail=1
+            fi
+          done
+          exit "$fail"
       - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
         with:
           go-version-file: go.mod
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
-        with:
-          node-version: "22"
-      - name: Install SPA dependencies
-        run: npm ci --silent
-        working-directory: internal/api/dashboardspa/web
-      - name: Vitest
-        run: npm run --workspace gas-city-dashboard-frontend test
-        working-directory: internal/api/dashboardspa/web
-      - name: Typecheck, build, handler tests, and no drift in dist/ or the API client (make dashboard-ci)
-        run: make dashboard-ci
+      - name: Go tests for the embedded page handler and the BFF
+        run: go test ./internal/api/dashboardspa/... ./internal/api/dashboardbff/... -count=1
