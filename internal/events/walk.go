@@ -9,22 +9,15 @@ import (
 // walkBatch is how many events WalkWithInFlight hands its callback at once.
 const walkBatch = 256
 
-// WalkProvider is an optional extension for providers that can stream their
-// history. Prefer it to List or ListInFlight whenever the caller folds, counts,
-// or keeps only a few of the events it reads: a walk holds one small batch,
-// while a List holds every match at once.
-type WalkProvider interface {
-	WalkInFlight(filter Filter, fn func(batch []Event) bool) error
-}
-
-// The supervisor's /events fallback streams only when its provider is a
-// WalkProvider. Drift here would silently put the whole-history list back.
-var _ WalkProvider = (*FileRecorder)(nil)
-
 // WalkWithInFlight hands every event that matches filter to fn, in seq order,
 // a batch of at most walkBatch events at a time. It reads the same history as
 // ReadFilteredWithInFlight: the .gz archives, any in-flight rotating-* file,
 // and the active file.
+//
+// A walk always starts at the oldest archive. To keep only the newest few
+// events, use ReadNewestWithInFlight: it starts at the head and stops early.
+// Keeping the last N of a walk read all 8.6M town events per /events page and
+// held the supervisor at 160-640% CPU (hq-bshybj).
 //
 // Use it instead of ReadFilteredWithInFlight whenever you fold or count events
 // rather than keep them. ReadFilteredWithInFlight returns one slice of every

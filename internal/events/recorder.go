@@ -568,10 +568,10 @@ func (r *FileRecorder) ListInFlight(filter Filter) ([]Event, error) {
 	return ReadFilteredWithInFlight(r.path, filter)
 }
 
-// WalkInFlight streams the same events ListInFlight returns, one small batch
-// at a time. It implements [WalkProvider].
-func (r *FileRecorder) WalkInFlight(filter Filter, fn func(batch []Event) bool) error {
-	return WalkWithInFlight(r.path, filter, fn)
+// ListNewest returns the newest keep matches from the same history
+// ListInFlight reads, newest segment first. It implements [NewestProvider].
+func (r *FileRecorder) ListNewest(ctx context.Context, filter Filter, keep int) ([]Event, int, error) {
+	return ReadNewestWithInFlight(ctx, r.path, filter, keep)
 }
 
 // ListTail returns trailing matching events from the underlying file.
