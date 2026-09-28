@@ -17,6 +17,10 @@ type WalkProvider interface {
 	WalkInFlight(filter Filter, fn func(batch []Event) bool) error
 }
 
+// The supervisor's /events fallback streams only when its provider is a
+// WalkProvider. Drift here would silently put the whole-history list back.
+var _ WalkProvider = (*FileRecorder)(nil)
+
 // WalkWithInFlight hands every event that matches filter to fn, in seq order,
 // a batch of at most walkBatch events at a time. It reads the same history as
 // ReadFilteredWithInFlight: the .gz archives, any in-flight rotating-* file,
