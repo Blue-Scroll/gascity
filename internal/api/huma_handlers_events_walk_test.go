@@ -2,6 +2,8 @@ package api
 
 import (
 	"errors"
+	"io"
+	"path/filepath"
 	"reflect"
 	"testing"
 
@@ -69,4 +71,69 @@ func TestLastMatchingEventsReturnsTheWalkError(t *testing.T) {
 	if _, _, err := lastMatchingEvents(batchWalker{n: 4, size: 2, err: want}, events.Filter{}, 3); !errors.Is(err, want) {
 		t.Fatalf("err = %v, want %v", err, want)
 	}
+}
+
+// TestEventListWalksARealRecorderAcrossItsArchive drives the /events page
+// fallback through a real FileRecorder, so the WalkProvider branch runs: the
+// fakes the other keyset tests use do not implement it. The first page cannot
+// fill from the active file alone, so it must walk the .gz archive AND the
+// active file, and the full walk must see every seq exactly once.
+func TestEventListWalksARealRecorderAcrossItsArchive(t *testing.T) {
+	state := newFakeState(t)
+	rec, err := events.NewFileRecorder(filepath.Join(t.TempDir(), "events.jsonl"), io.Discard)
+	if err != nil {
+		t.Fatalf("NewFileRecorder: %v", err)
+	}
+	t.Cleanup(func() { _ = rec.Close() })
+	state.eventProv = rec
+	for i := 0; i < 12; i++ {
+		rec.Record(events.Event{Type: "e.t", Actor: "a"})
+	}
+	if _, err := rec.ForceRotate(); err != nil {
+		t.Fatalf("ForceRotate: %v", err)
+	}
+	rec.WaitForRotations()
+	for i := 0; i < 3; i++ {
+		rec.Record(events.Event{Type: "e.t", Actor: "a"})
+	}
+	latest, err := rec.LatestSeq()
+	if err != nil {
+		t.Fatalf("LatestSeq: %v", err)
+	}
+	h := newTestCityHandler(t, state)
+
+	seen := map[uint64]int{}
+	cursor := ""
+	for pages := 0; ; pages++ {
+		if pages > 10 {
+			t.Fatal("walk did not terminate")
+		}
+		url := cityURL(state, "/events?limit=5")
+		if cursor != "" {
+			url += "&cursor=" + cursor
+		}
+		items, _, next := decodeEventList(t, getList(t, h, url))
+		if pages == 0 && (len(items) != 5 || items[0].Seq != latest) {
+			t.Fatalf("page 1 = %d items from seq %d, want 5 from the newest seq %d", len(items), firstSeq(items), latest)
+		}
+		for _, e := range items {
+			seen[e.Seq]++
+		}
+		if next == "" {
+			break
+		}
+		cursor = next
+	}
+	for seq := uint64(1); seq <= latest; seq++ {
+		if seen[seq] != 1 {
+			t.Errorf("seq %d seen %d times, want exactly 1", seq, seen[seq])
+		}
+	}
+}
+
+func firstSeq(items []WireEvent) uint64 {
+	if len(items) == 0 {
+		return 0
+	}
+	return items[0].Seq
 }
