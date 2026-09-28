@@ -38,20 +38,22 @@ func NewProjector() *Projector {
 	return &Projector{beads: make(map[string]beads.Bead)}
 }
 
-// ColdLoad folds the entire event log at path into the projector. It reads via
-// events.ReadFilteredWithInFlight so the replay spans rotated .gz archives AND
-// any in-flight events.jsonl.rotating-* file the recorder has not yet gzipped —
-// otherwise a cold start that lands in a rotation's compression window would
-// miss those pre-rotation events until the next rotation's catch-up. Safe to
-// call once on a fresh projector before the incremental tail begins; Apply is
-// seq-idempotent so the transient .gz/rotating overlap folds cleanly.
+// ColdLoad folds the entire event log at path into the projector. It walks
+// the rotated .gz archives AND any in-flight events.jsonl.rotating-* file the
+// recorder has not yet gzipped, so a cold start inside a rotation's compression
+// window still sees those events. Safe to call once on a fresh projector before
+// the incremental tail begins.
+//
+// It folds one batch at a time and never holds the whole log. Reading the log
+// into one slice first (events.ReadFilteredWithInFlight) held the gc supervisor
+// at about 14 GB, because the town's history is 7.9 GB of JSON (hq-k9wi6n). On a
+// read error the batches before it stay folded and the error is returned, so
+// the caller can mark the projection partial.
 func (p *Projector) ColdLoad(path string) error {
-	evts, err := events.ReadFilteredWithInFlight(path, events.Filter{})
-	if err != nil {
-		return err
-	}
-	p.Apply(evts)
-	return nil
+	return events.WalkWithInFlight(path, events.Filter{}, func(batch []events.Event) bool {
+		p.Apply(batch)
+		return true
+	})
 }
 
 // Apply folds a chronological event slice, upserting bead.created/updated/closed
@@ -97,6 +99,22 @@ func (p *Projector) Beads() []beads.Bead {
 	out := make([]beads.Bead, 0, len(p.order))
 	for _, id := range p.order {
 		if b, ok := p.beads[id]; ok {
+			out = append(out, b)
+		}
+	}
+	return out
+}
+
+// RunBeads returns the beads that take part in run classification
+// (RunBeadFilter), in first-seen order. It is FilterRunBeads(p.Beads()) in one
+// pass. Use it on any hot path: the projector holds every bead the log has ever
+// named (422,941 on the town Mac on 2026-09-28), and the run tailer rebuilds on
+// every poll that changes a bead, so the two-pass form copied that whole set
+// twice a second (hq-k9wi6n).
+func (p *Projector) RunBeads() []beads.Bead {
+	out := make([]beads.Bead, 0, len(p.order))
+	for _, id := range p.order {
+		if b, ok := p.beads[id]; ok && RunBeadFilter(b) {
 			out = append(out, b)
 		}
 	}

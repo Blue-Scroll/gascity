@@ -171,6 +171,9 @@ func fetchEventPageAscending(ep events.Provider, filter events.Filter, limit int
 			return tail, limit, nil
 		}
 	}
+	if wp, ok := ep.(events.WalkProvider); ok {
+		return lastMatchingEvents(wp, filter, fetch)
+	}
 	all, err := listWithInFlight(ep, filter)
 	if err != nil {
 		return nil, 0, err
@@ -180,6 +183,33 @@ func fetchEventPageAscending(ep events.Provider, filter events.Filter, limit int
 		all = all[len(all)-fetch:]
 	}
 	return all, scanned, nil
+}
+
+// lastMatchingEvents streams the provider's history and keeps only the newest
+// keep matches, in ascending seq order, plus the count of every match. Paging
+// back past the active file with no filter matches nearly the whole history,
+// which is 7.9 GB of JSON on the town Mac. Listing it into one slice just to
+// keep the last page is how a phone scrolling the events feed could grow the
+// supervisor by GBs (hq-k9wi6n). This holds keep events plus one batch.
+func lastMatchingEvents(wp events.WalkProvider, filter events.Filter, keep int) ([]events.Event, int, error) {
+	ring := make([]events.Event, keep)
+	next, scanned := 0, 0
+	err := wp.WalkInFlight(filter, func(batch []events.Event) bool {
+		for _, e := range batch {
+			ring[next] = e
+			next = (next + 1) % keep
+			scanned++
+		}
+		return true
+	})
+	if err != nil {
+		return nil, 0, err
+	}
+	if scanned < keep {
+		return ring[:scanned], scanned, nil
+	}
+	// The ring is full, so next points at the oldest kept event.
+	return append(ring[next:], ring[:next]...), scanned, nil
 }
 
 // listWithInFlight returns all events matching filter, folding in events still

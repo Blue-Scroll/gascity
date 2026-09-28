@@ -568,6 +568,12 @@ func (r *FileRecorder) ListInFlight(filter Filter) ([]Event, error) {
 	return ReadFilteredWithInFlight(r.path, filter)
 }
 
+// WalkInFlight streams the same events ListInFlight returns, one small batch
+// at a time. It implements [WalkProvider].
+func (r *FileRecorder) WalkInFlight(filter Filter, fn func(batch []Event) bool) error {
+	return WalkWithInFlight(r.path, filter, fn)
+}
+
 // ListTail returns trailing matching events from the underlying file.
 func (r *FileRecorder) ListTail(filter Filter, limit int) ([]Event, error) {
 	return ReadFilteredTail(r.path, filter, limit)

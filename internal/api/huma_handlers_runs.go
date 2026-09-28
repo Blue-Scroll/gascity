@@ -123,7 +123,7 @@ func (s *Server) runFold(ctx context.Context) (runFoldResult, error) {
 		return runFoldResult{}, err
 	}
 	res := runFoldResult{
-		beads:        runproj.FilterRunBeads(proj.Beads()),
+		beads:        proj.RunBeads(),
 		decodeMisses: proj.DecodeMisses(),
 		ready:        true,
 		partial:      proj.DecodeMisses() > 0,
