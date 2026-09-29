@@ -1,8 +1,11 @@
 package tmux
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -34,6 +37,11 @@ const (
 	// to fit on the box's first line, long enough that a person is unlikely to
 	// type the same words by chance.
 	nudgeDraftHeadRunes = 40
+	// nudgeDraftSumEnvKey holds a fingerprint of the WHOLE last message gc
+	// pasted. When the box still holds gc's own unsent paste of the very
+	// message a retry is about to send, the retry presses Enter on it instead
+	// of pasting it a second time (hq-eez8jf).
+	nudgeDraftSumEnvKey = "GC_NUDGE_DRAFT_SUM"
 
 	// inputProbeChar is typed to ask the box what it really holds. It cannot
 	// submit (only Enter does), and it is not a digit or y/n, so a select
@@ -54,40 +62,51 @@ const (
 )
 
 // guardUnsentInput checks target's input box before a nudge types into it.
-// It returns nil when the nudge may go ahead, and an error wrapping
-// ErrNudgeInputOccupied when the box holds text somebody else typed.
+// It returns an error wrapping ErrNudgeInputOccupied when the box holds text
+// somebody else typed, and nil when the nudge may go ahead.
+//
+// alreadyDrafted is true when the box holds gc's own unsent paste of this
+// same message: an earlier try pasted it and its submit Enter was lost. The
+// caller then skips the paste and only presses Enter, so the message is not
+// sent twice.
 //
 // Panes with no recognizable prompt line (other TUIs, a dialog, a shell) are
 // not guarded, because there is no box to read. That is the one gap.
-func (t *Tmux) guardUnsentInput(target string) error {
+func (t *Tmux) guardUnsentInput(target, message string) (alreadyDrafted bool, err error) {
+	read := t.inputBoxReader(target)
+	pre, found := read()
+	switch {
+	case !found:
+		return false, nil
+	case pre == "":
+		return false, nil
+	}
+	if head, err := t.GetEnvironment(target, nudgeDraftEnvKey); err == nil && isOwnDraft(pre, head) {
+		sum, err := t.GetEnvironment(target, nudgeDraftSumEnvKey)
+		return err == nil && sum == nudgeDraftSum(message), nil
+	}
+
+	verdict := t.probeInputBox(target, pre, read)
+	if verdict == boxGhost {
+		return false, nil
+	}
+	return false, wrapOccupied(target, pre, verdict)
+}
+
+// inputBoxReader returns a function that captures target's pane and reads
+// its input box (see inputBoxText).
+func (t *Tmux) inputBoxReader(target string) func() (string, bool) {
 	prefix := DefaultReadyPromptPrefix
 	if configured, err := t.GetEnvironment(target, sessionReadyPromptEnvKey); err == nil {
 		prefix = idlePromptPrefix(configured)
 	}
-	read := func() (string, bool) {
+	return func() (string, bool) {
 		out, err := t.run("capture-pane", "-e", "-p", "-t", target, "-S", fmt.Sprintf("-%d", promptObservationLines))
 		if err != nil {
 			return "", false
 		}
 		return inputBoxText(strings.Split(out, "\n"), prefix)
 	}
-
-	pre, found := read()
-	switch {
-	case !found:
-		return nil
-	case pre == "":
-		return nil
-	}
-	if head, err := t.GetEnvironment(target, nudgeDraftEnvKey); err == nil && isOwnDraft(pre, head) {
-		return nil
-	}
-
-	verdict := t.probeInputBox(target, pre, read)
-	if verdict == boxGhost {
-		return nil
-	}
-	return wrapOccupied(target, pre, verdict)
 }
 
 // wrapOccupied builds the refusal. It reports the box text's LENGTH, never
@@ -160,10 +179,20 @@ func probeVerdict(pre, probed string) inputBoxVerdict {
 	return boxUnknown
 }
 
-// recordNudgeDraft remembers the start of a message gc is about to paste, so
-// a retry over gc's own unsubmitted paste is not mistaken for a person's words.
+// recordNudgeDraft remembers the message gc is about to paste, so a retry
+// over gc's own unsubmitted paste is not mistaken for a person's words.
 func (t *Tmux) recordNudgeDraft(target, message string) error {
+	if err := t.SetEnvironment(target, nudgeDraftSumEnvKey, nudgeDraftSum(message)); err != nil {
+		return err
+	}
 	return t.SetEnvironment(target, nudgeDraftEnvKey, nudgeDraftHead(message))
+}
+
+// forgetNudgeDraft drops the draft record once gc knows its paste left the
+// box, so a stale record can never vouch for text typed later.
+func (t *Tmux) forgetNudgeDraft(target string) {
+	_ = t.RemoveEnvironment(target, nudgeDraftEnvKey)
+	_ = t.RemoveEnvironment(target, nudgeDraftSumEnvKey)
 }
 
 func nudgeDraftHead(message string) string {
@@ -175,16 +204,139 @@ func nudgeDraftHead(message string) string {
 	return string(r)
 }
 
-// isOwnDraft reports whether box text starts with gc's last paste. head is at
-// most nudgeDraftHeadRunes long, so it fits on the box's first line even when
-// the message itself wraps.
+func nudgeDraftSum(message string) string {
+	sum := sha256.Sum256([]byte(message))
+	return hex.EncodeToString(sum[:8])
+}
+
+// isOwnDraft reports whether box text is gc's last paste.
+//
+// A text head is the first nudgeDraftHeadRunes of the message, short enough
+// to fit on the box's first line even when the message wraps, so the box
+// only has to START with it.
+//
+// A paste-label head (see notePasteLabel) must match the box EXACTLY. Claude
+// numbers every paste, so a label a person pastes later carries a new number
+// and never matches, and a label with anything typed after it is not gc's.
 func isOwnDraft(box, head string) bool {
 	head = strings.TrimSpace(head)
 	if head == "" {
 		return false
 	}
-	return strings.HasPrefix(strings.Join(strings.Fields(box), " "), head)
+	flat := strings.Join(strings.Fields(box), " ")
+	if isPasteLabelOnly(head) {
+		return flat == strings.Join(strings.Fields(head), " ")
+	}
+	return strings.HasPrefix(flat, head)
 }
+
+// pasteLabelOnly matches a box that holds nothing but Claude's collapsed
+// paste labels. Claude does not show the words of a multi-line paste in its
+// box. It shows "[Pasted text #3 +8 lines]" instead, so a text head can
+// never match it. Without this, one lost Enter after a multi-line nudge left
+// that label in the mayor's box, and gc refused every later message to the
+// mayor for 7 hours, while the dashboard said "Sent" (hq-eez8jf).
+var pasteLabelOnly = regexp.MustCompile(`^(?:\[Pasted text #\d+(?: \+\d+ lines?)?\] ?)+$`)
+
+func isPasteLabelOnly(text string) bool {
+	return pasteLabelOnly.MatchString(strings.TrimSpace(text))
+}
+
+// notePasteLabel runs right after gc pastes into target. If the box now shows
+// only Claude's paste label, it records that exact label as the draft head,
+// so a later check can tell gc's own stranded paste from a person's.
+//
+// The label is read off the screen rather than guessed, because only Claude
+// knows its number. It returns the label, or "" when the box shows none.
+func (t *Tmux) notePasteLabel(target string) string {
+	read := t.inputBoxReader(target)
+	for i := 0; i < pasteLabelMaxPolls; i++ {
+		if i > 0 {
+			time.Sleep(inputProbeSettle)
+		}
+		text, found := read()
+		if !found {
+			return "" // no box to read: not a Claude pane, or a dialog
+		}
+		if text == "" {
+			continue // the paste has not been drawn yet
+		}
+		if !isPasteLabelOnly(text) {
+			return ""
+		}
+		_ = t.SetEnvironment(target, nudgeDraftEnvKey, text)
+		return text
+	}
+	return ""
+}
+
+// draftPasteLabel returns the paste label on record for target, or "" when
+// gc's last draft there was recorded as text.
+func (t *Tmux) draftPasteLabel(target string) string {
+	head, err := t.GetEnvironment(target, nudgeDraftEnvKey)
+	if err != nil || !isPasteLabelOnly(head) {
+		return ""
+	}
+	return strings.TrimSpace(head)
+}
+
+// pasteLabelMaxPolls bounds how long notePasteLabel waits for a paste to be
+// drawn. The nudge already waited its debounce, so this is rarely more than
+// one read.
+const pasteLabelMaxPolls = 4
+
+// pasteState is what submitStrandedPaste learned about gc's paste label.
+type pasteState int
+
+const (
+	pasteNotTracked pasteState = iota // gc saw no label, so the box says nothing
+	pasteSubmitted                    // the label left the box
+	pasteStranded                     // the label is still in the box
+)
+
+// submitStrandedPaste checks that gc's collapsed paste really left the box
+// after the submit, and presses submit again while it has not.
+//
+// Waiting for "busy" alone is not proof. A pane that was already busy looks
+// busy whether or not the Enter landed, and a lost Enter leaves the paste in
+// the box for the next nudge to trip over (hq-eez8jf).
+//
+// Pressing submit again is safe here: the box holds EXACTLY gc's own label,
+// with nothing a person typed, so the only thing it can send is gc's message.
+// While Claude is busy, Enter queues that message instead of sending it now,
+// which is also what a nudge wants.
+func (t *Tmux) submitStrandedPaste(target, label string, sendSubmit func() error) pasteState {
+	if label == "" {
+		return pasteNotTracked
+	}
+	read := t.inputBoxReader(target)
+	for send := 0; send <= pasteResubmitMax; send++ {
+		if send > 0 {
+			if err := sendSubmit(); err != nil {
+				continue
+			}
+		}
+		for poll := 0; poll < inputProbeMaxPolls; poll++ {
+			time.Sleep(inputProbeSettle)
+			text, found := read()
+			switch {
+			case !found:
+				// No box on screen (a dialog, say). An Enter now could answer
+				// something that is not gc's, so stop here.
+				return pasteNotTracked
+			case text == "":
+				return pasteSubmitted
+			case text != label:
+				// Somebody typed. The box is no longer gc's to press Enter on.
+				return pasteNotTracked
+			}
+		}
+	}
+	return pasteStranded
+}
+
+// pasteResubmitMax is how many extra submits submitStrandedPaste may send.
+const pasteResubmitMax = 2
 
 // inputBoxText finds the input box in a pane captured WITH color codes
 // (capture-pane -e) and returns the text a person typed there. found is false

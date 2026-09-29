@@ -1814,16 +1814,19 @@ func (t *Tmux) sendHiddenAttachedText(target, text string) (bool, error) {
 	// discountPokeActivity). A failed write records nothing.
 	// The hidden client's trailing Enter submits the whole box, exactly like
 	// NudgeSession's, so it needs the same guard (hq-ibmvf).
-	if err := t.guardUnsentInput(target); err != nil {
+	alreadyDrafted, err := t.guardUnsentInput(target, text)
+	if err != nil {
 		return true, err
 	}
-	_ = t.recordNudgeDraft(target, text)
 	commitPoke := t.beginPoke(target)
-	if err := client.write([]byte(text)); err != nil {
-		return true, err
-	}
-	if t.cfg.DebounceMs > 0 {
-		time.Sleep(time.Duration(t.cfg.DebounceMs) * time.Millisecond)
+	if !alreadyDrafted {
+		_ = t.recordNudgeDraft(target, text)
+		if err := client.write([]byte(text)); err != nil {
+			return true, err
+		}
+		if t.cfg.DebounceMs > 0 {
+			time.Sleep(time.Duration(t.cfg.DebounceMs) * time.Millisecond)
+		}
 	}
 	if err := client.write([]byte{'\r'}); err != nil {
 		return true, err
@@ -2168,20 +2171,32 @@ func (t *Tmux) NudgeSession(session, message string) error {
 	t.WakePaneIfDetached(session)
 
 	// 0. Never paste into a box that holds somebody's unsent words: the Enter
-	// below would submit them too (hq-ibmvf).
-	if err := t.guardUnsentInput(target); err != nil {
+	// below would submit them too (hq-ibmvf). When the box already holds
+	// gc's own unsent paste of this message, skip straight to the submit.
+	alreadyDrafted, err := t.guardUnsentInput(target, message)
+	if err != nil {
 		return err
 	}
-	_ = t.recordNudgeDraft(target, message)
+	var pasteLabel string
+	if alreadyDrafted {
+		pasteLabel = t.draftPasteLabel(target)
+	} else {
+		_ = t.recordNudgeDraft(target, message)
 
-	// 1. Send text in literal mode with retry on transient errors
-	if err := t.sendKeysLiteralWithRetry(target, message, t.cfg.NudgeReadyTimeout); err != nil {
-		return err
+		// 1. Send text in literal mode with retry on transient errors
+		if err := t.sendKeysLiteralWithRetry(target, message, t.cfg.NudgeReadyTimeout); err != nil {
+			return err
+		}
+
+		// 2. Wait for paste to complete (tested, required). Kimi's TUI can take
+		// longer to accept large pasted prompts in detached panes.
+		time.Sleep(t.nudgeSubmitDebounce(target))
+
+		// Claude shows a multi-line paste as a label, not its words. Record
+		// that label so the submit check below, and a later guard, can
+		// recognize it as gc's own (hq-eez8jf).
+		pasteLabel = t.notePasteLabel(target)
 	}
-
-	// 2. Wait for paste to complete (tested, required). Kimi's TUI can take
-	// longer to accept large pasted prompts in detached panes.
-	time.Sleep(t.nudgeSubmitDebounce(target))
 
 	// 3. Send Escape only for TUIs where it's an insert-mode escape, not a
 	// semantic input key. Claude, Codex, Gemini, and OpenCode all treat
@@ -2225,9 +2240,18 @@ func (t *Tmux) NudgeSession(session, message string) error {
 			return fmt.Errorf("failed to send submit sequence: %w", err)
 		}
 		delivered = true
+		// A busy pane is not proof on its own: a pane that was busy before
+		// the Enter stays busy when the Enter is lost. When gc's paste label
+		// is on record, the box itself says whether it went (hq-eez8jf).
+		switch t.submitStrandedPaste(target, pasteLabel, sendSubmit) {
+		case pasteSubmitted:
+			confirmed = true
+		case pasteStranded:
+			confirmed = false
+		}
 		if confirmed {
 			// The box is empty again, so the draft marker has done its job.
-			_ = t.RemoveEnvironment(target, nudgeDraftEnvKey)
+			t.forgetNudgeDraft(target)
 		}
 		if !confirmed {
 			// Do NOT collapse this to nil: a caller that treats nil as "clean
@@ -2283,18 +2307,23 @@ func (t *Tmux) NudgePane(pane, message string) error {
 	}()
 
 	// 0. Never paste into a box that holds somebody's unsent words (hq-ibmvf).
-	if err := t.guardUnsentInput(pane); err != nil {
+	// See NudgeSession for alreadyDrafted and the paste label.
+	alreadyDrafted, err := t.guardUnsentInput(pane, message)
+	if err != nil {
 		return err
 	}
-	_ = t.recordNudgeDraft(pane, message)
+	if !alreadyDrafted {
+		_ = t.recordNudgeDraft(pane, message)
 
-	// 1. Send text in literal mode with retry on transient errors
-	if err := t.sendKeysLiteralWithRetry(pane, message, t.cfg.NudgeReadyTimeout); err != nil {
-		return err
+		// 1. Send text in literal mode with retry on transient errors
+		if err := t.sendKeysLiteralWithRetry(pane, message, t.cfg.NudgeReadyTimeout); err != nil {
+			return err
+		}
+
+		// 2. Wait 500ms for paste to complete (tested, required)
+		time.Sleep(500 * time.Millisecond)
+		_ = t.notePasteLabel(pane)
 	}
-
-	// 2. Wait 500ms for paste to complete (tested, required)
-	time.Sleep(500 * time.Millisecond)
 
 	// 3. See NudgeSession for why Escape is provider-specific.
 	if t.shouldSendEscapeBeforeEnter(pane) {

@@ -143,6 +143,14 @@ func TestIsOwnDraft(t *testing.T) {
 		{"approve both PRs", head, false},                      // a person's words
 		{"R", head, false},                                     // a person typing the same first letter
 		{"approve both PRs", "", false},                        // gc never pasted here
+
+		// Claude shows a multi-line paste as a label (hq-eez8jf). A label
+		// head must match the box exactly.
+		{"[Pasted text #3 +8 lines]", "[Pasted text #3 +8 lines]", true},
+		{"[Pasted text #3 +8 lines] [Pasted text #4 +2 lines]", "[Pasted text #3 +8 lines] [Pasted text #4 +2 lines]", true},
+		{"[Pasted text #4 +8 lines]", "[Pasted text #3 +8 lines]", false},         // a later paste, not gc's
+		{"[Pasted text #3 +8 lines] approve", "[Pasted text #3 +8 lines]", false}, // a person typed after it
+		{"[Pasted text #3 +8 lines]", head, false},                                // gc's last paste was text
 	}
 	for _, tc := range cases {
 		if got := isOwnDraft(tc.box, tc.head); got != tc.want {
@@ -171,7 +179,8 @@ type boxFake struct {
 	box   string   // what the box holds; "" draws no box at all when noBox
 	dim   string   // a dim suggestion drawn after the box text
 	noBox bool
-	keys  [][]string // every send-keys call
+	keys  [][]string        // every send-keys call
+	env   map[string]string // set-environment writes, read back by show-environment
 }
 
 func (f *boxFake) screen() string {
@@ -190,7 +199,21 @@ func (f *boxFake) execute(args []string) (string, error) {
 	for i, a := range args {
 		switch a {
 		case "show-environment":
+			key := args[len(args)-1]
+			if v, ok := f.env[key]; ok {
+				return key + "=" + v, nil
+			}
 			return "", errors.New("unknown variable")
+		case "set-environment":
+			if f.env == nil {
+				f.env = map[string]string{}
+			}
+			if args[len(args)-2] == "-u" {
+				delete(f.env, args[len(args)-1])
+			} else {
+				f.env[args[len(args)-2]] = args[len(args)-1]
+			}
+			return "", nil
 		case "capture-pane":
 			return f.screen(), nil
 		case "send-keys":
@@ -221,7 +244,7 @@ func TestGuardUnsentInput(t *testing.T) {
 		f := &boxFake{above: []string{bubble}, noBox: true}
 		tm := NewTmux()
 		tm.exec = f
-		if err := tm.guardUnsentInput("sess"); err != nil {
+		if _, err := tm.guardUnsentInput("sess", "Run gc hook"); err != nil {
 			t.Fatalf("guard refused a resume screen: %v", err)
 		}
 		if len(f.keys) != 0 {
@@ -233,7 +256,7 @@ func TestGuardUnsentInput(t *testing.T) {
 		f := &boxFake{above: []string{bubble}, dim: "Run 'gc prime' to check merge queue and begin processing."}
 		tm := NewTmux()
 		tm.exec = f
-		if err := tm.guardUnsentInput("sess"); err != nil {
+		if _, err := tm.guardUnsentInput("sess", "Run gc hook"); err != nil {
 			t.Fatalf("guard refused a dim suggestion: %v", err)
 		}
 		if len(f.keys) != 0 {
@@ -245,7 +268,7 @@ func TestGuardUnsentInput(t *testing.T) {
 		f := &boxFake{above: []string{bubble}, box: "approve both PRs"}
 		tm := NewTmux()
 		tm.exec = f
-		err := tm.guardUnsentInput("sess")
+		_, err := tm.guardUnsentInput("sess", "Run gc hook")
 		if !errors.Is(err, ErrNudgeInputOccupied) || !strings.Contains(err.Error(), "verdict real") {
 			t.Fatalf("guard = %v, want a refusal with verdict real", err)
 		}
@@ -258,8 +281,197 @@ func TestGuardUnsentInput(t *testing.T) {
 		f := &boxFake{box: "approve both PRs", dim: " and merge them"}
 		tm := NewTmux()
 		tm.exec = f
-		if err := tm.guardUnsentInput("sess"); !errors.Is(err, ErrNudgeInputOccupied) {
+		if _, err := tm.guardUnsentInput("sess", "Run gc hook"); !errors.Is(err, ErrNudgeInputOccupied) {
 			t.Fatalf("guard = %v, want a refusal", err)
+		}
+	})
+}
+
+func TestIsPasteLabelOnly(t *testing.T) {
+	cases := map[string]bool{
+		"[Pasted text #3 +8 lines]":                           true,
+		"[Pasted text #12 +1 line]":                           true,
+		"[Pasted text #2]":                                    true,
+		"[Pasted text #3 +8 lines][Pasted text #4 +2 lines]":  true,
+		"[Pasted text #3 +8 lines] [Pasted text #4 +2 lines]": true,
+		"[Pasted text #3 +8 lines] approve":                   false,
+		"approve [Pasted text #3 +8 lines]":                   false,
+		"[Pasted text #x +8 lines]":                           false,
+		"":                                                    false,
+	}
+	for box, want := range cases {
+		if got := isPasteLabelOnly(box); got != want {
+			t.Errorf("isPasteLabelOnly(%q) = %v, want %v", box, got, want)
+		}
+	}
+}
+
+// TestGuardCollapsedPaste covers hq-eez8jf: one lost Enter after a multi-line
+// nudge left Claude's "[Pasted text #3 +8 lines]" in the mayor's box, and the
+// guard refused every message after it for 7 hours.
+func TestGuardCollapsedPaste(t *testing.T) {
+	const label = "[Pasted text #3 +8 lines]"
+	const msg = "line one\nline two"
+
+	// ownPaste is a box holding gc's own stranded paste of msg, recorded the
+	// way NudgeSession records it: the draft first, then the label it drew.
+	ownPaste := func(t *testing.T) (*Tmux, *boxFake) {
+		t.Helper()
+		f := &boxFake{}
+		tm := NewTmux()
+		tm.exec = f
+		if err := tm.recordNudgeDraft("sess", msg); err != nil {
+			t.Fatalf("recordNudgeDraft: %v", err)
+		}
+		f.box = label
+		if got := tm.notePasteLabel("sess"); got != label {
+			t.Fatalf("notePasteLabel = %q, want %q", got, label)
+		}
+		f.keys = nil
+		return tm, f
+	}
+
+	t.Run("gc's own label for the same message is submitted, not pasted again", func(t *testing.T) {
+		tm, f := ownPaste(t)
+		drafted, err := tm.guardUnsentInput("sess", msg)
+		if err != nil || !drafted {
+			t.Fatalf("guard = (%v, %v), want (true, nil)", drafted, err)
+		}
+		if len(f.keys) != 0 {
+			t.Fatalf("guard typed into gc's own draft: %v", f.keys)
+		}
+		if got := tm.draftPasteLabel("sess"); got != label {
+			t.Fatalf("draftPasteLabel = %q, want %q", got, label)
+		}
+	})
+
+	t.Run("gc's own label lets a different message through", func(t *testing.T) {
+		tm, f := ownPaste(t)
+		drafted, err := tm.guardUnsentInput("sess", "a newer message")
+		if err != nil || drafted {
+			t.Fatalf("guard = (%v, %v), want (false, nil)", drafted, err)
+		}
+		if len(f.keys) != 0 {
+			t.Fatalf("guard probed gc's own draft: %v", f.keys)
+		}
+	})
+
+	t.Run("a label with no gc paste on record refuses", func(t *testing.T) {
+		f := &boxFake{box: label}
+		tm := NewTmux()
+		tm.exec = f
+		_, err := tm.guardUnsentInput("sess", msg)
+		if !errors.Is(err, ErrNudgeInputOccupied) {
+			t.Fatalf("guard = %v, want a refusal", err)
+		}
+	})
+
+	t.Run("a label gc did not draw refuses, even after a gc paste", func(t *testing.T) {
+		tm, f := ownPaste(t)
+		f.box = "[Pasted text #4 +8 lines]" // a person's later paste
+		if _, err := tm.guardUnsentInput("sess", msg); !errors.Is(err, ErrNudgeInputOccupied) {
+			t.Fatalf("guard = %v, want a refusal", err)
+		}
+	})
+
+	t.Run("a label is not gc's when gc's last paste was recorded as text", func(t *testing.T) {
+		f := &boxFake{}
+		tm := NewTmux()
+		tm.exec = f
+		_ = tm.recordNudgeDraft("sess", msg)
+		f.box = label
+		if _, err := tm.guardUnsentInput("sess", msg); !errors.Is(err, ErrNudgeInputOccupied) {
+			t.Fatalf("guard = %v, want a refusal", err)
+		}
+	})
+
+	t.Run("a real typed line after gc's label still refuses", func(t *testing.T) {
+		tm, f := ownPaste(t)
+		f.box = label + " approve both PRs"
+		if _, err := tm.guardUnsentInput("sess", msg); !errors.Is(err, ErrNudgeInputOccupied) {
+			t.Fatalf("guard = %v, want a refusal", err)
+		}
+		if f.box != label+" approve both PRs" {
+			t.Fatalf("box after the probe = %q, want it unchanged", f.box)
+		}
+	})
+
+	t.Run("notePasteLabel records nothing when the box shows text", func(t *testing.T) {
+		f := &boxFake{}
+		tm := NewTmux()
+		tm.exec = f
+		_ = tm.recordNudgeDraft("sess", "Run gc hook")
+		f.box = "Run gc hook"
+		if got := tm.notePasteLabel("sess"); got != "" {
+			t.Fatalf("notePasteLabel = %q, want nothing", got)
+		}
+		if got := f.env[nudgeDraftEnvKey]; got != "Run gc hook" {
+			t.Fatalf("draft head = %q, want the text head kept", got)
+		}
+	})
+}
+
+func TestSubmitStrandedPaste(t *testing.T) {
+	const label = "[Pasted text #3 +8 lines]"
+
+	t.Run("no label on record: the box is not read", func(t *testing.T) {
+		f := &boxFake{box: label}
+		tm := NewTmux()
+		tm.exec = f
+		sends := 0
+		if got := tm.submitStrandedPaste("sess", "", func() error { sends++; return nil }); got != pasteNotTracked || sends != 0 {
+			t.Fatalf("got (%v, %d sends), want (pasteNotTracked, 0)", got, sends)
+		}
+	})
+
+	t.Run("a box already empty proves the submit", func(t *testing.T) {
+		f := &boxFake{}
+		tm := NewTmux()
+		tm.exec = f
+		sends := 0
+		if got := tm.submitStrandedPaste("sess", label, func() error { sends++; return nil }); got != pasteSubmitted || sends != 0 {
+			t.Fatalf("got (%v, %d sends), want (pasteSubmitted, 0)", got, sends)
+		}
+	})
+
+	t.Run("a lost Enter is sent again until the label leaves", func(t *testing.T) {
+		f := &boxFake{box: label}
+		tm := NewTmux()
+		tm.exec = f
+		sends := 0
+		enter := func() error { sends++; f.box = ""; return nil }
+		if got := tm.submitStrandedPaste("sess", label, enter); got != pasteSubmitted || sends != 1 {
+			t.Fatalf("got (%v, %d sends), want (pasteSubmitted, 1)", got, sends)
+		}
+	})
+
+	t.Run("an Enter that never lands reads as stranded", func(t *testing.T) {
+		f := &boxFake{box: label}
+		tm := NewTmux()
+		tm.exec = f
+		sends := 0
+		if got := tm.submitStrandedPaste("sess", label, func() error { sends++; return nil }); got != pasteStranded || sends != pasteResubmitMax {
+			t.Fatalf("got (%v, %d sends), want (pasteStranded, %d)", got, sends, pasteResubmitMax)
+		}
+	})
+
+	t.Run("somebody typing stops the re-submit", func(t *testing.T) {
+		f := &boxFake{box: label + " approve"}
+		tm := NewTmux()
+		tm.exec = f
+		sends := 0
+		if got := tm.submitStrandedPaste("sess", label, func() error { sends++; return nil }); got != pasteNotTracked || sends != 0 {
+			t.Fatalf("got (%v, %d sends), want (pasteNotTracked, 0)", got, sends)
+		}
+	})
+
+	t.Run("no box on screen stops the re-submit", func(t *testing.T) {
+		f := &boxFake{noBox: true}
+		tm := NewTmux()
+		tm.exec = f
+		sends := 0
+		if got := tm.submitStrandedPaste("sess", label, func() error { sends++; return nil }); got != pasteNotTracked || sends != 0 {
+			t.Fatalf("got (%v, %d sends), want (pasteNotTracked, 0)", got, sends)
 		}
 	})
 }
