@@ -445,6 +445,7 @@ func buildDesiredStateWithSessionBeads(
 		}
 	}
 
+	subPhaseStart = startTickPhase()
 	for i := range cfg.Agents {
 		if cfg.Agents[i].Suspended {
 			continue
@@ -681,6 +682,11 @@ func buildDesiredStateWithSessionBeads(
 		}
 		pendingPools = append(pendingPools, poolEvalWork{agentIdx: i, sp: sp, poolDir: poolDir, env: env, newDemand: store != nil})
 	}
+	recordDemandSubPhase(trace, "demand_snapshot.scan_agents", subPhaseStart, map[string]any{
+		"agents":          len(cfg.Agents),
+		"pending_pools":   len(pendingPools),
+		"default_targets": len(defaultScaleTargets),
+	})
 
 	// Collect work beads with assignees — used for both pool demand and
 	// named session on_demand wake. Hoisted out of the store block so
@@ -735,12 +741,16 @@ func buildDesiredStateWithSessionBeads(
 		// storePartial: stamping the beads that WERE collected is always
 		// correct, and any bead missed by a partial query simply gets stamped
 		// on a later tick.
+		subPhaseStart = startTickPhase()
 		stampRunSessionIdentity(assignedWorkBeads, assignedWorkStores, sessionBeads, stderr)
 		// Re-home work pre-assigned to a legacy bound form of a now-unbound pool
 		// agent onto the canonical identity, so the canonical session the
 		// awake/scale accounting wakes for it can actually surface and claim it
 		// (the agent-side work_query/claim path matches identities by raw string).
 		canonicalizeLegacyBoundAssignedWork(cfg, assignedWorkBeads, assignedWorkStores, sessionBeads, stderr)
+		recordDemandSubPhase(trace, "demand_snapshot.stamp_assigned_work", subPhaseStart, map[string]any{
+			"beads": len(assignedWorkBeads),
+		})
 		// Re-home open, unassigned work still routed to a legacy bound form of a
 		// now-unbound pool agent. This is the demand/claim half of the migration:
 		// empty-assignee open work never enters the assigned-work collection above,
@@ -859,6 +869,8 @@ func buildDesiredStateWithSessionBeads(
 		if len(scaleCheckPartialTemplates) > 0 {
 			fmt.Fprintf(stderr, "scaleCheck: PARTIAL — scale_check failed for %s, retaining affected sessions\n", strings.Join(sortedBoolMapKeys(scaleCheckPartialTemplates), ",")) //nolint:errcheck
 		}
+		subPhaseStart = startTickPhase()
+		resolveBefore := bp.resolveCost.totals()
 		poolWorkBeads := filterAssignedWorkBeadsForPoolDemand(cfg, cityPath, sessionBeads.OpenInfos(), assignedWorkBeads, assignedWorkStoreRefs)
 		bp.assignedWorkBeads = poolWorkBeads
 		bp.poolScaleCheckPartialTemplates = poolScaleCheckPartialTemplates
@@ -876,6 +888,10 @@ func buildDesiredStateWithSessionBeads(
 			}
 			realizePoolDesiredSessions(bp, cfgAgent, poolState, desired, stderr)
 		}
+		recordDemandSubPhase(trace, "demand_snapshot.realize_pools", subPhaseStart, bp.resolveCost.addSince(resolveBefore, map[string]any{
+			"pools":   len(poolDesiredStates),
+			"desired": len(desired),
+		}))
 	} else {
 		// No store — use scale_check counts directly.
 		scaleCheckCounts, _ = evaluatePendingPoolsMap(cfg, pendingPools, stderr, trace)
@@ -907,6 +923,8 @@ func buildDesiredStateWithSessionBeads(
 	// entries. "always" mode sessions are unconditionally materialized;
 	// "on_demand" sessions are materialized only when they already have a
 	// canonical bead or direct assigned work.
+	namedPhaseStart := startTickPhase()
+	namedResolveBefore := bp.resolveCost.totals()
 	namedSpecs := make(map[string]namedSessionSpec)
 	for i := range cfg.NamedSessions {
 		identity := cfg.NamedSessions[i].QualifiedName()
@@ -1045,14 +1063,23 @@ func buildDesiredStateWithSessionBeads(
 		installAgentSideEffects(bp, spec.Agent, tp, stderr)
 		desired[tp.SessionName] = tp
 	}
+	recordDemandSubPhase(trace, "demand_snapshot.realize_named_sessions", namedPhaseStart, bp.resolveCost.addSince(namedResolveBefore, map[string]any{
+		"named_specs": len(namedSpecs),
+	}))
 
 	baseDesired := cloneDesiredState(desired)
 
 	// Phase 2: discover session beads created outside config iteration
 	// (e.g., by "gc session new"). Include them in desired state if they
 	// have a valid template and are not held/closed.
+	overlayPhaseStart := startTickPhase()
+	overlayResolveBefore := bp.resolveCost.totals()
 	applySessionBeadDesiredOverlay(bp, cfg, desired, suspendedRigPaths, poolPartialRetentionTemplates, namedScaleCheckPartialTemplates, stderr)
+	recordDemandSubPhase(trace, "demand_snapshot.session_overlay", overlayPhaseStart, bp.resolveCost.addSince(overlayResolveBefore, map[string]any{
+		"desired": len(desired),
+	}))
 
+	continuationPhaseStart := startTickPhase()
 	var continuationClaimCandidates []ContinuationClaimCandidate
 	continuationClaimQueryPartial := storePartial
 	if !storePartial {
@@ -1064,6 +1091,9 @@ func buildDesiredStateWithSessionBeads(
 			readyAssigned,
 		)
 	}
+	recordDemandSubPhase(trace, "demand_snapshot.continuation_claims", continuationPhaseStart, map[string]any{
+		"candidates": len(continuationClaimCandidates),
+	})
 
 	return DesiredStateResult{
 		State:                              desired,
@@ -5333,11 +5363,17 @@ func materializeProviderOverlaysBeforeFingerprint(
 }
 
 func resolveTemplatePrepared(bp *agentBuildParams, cfgAgent *config.Agent, qualifiedName string, fpExtra map[string]string) (TemplateParams, error) {
+	start := time.Now()
 	if err := validateAgentSessionTransportForBuild(bp, cfgAgent, qualifiedName); err != nil {
+		bp.resolveCost.add(time.Since(start), 0, 0)
 		return TemplateParams{}, err
 	}
+	validated := time.Now()
 	prepareTemplateResolution(bp, cfgAgent, qualifiedName, bp.stderr)
-	return resolveTemplate(bp, cfgAgent, qualifiedName, fpExtra)
+	prepared := time.Now()
+	tp, err := resolveTemplate(bp, cfgAgent, qualifiedName, fpExtra)
+	bp.resolveCost.add(validated.Sub(start), prepared.Sub(validated), time.Since(prepared))
+	return tp, err
 }
 
 func validateAgentSessionTransportForBuild(bp *agentBuildParams, cfgAgent *config.Agent, qualifiedName string) error {

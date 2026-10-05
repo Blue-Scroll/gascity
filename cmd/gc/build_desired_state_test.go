@@ -13492,11 +13492,28 @@ func TestBuildDesiredStateRecordsDemandSubPhases(t *testing.T) {
 	// Sub-phases that must fire on every store-backed build, even with an
 	// empty config (the scale/named demand probes only fire with matching
 	// agents, so they are intentionally not asserted here).
+	//
+	// The tail sub-phases (scan_agents onward) are asserted too: before they
+	// existed, 38s to 157s of every demand build ran with no record at all
+	// (vn-z3xmcnp), and a dropped record would quietly hide it again.
 	want := map[string]bool{
 		"demand_snapshot.collect_open_session_beads": false,
+		"demand_snapshot.scan_agents":                false,
 		"demand_snapshot.collect_assigned_work":      false,
+		"demand_snapshot.stamp_assigned_work":        false,
 		"demand_snapshot.collect_unassigned_routed":  false,
 		"demand_snapshot.evaluate_pending_pools":     false,
+		"demand_snapshot.realize_pools":              false,
+		"demand_snapshot.realize_named_sessions":     false,
+		"demand_snapshot.session_overlay":            false,
+		"demand_snapshot.continuation_claims":        false,
+	}
+	// Records that spend time resolving session templates say how much, so a
+	// trace can tell file copying (prepare) apart from template building.
+	resolveCostFields := map[string]bool{
+		"demand_snapshot.realize_pools":          true,
+		"demand_snapshot.realize_named_sessions": true,
+		"demand_snapshot.session_overlay":        true,
 	}
 	for i := range records {
 		r := &records[i]
@@ -13506,6 +13523,13 @@ func TestBuildDesiredStateRecordsDemandSubPhases(t *testing.T) {
 		name, _ := r.Fields["operation_name"].(string)
 		if _, tracked := want[name]; tracked {
 			want[name] = true
+		}
+		if resolveCostFields[name] {
+			for _, field := range []string{"templates_resolved", "template_validate_ms", "template_prepare_ms", "template_resolve_ms"} {
+				if _, ok := r.Fields[field]; !ok {
+					t.Errorf("demand sub-phase %q is missing field %q", name, field)
+				}
+			}
 		}
 	}
 	for name, seen := range want {

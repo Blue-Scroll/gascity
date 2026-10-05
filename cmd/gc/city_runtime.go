@@ -3565,6 +3565,7 @@ func (cr *CityRuntime) loadDemandSnapshot(
 ) runtimeDemandSnapshot {
 	sessionFingerprint := sessionBeadSnapshotFingerprint(sessionBeads)
 	readyDemandFingerprint := ""
+	fingerprintStart := startTickPhase()
 	refresh := cr.shouldRefreshDemandSnapshot(trigger, configChanged, sessionFingerprint)
 	if !refresh && trigger == "patrol" && cr.demandSnapshotsEnabled() {
 		readyDemandFingerprint = cr.readyDemandSnapshotFingerprint()
@@ -3576,7 +3577,13 @@ func (cr *CityRuntime) loadDemandSnapshot(
 		} else if cr.demandSnapshot != nil {
 			readyDemandFingerprint = cr.demandSnapshot.readyDemandFingerprint
 		}
+	}
+	recordDemandSubPhase(trace, "demand_snapshot.ready_fingerprint", fingerprintStart, map[string]any{
+		"refresh": refresh,
+	})
+	if refresh {
 		result := cr.buildDesiredState(sessionBeads, trace)
+		poolDesiredStart := startTickPhase()
 		var openSessionInfos []sessionpkg.Info
 		if sessionBeads != nil {
 			openSessionInfos = sessionBeads.OpenInfos()
@@ -3593,6 +3600,9 @@ func (cr *CityRuntime) loadDemandSnapshot(
 			result.PoolDesiredCounts = make(map[string]int)
 		}
 		mergeNamedSessionDemand(result.PoolDesiredCounts, result.NamedSessionDemand, cr.cfg)
+		recordDemandSubPhase(trace, "demand_snapshot.pool_desired_counts", poolDesiredStart, map[string]any{
+			"pools": len(result.PoolDesiredCounts),
+		})
 		result.WorkSet = make(map[string]bool)
 		cr.demandSnapshot = &runtimeDemandSnapshot{
 			createdAt:              time.Now(),
