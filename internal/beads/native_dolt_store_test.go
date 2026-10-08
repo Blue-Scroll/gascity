@@ -1199,15 +1199,13 @@ func TestNativeDoltStoreCloseWithMetadataIfMatchRetriesWholeTransaction(t *testi
 		errors.New("Error 1205 (HY000): lock wait timeout exceeded"),
 	} {
 		t.Run(conflict.Error(), func(t *testing.T) {
-			storage := &retryingNativeDoltStorage{
-				nativeDoltMemStorage: newNativeDoltMemStorage(),
-				txErrors:             []error{conflict},
-			}
+			storage := &retryingNativeDoltStorage{nativeDoltMemStorage: newNativeDoltMemStorage()}
 			store := newNativeDoltStoreForTest(storage)
 			created, err := store.Create(Bead{Title: "retry whole transaction"})
 			if err != nil {
 				t.Fatalf("Create: %v", err)
 			}
+			storage.armAfterCreate(conflict)
 
 			closed, err := store.CloseWithMetadataIfMatch(created.ID, created.Revision, map[string]string{"state": "drained"})
 			if err != nil {
@@ -1230,7 +1228,7 @@ func TestNativeDoltStoreCloseWithMetadataIfMatchRetryRereadsFence(t *testing.T) 
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
-	storage.txErrors = []error{errors.New("Error 1213 (40001): deadlock")}
+	storage.armAfterCreate(errors.New("Error 1213 (40001): deadlock"))
 	storage.afterConflict = func() {
 		if err := storage.store.SetMetadata(created.ID, "intervening", "write"); err != nil {
 			t.Fatalf("intervening write: %v", err)
@@ -1258,15 +1256,13 @@ func TestNativeDoltStoreCloseWithMetadataIfMatchRetryRereadsFence(t *testing.T) 
 
 func TestNativeDoltStoreCloseWithMetadataIfMatchDoesNotRetryAmbiguousFailure(t *testing.T) {
 	sentinel := errors.New("connection reset by peer")
-	storage := &retryingNativeDoltStorage{
-		nativeDoltMemStorage: newNativeDoltMemStorage(),
-		txErrors:             []error{sentinel},
-	}
+	storage := &retryingNativeDoltStorage{nativeDoltMemStorage: newNativeDoltMemStorage()}
 	store := newNativeDoltStoreForTest(storage)
 	created, err := store.Create(Bead{Title: "ambiguous close"})
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
+	storage.armAfterCreate(sentinel)
 
 	closed, err := store.CloseWithMetadataIfMatch(created.ID, created.Revision, nil)
 	if !errors.Is(err, sentinel) {
@@ -1282,15 +1278,13 @@ func TestNativeDoltStoreCloseWithMetadataIfMatchDoesNotRetryAmbiguousFailure(t *
 
 func TestNativeDoltStoreCloseWithMetadataIfMatchReturnsZeroAfterRetryExhaustion(t *testing.T) {
 	conflict := errors.New("Error 1213 (40001): deadlock")
-	storage := &retryingNativeDoltStorage{
-		nativeDoltMemStorage: newNativeDoltMemStorage(),
-		txErrors:             []error{conflict, conflict, conflict},
-	}
+	storage := &retryingNativeDoltStorage{nativeDoltMemStorage: newNativeDoltMemStorage()}
 	store := newNativeDoltStoreForTest(storage)
 	created, err := store.Create(Bead{Title: "exhaust close retries"})
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
+	storage.armAfterCreate(conflict, conflict, conflict)
 
 	closed, err := store.CloseWithMetadataIfMatch(created.ID, created.Revision, nil)
 	if !errors.Is(err, conflict) {
@@ -1314,15 +1308,13 @@ func TestNativeDoltStoreDeleteIfMatchRetriesWholeTransaction(t *testing.T) {
 		errors.New("Error 1205 (HY000): lock wait timeout exceeded"),
 	} {
 		t.Run(conflict.Error(), func(t *testing.T) {
-			storage := &retryingNativeDoltStorage{
-				nativeDoltMemStorage: newNativeDoltMemStorage(),
-				txErrors:             []error{conflict},
-			}
+			storage := &retryingNativeDoltStorage{nativeDoltMemStorage: newNativeDoltMemStorage()}
 			store := newNativeDoltStoreForTest(storage)
 			created, err := store.Create(Bead{Title: "retry whole delete transaction"})
 			if err != nil {
 				t.Fatalf("Create: %v", err)
 			}
+			storage.armAfterCreate(conflict)
 
 			if err := store.DeleteIfMatch(created.ID, created.Revision); err != nil {
 				t.Fatalf("DeleteIfMatch: %v", err)
@@ -1342,15 +1334,13 @@ func TestNativeDoltStoreDeleteIfMatchRetriesWholeTransaction(t *testing.T) {
 // pins the same transient/ambiguous split the close path draws.
 func TestNativeDoltStoreDeleteIfMatchDoesNotRetryAmbiguousFailure(t *testing.T) {
 	sentinel := errors.New("connection reset by peer")
-	storage := &retryingNativeDoltStorage{
-		nativeDoltMemStorage: newNativeDoltMemStorage(),
-		txErrors:             []error{sentinel},
-	}
+	storage := &retryingNativeDoltStorage{nativeDoltMemStorage: newNativeDoltMemStorage()}
 	store := newNativeDoltStoreForTest(storage)
 	created, err := store.Create(Bead{Title: "ambiguous delete"})
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
+	storage.armAfterCreate(sentinel)
 
 	if err := store.DeleteIfMatch(created.ID, created.Revision); !errors.Is(err, sentinel) {
 		t.Fatalf("DeleteIfMatch error = %v, want %v", err, sentinel)
@@ -3163,6 +3153,16 @@ type retryingNativeDoltStorage struct {
 	txCalls       int
 	txErrors      []error
 	afterConflict func()
+}
+
+// armAfterCreate starts the count and the injected failures AFTER the test's
+// Create. Create is one RunInTransaction of its own since vn-g3yqvvk (the bead
+// and its edges land together or not at all), so a spy armed in the literal
+// would hand its first failure to the create and count it as a close or delete
+// attempt. The six retry tests below pin the close and delete paths only.
+func (s *retryingNativeDoltStorage) armAfterCreate(txErrors ...error) {
+	s.txCalls = 0
+	s.txErrors = txErrors
 }
 
 func (s *retryingNativeDoltStorage) RunInTransaction(_ context.Context, _ string, fn func(beadslib.Transaction) error) error {
