@@ -19,8 +19,6 @@ interface BeadBoardSectionProps {
   ids: ReadonlySet<string>;
   selectedId: string | null;
   attentionSeverity?: (beadId: string) => BadgeSeverity | null;
-  /** Liveness note per bead for in-progress rows (gp-6xd); see BeadBoardRow. */
-  noteOf?: (beadId: string) => string | null;
   onSelect: (beadId: string) => void;
 }
 
@@ -31,7 +29,6 @@ export function BeadBoardSection({
   ids,
   selectedId,
   attentionSeverity,
-  noteOf,
   onSelect,
 }: BeadBoardSectionProps) {
   const columns = selectColumns(graph, ids);
@@ -45,7 +42,6 @@ export function BeadBoardSection({
         columns={columns}
         selectedId={selectedId}
         {...(attentionSeverity === undefined ? {} : { attentionSeverity })}
-        {...(noteOf === undefined ? {} : { noteOf })}
         onSelect={onSelect}
       />
     </section>

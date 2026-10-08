@@ -5,19 +5,19 @@ import type { IsoTimestamp } from './dashboard-sessions.js';
 // per rig before it bites. Unlike the supervisor's single city-level
 // store_health, each rig carries its own embedded-dolt `.beads` store, so this
 // is a dashboard-local probe (host-FS reachability + dolt endpoint liveness +
-// `bd ping` connectivity check), not supervisor wire data.
+// `bd doctor` health checks), not supervisor wire data.
 
 /** Per-rig roll-up tone for the status dot. */
 export type RigStoreRollup = 'ok' | 'warn' | 'down';
 
-/** Status of a single `bd ping` check, mirroring its own vocabulary. */
+/** Status of a single `bd doctor` check, mirroring its own vocabulary. */
 export type RigStoreCheckStatus = 'ok' | 'warning' | 'error';
 
 /** One non-ok store/dolt health check, surfaced for the operator. */
 export interface RigStoreCheck {
-  /** Check category, e.g. "Beads". */
+  /** `bd doctor` category, e.g. "Core System", "Data & Config". */
   category: string;
-  /** Check name, e.g. "Database Connectivity". */
+  /** `bd doctor` check name, e.g. "Dolt Connection". */
   name: string;
   status: RigStoreCheckStatus;
   message: string;
@@ -35,18 +35,17 @@ export interface RigStoreHealth {
   /** Configured dolt sql-server endpoint (host:port), or null when the store
    *  declares no server endpoint (e.g. embedded / jsonl-only mode). */
   doltEndpoint: string | null;
-  /** Dolt connectivity: the TCP probe result at `doltEndpoint` for a store
-   *  that persists `server` mode, and the `bd ping` connectivity check
-   *  otherwise (embedded and proxied-server stores report non-null here).
-   *  `null` only when the probe produced no connectivity signal at all — it
-   *  could not be run, or it exited 0 with no parseable JSON. */
+  /** Dolt sql-server reachable at its endpoint. `null` when there is no
+   *  endpoint to probe (no outage to report for an embedded store). */
   doltConnected: boolean | null;
+  /** Live bead row count when `bd doctor` reported it. */
+  issueCount: number | null;
   /** Store/dolt checks that are not `ok`. Benign hygiene categories
    *  (git hooks, editor integrations) are excluded — they are not store
    *  health and the dashboard operator cannot act on them here. */
   problems: RigStoreCheck[];
-  /** Set when the probe could not fully assess the store (e.g. `bd ping`
-   *  returned no parseable JSON while still exiting 0). */
+  /** Set when the probe could not fully assess the store (e.g. `bd doctor`
+   *  fell back to embedded mode, which it cannot health-check). */
   note?: string;
 }
 
