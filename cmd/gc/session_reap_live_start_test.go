@@ -59,7 +59,7 @@ func TestReapStaleSessionBeads_SkipsSessionWhoseStartIsStillInFlight(t *testing.
 	}
 
 	var stderr bytes.Buffer
-	if got := reapStaleSessionBeads(store, sp, nil, starts, clk, &stderr); got != 0 {
+	if got := reapStaleSessionBeads("", nil, store, nil, sp, nil, starts, clk, &stderr); got != 0 {
 		t.Fatalf("reapStaleSessionBeads() = %d, want 0 while the start goroutine is still running\nstderr: %s", got, stderr.String())
 	}
 	open, err := loadSessionBeads(store)
@@ -74,7 +74,7 @@ func TestReapStaleSessionBeads_SkipsSessionWhoseStartIsStillInFlight(t *testing.
 	// the existing windows must still reap it.
 	done()
 	stderr.Reset()
-	if got := reapStaleSessionBeads(store, sp, nil, starts, clk, &stderr); got != 1 {
+	if got := reapStaleSessionBeads("", nil, store, nil, sp, nil, starts, clk, &stderr); got != 1 {
 		t.Fatalf("reapStaleSessionBeads() = %d, want 1 once the start goroutine has ended\nstderr: %s", got, stderr.String())
 	}
 }
@@ -137,7 +137,7 @@ func TestAsyncStart_MarksSessionInFlightSoTheReaperSparesIt(t *testing.T) {
 	// even with a clock far past every grace window.
 	var stderr bytes.Buffer
 	reapClk := &clock.Fake{Time: clk.Now().Add(30 * time.Minute)}
-	if got := reapStaleSessionBeads(store, sp, nil, starts, reapClk, &stderr); got != 0 {
+	if got := reapStaleSessionBeads("", nil, store, nil, sp, nil, starts, reapClk, &stderr); got != 0 {
 		t.Fatalf("reapStaleSessionBeads() = %d, want 0 during a live start\nstderr: %s", got, stderr.String())
 	}
 
