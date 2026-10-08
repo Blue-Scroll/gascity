@@ -273,6 +273,15 @@ city (HQ) store. An explicit --city is a true scope override: it forces the
 city store and disables rig auto-detection (GC_RIG, cwd, bead prefix), so a
 deliberate city-scoped query is never silently downgraded to a rig store.
 
+--rig also takes the city's own name, the name "gc rig list" prints for the
+HQ, because that store is where session, agent and mail beads live and it is
+never a rig. Rig stores hold none of them. So "gc bd list --type session" run
+from a rig reads a store with zero session beads and returns nothing, while
+"gc bd show &lt;hq-id&gt;" works from the same place: a bead id in the args
+auto-detects the city store, and a list has no id to detect. Pin the scope
+when you query by type rather than by id. --rig takes names and not prefixes,
+so use the city name, not the HQ bead prefix.
+
 On a city that serves a coordination class from its own [storage] binding,
 a by-id read or write of a bead that binding owns is answered in process
 from the binding, not by bd against a work store that does not hold it.
@@ -326,6 +335,7 @@ gc bd --rig my-project create "New task"
 gc bd show my-project-abc          # auto-detects rig from bead prefix
 gc bd list --rig my-project -s open
 gc bd --city /path/to/city list    # pins the city (HQ) store, no rig auto-detect
+gc bd --rig my-city list --type session   # session beads: city store, by its name
 gc bd heartbeat my-project-abc     # refresh the claim lease you hold
 gc bd release-if-current my-project-abc worker-1
 ```
@@ -809,6 +819,10 @@ Loads city.toml with all includes, packs, patches, and overrides,
 then outputs the merged result. Use --validate to check for errors
 without printing. Use --provenance to see which file contributed each
 config element. Use -f to layer additional config files.
+
+This is where config-load warnings live. Other gc commands do not print
+them, so their stderr stays free for real errors. Set GC_CONFIG_WARNINGS=1
+to print them on every command too.
 
 ```
 gc config show [flags]
@@ -4178,6 +4192,17 @@ gc session kill <session-id-or-alias> [flags]
 
 List all chat sessions. By default shows active and suspended sessions.
 
+--state closed (or --state all) reads closed session history from the bead
+store, newest first, bounded by --limit. Closed rows carry the drain record:
+the REASON cell says when the controller asked a session to stop, and --json
+carries the whole record (drain_reason, drain_initiator, drain_requested_at,
+drain_canceled_at, drain_cancel_count).
+
+To see every drain the controller began, and which of them it took back:
+
+  gc session list --state closed --json |
+    jq '[.sessions[] | select(.drain_initiator == "reconciler")]'
+
 ```
 gc session list [flags]
 ```
@@ -4185,6 +4210,7 @@ gc session list [flags]
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
 | `--json` | bool |  | JSON output |
+| `--limit` | int |  | max closed sessions to read with --state closed/all (default 200); does not bound open sessions |
 | `--state` | string |  | filter by state: "active", "suspended", "closed", "all" |
 | `--template` | string |  | filter by template name |
 

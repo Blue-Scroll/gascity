@@ -186,23 +186,21 @@ func (cr *CityRuntime) runOrdersLanePass(ctx context.Context, cityRoot, reason s
 		return
 	}
 
-	phaseStart := time.Now()
+	phaseStart := startTickPhase()
 	cr.ensureManagedDoltPublishedForTick()
-	if trace != nil {
-		trace.RecordControllerOperation(TraceSiteControllerTickPhase, TraceReasonRetained, TraceOutcomeComplete,
-			"managed_dolt_preflight", time.Since(phaseStart), nil)
-	}
+	trace.RecordTickPhase(TraceSiteControllerTickPhase, "managed_dolt_preflight", phaseStart, nil)
 	if ctx.Err() != nil {
 		return
 	}
 
-	phaseStart = time.Now()
-	cr.dispatchOrdersLocked(ctx, cityRoot, generation, cfg)
+	// The dispatch_orders record says where the pass spent its time: one
+	// <part>_ms and <part>_bd_calls per part of the body, the dispatcher's own
+	// passes and counts, and the slowest orders. The phase ran 20s to 221s
+	// under one bare number before that (hq-mb1gvr).
+	phaseStart = startTickPhase()
+	parts := cr.dispatchOrdersLocked(ctx, cityRoot, generation, cfg)
 	lane.notePass(time.Now(), reason)
-	if trace != nil {
-		trace.RecordControllerOperation(TraceSiteOrderDispatch, TraceReasonRetained, TraceOutcomeComplete,
-			"dispatch_orders", time.Since(phaseStart), nil)
-	}
+	trace.RecordTickPhase(TraceSiteOrderDispatch, "dispatch_orders", phaseStart, parts)
 	if ctx.Err() != nil {
 		return
 	}
@@ -284,33 +282,41 @@ func (cr *CityRuntime) dispatchOrders(ctx context.Context, cityRoot string) {
 }
 
 // dispatchOrdersLocked is the dispatch body. passMu must be held; generation
-// and cfg come from orderPassConfig.
-func (cr *CityRuntime) dispatchOrdersLocked(ctx context.Context, cityRoot string, generation uint64, cfg *config.City) {
+// and cfg come from orderPassConfig. It returns where the body spent its
+// time, as the fields of the pass's dispatch_orders record: each part it ran
+// (rescan, install, the three watchdogs, dispatch) as <part>_ms and
+// <part>_bd_calls, plus the dispatcher's own report. A pass that ran nothing
+// returns no fields.
+func (cr *CityRuntime) dispatchOrdersLocked(ctx context.Context, cityRoot string, generation uint64, cfg *config.City) tickPhaseParts {
+	parts := tickPhaseParts{}
 	if ctx.Err() != nil {
-		return
+		return parts
 	}
 	// A suspended city gets no order pass at all: dispatch already skips it,
 	// and the tracking and mail watchdogs below would read every scope's
 	// store, restarting the proxies suspension retired.
 	if effectiveCitySuspended(cfg, loadSuspensionStateBestEffort(cr.cityPath)) {
-		return
+		return parts
 	}
 	now := time.Now()
 	if !cr.wispIndexMigrationApplied {
 		cr.wispIndexMigrationApplied = true
-		cr.applyWispQueryIndexes(ctx)
+		parts.time("wisp_index", func() { cr.applyWispQueryIndexes(ctx) })
 	}
-	cr.rescanOrderDispatcherIfDue(cityRoot, cfg, generation, now)
+	parts.time("rescan", func() { cr.rescanOrderDispatcherIfDue(cityRoot, cfg, generation, now) })
 	// Installs whatever is staged — this rescan's result, or a reload staged
 	// while the previous pass held the lock — before anything dispatches
 	// against the outgoing dispatcher.
-	cr.installPendingOrderDispatcherLocked(ctx)
-	cr.runOrderTrackingSweepWatchdog(cfg, now)
-	cr.runOrderTrackingRetentionWatchdog(cfg, now)
-	cr.runNudgeMailSweepWatchdog(cfg, now)
+	parts.time("install", func() { cr.installPendingOrderDispatcherLocked(ctx) })
+	parts.time("tracking_sweep", func() { cr.runOrderTrackingSweepWatchdog(cfg, now) })
+	parts.time("tracking_retention", func() { cr.runOrderTrackingRetentionWatchdog(cfg, now) })
+	parts.time("nudge_mail_sweep", func() { cr.runNudgeMailSweepWatchdog(cfg, now) })
 	if cr.od != nil {
-		cr.od.dispatch(ctx, cityRoot, now)
+		var report orderDispatchReport
+		parts.time("dispatch", func() { report = cr.od.dispatch(ctx, cityRoot, now) })
+		report.addTo(parts)
 	}
+	return parts
 }
 
 // stageOrderDispatcher is the reload-side stage: it records next as the

@@ -185,7 +185,7 @@ func TestReconcileSessionBeads_IdleRespawnCancelsWhenActivityResumesBeforeAck(t 
 		},
 	}
 	dt := newDrainTracker()
-	if !beginSessionDrainInfo(info, sp, dt, idleRespawnDrainReason, clk, defaultDrainTimeout) {
+	if !beginSessionDrainInfo(info, sp, dt, idleRespawnDrainReason, clk, defaultDrainTimeout, nil) {
 		t.Fatal("begin idle-respawn drain")
 	}
 	sp.SetActivity(name, clk.Now().Add(time.Second))

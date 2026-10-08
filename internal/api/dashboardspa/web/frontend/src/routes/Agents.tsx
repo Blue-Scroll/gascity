@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
+import { sessionRoute } from '../lib/sessionLink';
+import { terminalRoute, useTerminalServed } from '../lib/terminal';
 import {
   GC_EVENT_PREFIX,
   effectiveContextPct,
@@ -27,6 +29,7 @@ import { useNow } from '../contexts/NowContext';
 import { READ_ONLY_CONTROL_TITLE, ReadOnlyBadge, useReadOnly } from '../contexts/ReadOnlyContext';
 import { useCachedData } from '../hooks/useCachedData';
 import { useGcEventRefresh } from '../hooks/useGcEvents';
+import { useRefreshWhilePartial } from '../hooks/useRefreshWhilePartial';
 import { formatRelative } from '../hooks/time';
 import {
   attachCommand,
@@ -36,7 +39,12 @@ import {
 } from '../supervisor/agentPending';
 import { listSupervisorSessions } from '../supervisor/sessionReads';
 import { listSupervisorBeads } from '../supervisor/beadReads';
-import { listSupervisorAgents, type SupervisorAgent } from '../supervisor/agentReads';
+import {
+  agentSessionId,
+  listSupervisorAgents,
+  sessionIdsByName,
+  type SupervisorAgent,
+} from '../supervisor/agentReads';
 import {
   agentProject,
   cleanWorkerName,
@@ -96,12 +104,15 @@ const AGENT_SEARCH_FIELDS = (a: SupervisorAgent): ReadonlyArray<string> =>
 
 export function AgentsPage() {
   const attention = useAttentionModel();
-  const { data, loading, error, refresh } = useCachedData('agents', listSupervisorAgents);
-  // The supervisor's AgentResponse.session (SessionInfo) carries only
-  // `name`/`attached`/`last_activity` — NOT the session id. Peek needs
-  // the session id (gc-XXX format) per SESSION_ID_RE on the backend.
-  // Fetch the sessions list in parallel so we can map agent.session.name
-  // -> session.id at peek time.
+  const { data, loading, error, refresh, fetchedAt } = useCachedData(
+    'agents',
+    listSupervisorAgents,
+  );
+  // The sessions list feeds "Workers active" below. A row's own way into its
+  // pane (the session link, Peek, a pending ask) reads session.id off the
+  // agent row through agentSessionId, and uses this list only as the fallback
+  // for a row with no id. That list can take over a minute on a busy town, so
+  // nothing a row needs may wait on it (hq-subxy4).
   const sessionsCache = useCachedData('sessions', listSupervisorSessions);
   // The "Workers active" section is SESSION-driven: it counts the live worker
   // sessions (stable across the bead churn), grouped by rig. Beads are fetched
@@ -110,23 +121,32 @@ export function AgentsPage() {
   // The beads churn to zero within seconds and aren't reliably aggregated, so a
   // worker with no captured bead is the common (and still-valid) case.
   const beadsCache = useCachedData('beads:in-flight', () => listSupervisorBeads());
+  // While the bead store is slow, both lists answer at once with live names
+  // and say they are partial. Ask again until the details land (vn-fzant5y).
+  useRefreshWhilePartial(data?.partial === true, fetchedAt, refresh);
+  useRefreshWhilePartial(
+    sessionsCache.data?.partial === true,
+    sessionsCache.fetchedAt,
+    sessionsCache.refresh,
+  );
   const rows = useMemo<SupervisorAgent[]>(() => data?.items ?? [], [data]);
-  const sessionIds = useMemo(
-    () => (sessionsCache.data?.items ?? []).map((session) => session.id).sort(),
+  const fallbackSessionIds = useMemo(
+    () => sessionIdsByName(sessionsCache.data?.items ?? []),
     [sessionsCache.data],
   );
-  const agentNames = useMemo(() => rows.map((agent) => agent.name).sort(), [rows]);
-  const pendingCache = useCachedData(
-    `agent-pending:${agentNames.join(',')}:${sessionIds.join(',')}`,
-    () => listAgentPendingInteractions(rows, sessionsCache.data?.items ?? []),
+  // Keyed on each agent's session id, so a new or replaced session asks
+  // again. With ids on the rows the key settles when the agents list lands.
+  const pendingKey = useMemo(
+    () =>
+      rows
+        .map((agent) => `${agent.name}=${agentSessionId(agent, fallbackSessionIds) ?? ''}`)
+        .sort()
+        .join(','),
+    [rows, fallbackSessionIds],
   );
-  const sessionsById = useMemo(() => {
-    const map = new Map<string, string>();
-    for (const s of sessionsCache.data?.items ?? []) {
-      if (s.session_name) map.set(s.session_name, s.id);
-    }
-    return map;
-  }, [sessionsCache.data]);
+  const pendingCache = useCachedData(`agent-pending:${pendingKey}`, () =>
+    listAgentPendingInteractions(rows, fallbackSessionIds),
+  );
   const pendingByAgent = useMemo(() => {
     const map = new Map<string, AgentPendingInteraction>();
     for (const pending of pendingCache.data ?? []) {
@@ -160,8 +180,7 @@ export function AgentsPage() {
   const [search, setSearch] = useState('');
   const [rigFilter, setRigFilter] = useState('');
 
-  // Peek key is the agent alias (`name`); modal resolves the live session
-  // by mapping agent.session.name -> session.id via the sessions cache.
+  // Peek key is the agent alias (`name`); the modal opens that agent's session.
   const [peekAlias, setPeekAlias] = useState<string | null>(null);
   const [responseMessage, setResponseMessage] = useState<string | null>(null);
   const [responseError, setResponseError] = useState<string | null>(null);
@@ -173,11 +192,10 @@ export function AgentsPage() {
     () => (peekAlias === null ? null : (rows.find((a) => a.name === peekAlias) ?? null)),
     [rows, peekAlias],
   );
-  const peekSessionId = useMemo(() => {
-    const sessionName = peekAgent?.session?.name;
-    if (!sessionName) return null;
-    return sessionsById.get(sessionName) ?? null;
-  }, [peekAgent, sessionsById]);
+  const peekSessionId = useMemo(
+    () => (peekAgent === null ? null : (agentSessionId(peekAgent, fallbackSessionIds) ?? null)),
+    [peekAgent, fallbackSessionIds],
+  );
 
   const sseState = useGcEventRefresh(
     [GC_EVENT_PREFIX.session, GC_EVENT_PREFIX.bead, 'agent.'],
@@ -192,6 +210,10 @@ export function AgentsPage() {
 
   const synopsis = useMemo(() => buildAgentSynopsis(rows), [rows]);
   const readOnly = useReadOnly();
+  // A terminal link per running agent, only where this machine serves one. The
+  // session view is the usual way in; the terminal is the escape hatch for what
+  // a transcript and the live pane cannot show (a startup dialog, a wedged TUI).
+  const terminalServed = useTerminalServed() === true;
   const handlePendingResponse = useCallback(
     async (pending: AgentPendingInteraction, action: 'approve' | 'deny') => {
       // Defense-in-depth: the disabled buttons already block this, but a
@@ -255,12 +277,19 @@ export function AgentsPage() {
       attentionDataProps(resourceAttentionSeverity(attention, 'agents', agent.name)),
     [attention],
   );
+  // Three different reasons the table can be empty, and each one says so.
+  // A slow first answer must never read as an empty town: on a big town the
+  // first fetch has taken minutes, and "No agents configured." sat on screen
+  // the whole time (hq-xujh6g).
   const rosterUnavailable = error !== null && rows.length === 0;
+  const rosterLoading = !rosterUnavailable && data === undefined;
   const emptyMessage = rosterUnavailable
     ? 'Agent roster unavailable.'
-    : rows.length === 0
-      ? 'No agents configured.'
-      : 'No agents match the current search or filter.';
+    : rosterLoading
+      ? ROSTER_LOADING_MESSAGE
+      : rows.length === 0
+        ? 'No agents configured.'
+        : 'No agents match the current search or filter.';
 
   const columns = useMemo<ReadonlyArray<TableColumn<SupervisorAgent>>>(
     () => [
@@ -290,6 +319,11 @@ export function AgentsPage() {
             ? `${r.name} — configured but not running; detail will show no live session`
             : `Open drilldown for ${r.name}`;
           const linkColor = orphan ? 'text-fg-muted' : 'text-fg';
+          // The live session, reachable straight from the roster.
+          const tmuxSession = r.session?.name ?? '';
+          const sessionId = agentSessionId(r, fallbackSessionIds) ?? '';
+          const showSession = sessionId !== '';
+          const showTerminal = terminalServed && tmuxSession !== '';
           return (
             <div className="min-w-0">
               <Link
@@ -301,9 +335,27 @@ export function AgentsPage() {
               >
                 {agentRowLabel(r)}
               </Link>
-              {secondary && (
-                <div className="text-label uppercase tracking-wider text-fg-faint mt-1 truncate">
-                  {secondary}
+              {(secondary || showSession || showTerminal) && (
+                <div className="text-label uppercase tracking-wider text-fg-faint mt-1 flex items-center gap-2 min-w-0">
+                  {secondary && <span className="truncate">{secondary}</span>}
+                  {showSession && (
+                    <Link
+                      to={sessionRoute(sessionId, '/agents', agentRowLabel(r), tmuxSession)}
+                      className="shrink-0 text-fg-muted hover:text-accent focus-mark"
+                      title={`Open the live session for ${r.name}`}
+                    >
+                      session
+                    </Link>
+                  )}
+                  {showTerminal && (
+                    <Link
+                      to={terminalRoute(tmuxSession, '/agents')}
+                      className="shrink-0 text-fg-muted hover:text-accent focus-mark"
+                      title={`Open a terminal on ${tmuxSession}`}
+                    >
+                      terminal
+                    </Link>
+                  )}
                 </div>
               )}
             </div>
@@ -445,14 +497,28 @@ export function AgentsPage() {
         className: 'w-80',
       },
     ],
-    [handlePendingResponse, now, pendingByAgent, readOnly, responding],
+    [
+      fallbackSessionIds,
+      handlePendingResponse,
+      now,
+      pendingByAgent,
+      readOnly,
+      responding,
+      terminalServed,
+    ],
   );
 
   return (
     <section>
       <PageHeader
         title="Agents"
-        synopsis={rosterUnavailable ? 'Agent roster unavailable.' : synopsis}
+        synopsis={
+          rosterUnavailable
+            ? 'Agent roster unavailable.'
+            : rosterLoading
+              ? ROSTER_LOADING_MESSAGE
+              : synopsis
+        }
         meta={
           <>
             <SseIndicator state={sseState} />
@@ -463,8 +529,11 @@ export function AgentsPage() {
             )}
             <PartialDataNotice
               show={data?.partial === true}
-              label="roster partial"
-              title={data?.partial_errors?.join('\n') ?? 'one or more agent backends unavailable'}
+              label="details loading"
+              title={
+                data?.partial_errors?.join('\n') ??
+                'the bead store is slow; details are still loading'
+              }
             />
             <Button size="sm" onClick={() => void refresh()} disabled={loading}>
               {loading ? 'Refreshing' : 'Refresh'}
@@ -559,12 +628,9 @@ export function AgentsPage() {
         onClose={() => setPeekAlias(null)}
         title={peekAgent?.name ?? peekAlias ?? 'Transcript'}
         caption={
-          // SessionInfo on the supervisor side carries only name/attached/
-          // last_activity — no session id — so we resolve agent.session.name
-          // -> session.id through the sessions cache. If sessions hasn't
-          // loaded yet (or the agent's session is missing from it), surface
-          // that explicitly instead of letting peek hit the route with an
-          // invalid id and degrade to "invalid session id".
+          // A row with no session.id falls back to the sessions list. While
+          // that list is loading, or when it has no match, say so instead of
+          // letting peek hit the route with an invalid id.
           peekAgent && peekAgent.session && !peekSessionId
             ? sessionsCache.loading
               ? 'Resolving session…'
@@ -696,6 +762,9 @@ function stateBucket(agent: SupervisorAgent): SynopsisBucket {
       return 'idle';
   }
 }
+
+// Shown in the header and the table until the first agents answer arrives.
+export const ROSTER_LOADING_MESSAGE = 'Loading agents.';
 
 export function buildAgentSynopsis(rows: ReadonlyArray<SupervisorAgent>): string {
   if (rows.length === 0) return 'No agents configured.';

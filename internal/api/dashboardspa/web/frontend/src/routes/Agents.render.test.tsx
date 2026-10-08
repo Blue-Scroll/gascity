@@ -14,8 +14,9 @@ import { resetSupervisorApiForTests } from '../supervisor/client';
 //
 // 1. Peek button errored with "invalid session id" because the modal passed
 //    `agent.session.name` (a friendly alias like "mayor") to a route that
-//    validates against SESSION_ID_RE (`gc-XXX` format). The fix maps
-//    agent.session.name -> session.id through the sessions cache.
+//    validates against SESSION_ID_RE (`gc-XXX` format). The fix reads
+//    session.id off the agent row, and maps agent.session.name -> session.id
+//    through the sessions cache only for a row with no id (hq-subxy4).
 //
 // 2. The agent name column rendered `display_name ?? name`, so the
 //    Orchestration group showed "Claude (Account 5)" instead of "mayor".
@@ -36,6 +37,10 @@ const fetchUrls = () => fetchCalls.map((call) => call.url);
 interface StubFetchOptions {
   agentsPayload?: unknown;
   agentsStatus?: number;
+  // The agents request never answers, like a slow supervisor on a big town.
+  agentsNeverAnswer?: boolean;
+  // The sessions list never answers. On the town it took over a minute.
+  sessionsNeverAnswer?: boolean;
 }
 
 // Minimal fetch stub that mimics the surface the AgentsPage hits: dashboard
@@ -53,6 +58,7 @@ function stubFetch(options: StubFetchOptions = {}) {
         throw new Error('old dashboard agents roster route should not be called');
       }
       if (url === '/v0/city/test-city/agents' && method === 'GET') {
+        if (options.agentsNeverAnswer) return new Promise<Response>(() => {});
         return jsonResponse(
           options.agentsPayload ?? {
             items: [
@@ -90,6 +96,7 @@ function stubFetch(options: StubFetchOptions = {}) {
         );
       }
       if (url === '/v0/city/test-city/sessions?limit=1000' && method === 'GET') {
+        if (options.sessionsNeverAnswer) return new Promise<Response>(() => {});
         return jsonResponse({
           items: [
             {
@@ -296,6 +303,39 @@ describe('AgentsPage (post-ay6 regressions)', () => {
     expect(sleepingLink.textContent).toBe('gascity-packs · polecat-2');
   });
 
+  it('says it is loading, not that the town is empty, while the first agents answer is on its way', async () => {
+    vi.unstubAllGlobals();
+    stubFetch({ agentsNeverAnswer: true });
+
+    const { container } = render(
+      <MemoryRouter future={{ v7_relativeSplatPath: true, v7_startTransition: true }}>
+        <NowProvider intervalMs={1_000_000}>
+          <AgentsPage />
+        </NowProvider>
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => expect(fetchUrls()).toContain('/v0/city/test-city/agents'));
+    expect(container.textContent).toContain('Loading agents.');
+    expect(container.textContent).not.toContain('No agents configured.');
+  });
+
+  it('says the town has no agents only once an empty answer has arrived', async () => {
+    vi.unstubAllGlobals();
+    stubFetch({ agentsPayload: { items: [], total: 0 } });
+
+    const { container } = render(
+      <MemoryRouter future={{ v7_relativeSplatPath: true, v7_startTransition: true }}>
+        <NowProvider intervalMs={1_000_000}>
+          <AgentsPage />
+        </NowProvider>
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => expect(container.textContent).toContain('No agents configured.'));
+    expect(container.textContent).not.toContain('Loading agents.');
+  });
+
   it('renders a genuine supervisor agents failure as operator-safe unavailable copy', async () => {
     vi.unstubAllGlobals();
     stubFetch({
@@ -350,6 +390,52 @@ describe('AgentsPage (post-ay6 regressions)', () => {
     expect(fetchUrls()).not.toContain('/api/city/test-city/sessions');
     expect(fetchUrls()).not.toContain('/api/city/test-city/sessions/gc-2568/peek');
     expect(fetchUrls()).not.toContain('/api/city/test-city/sessions/mayor/peek');
+  });
+
+  it('links a row to its live session from session.id, without waiting on the sessions list (hq-subxy4)', async () => {
+    vi.unstubAllGlobals();
+    stubFetch({
+      sessionsNeverAnswer: true,
+      agentsPayload: {
+        items: [
+          {
+            name: 'mayor',
+            available: true,
+            running: true,
+            suspended: false,
+            state: 'idle',
+            provider: 'claude-5',
+            session: {
+              id: 'gc-2568',
+              name: 'mayor',
+              attached: false,
+              last_activity: '2026-05-30T00:56:31Z',
+            },
+          },
+        ],
+        total: 1,
+      },
+    });
+
+    render(
+      <MemoryRouter future={{ v7_relativeSplatPath: true, v7_startTransition: true }}>
+        <NowProvider intervalMs={1_000_000}>
+          <AgentsPage />
+        </NowProvider>
+      </MemoryRouter>,
+    );
+
+    const roster = within(await screen.findByRole('table'));
+    const sessionLink = await roster.findByRole('link', { name: 'session' });
+    expect(sessionLink.getAttribute('href')).toBe(
+      '/session/gc-2568?back=%2Fagents&label=mayor&tmux=mayor',
+    );
+    // The pending ask is found through the same id.
+    expect(await screen.findByText('needs you')).toBeTruthy();
+    expect(fetchUrls()).toContain('/v0/city/test-city/session/gc-2568/pending');
+    // The sessions list was asked for (Workers active reads it) and never
+    // answered, so nothing above could have come from it.
+    expect(fetchUrls()).toContain('/v0/city/test-city/sessions?limit=1000');
   });
 
   it('surfaces pending interactions and copies the attach command for the agent', async () => {

@@ -68,7 +68,7 @@ func (s *Server) humaHandleEventList(ctx context.Context, input *EventListInput)
 	// page) the boundary, ascending; the extra row is the has-more signal.
 	scanFilter := filter
 	scanFilter.BeforeSeq = beforeSeq
-	evts, scanned, err := fetchEventPageAscending(ep, scanFilter, limit)
+	evts, scanned, err := fetchEventPageAscending(ctx, ep, scanFilter, limit)
 	if err != nil {
 		return nil, apierr.Internal.Msg(err.Error())
 	}
@@ -154,13 +154,17 @@ func parseEventBeforeSeq(cursor string) (uint64, error) {
 // limit+1 rows. The active file holds the newest events, so a full tail page
 // there IS the newest page below the boundary. Anything short cannot
 // distinguish "log exhausted" from "active file exhausted, older matches in
-// archives/rotation" and MUST fall through to the full scan — otherwise a
-// rotation (or a selective filter) strands the older history behind an unminted
-// cursor. The scan uses the in-flight-aware read when the provider offers one
-// (listWithInFlight) so a just-rotated segment living only in a .rotating-* file
-// is not skipped; the BeforeSeq predicate keeps rotation/archive handling inside
-// the one battle-tested sequential reader instead of a bespoke reverse reader.
-func fetchEventPageAscending(ep events.Provider, filter events.Filter, limit int) ([]events.Event, int, error) {
+// archives/rotation" and MUST fall through to a read that also covers the
+// archives and any in-flight .rotating-* file — otherwise a rotation (or a
+// selective filter) strands the older history behind an unminted cursor.
+//
+// That fall-through reads newest segment first and stops once it holds a page
+// (events.NewestProvider). Do not swap it for an oldest-first walk that keeps
+// the last page: on the town Mac that read all 8.6M events per request, ran on
+// for over an hour after the phone gave up, and held the supervisor at
+// 160-640% CPU (hq-bshybj). ctx must be the request's, so a client that leaves
+// stops the read.
+func fetchEventPageAscending(ctx context.Context, ep events.Provider, filter events.Filter, limit int) ([]events.Event, int, error) {
 	fetch := limit + 1
 	if tp, ok := ep.(events.TailProvider); ok {
 		tail, err := tp.ListTail(filter, fetch)
@@ -170,6 +174,9 @@ func fetchEventPageAscending(ep events.Provider, filter events.Filter, limit int
 		if len(tail) == fetch {
 			return tail, limit, nil
 		}
+	}
+	if np, ok := ep.(events.NewestProvider); ok {
+		return np.ListNewest(ctx, filter, fetch)
 	}
 	all, err := listWithInFlight(ep, filter)
 	if err != nil {

@@ -95,6 +95,17 @@ func agreementRows() []agreementRow {
 			wantServable: false,
 		},
 		{
+			// vn-rfn0d9g: the root of a graph.v2 run is a latch, and its routed
+			// steps are the work. Counting it spawned a second seat per run.
+			name: "graph.v2 workflow root routed to the pool",
+			bead: beads.Bead{ID: "a-14", Status: "open", Type: "task", Metadata: map[string]string{
+				beadmeta.KindMetadataKey:            beadmeta.KindWorkflow,
+				beadmeta.FormulaContractMetadataKey: beadmeta.FormulaContractGraphV2,
+				beadmeta.RoutedToMetadataKey:        agreementTemplate,
+			}},
+			wantServable: false,
+		},
+		{
 			name: "routed epic",
 			bead: beads.Bead{
 				ID: "a-7", Status: "open", Type: "epic",

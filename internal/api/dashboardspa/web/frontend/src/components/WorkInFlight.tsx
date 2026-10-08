@@ -1,7 +1,7 @@
 import { useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
 import type { SupervisorBead } from '../supervisor/beadReads';
-import type { SupervisorSession } from '../supervisor/sessionReads';
+import { hasSessionId, type SupervisorSession } from '../supervisor/sessionReads';
 import { useNow } from '../contexts/NowContext';
 import { formatRelative } from '../hooks/time';
 import {
@@ -63,6 +63,19 @@ function WorkerRow({
   // tone; every other worker reads as neutral state text so at most one maroon
   // mark appears per viewport.
   const tone = accent ? stateTone(session.state) : 'neutral';
+  // A live row from a partial list has no id yet, so there is nothing to
+  // peek at. It still shows, so the worker count stays honest.
+  const peekable = hasSessionId(session);
+  const label = (
+    <>
+      <span className="font-medium group-hover:text-accent">{rig}</span>
+      <span className="text-fg-faint" aria-hidden="true">
+        {' '}
+        ·{' '}
+      </span>
+      <span className="text-fg-muted group-hover:text-accent">{worker.worker}</span>
+    </>
+  );
   return (
     <li className="px-2 py-2 -mx-2 rounded-sm transition-colors duration-150 ease-out-quart hover:bg-surface-tint/60">
       <div className="flex items-baseline justify-between gap-4">
@@ -75,19 +88,18 @@ function WorkerRow({
               a route. focus-mark + group-hover accent match the roster's
               interactive affordance; the bold-rig / muted-worker hierarchy is
               preserved at rest. */}
-          <button
-            type="button"
-            onClick={() => onPeek(session.id)}
-            className="group text-left cursor-pointer focus-mark"
-            title={`Open ${rig} · ${worker.worker} transcript`}
-          >
-            <span className="font-medium group-hover:text-accent">{rig}</span>
-            <span className="text-fg-faint" aria-hidden="true">
-              {' '}
-              ·{' '}
-            </span>
-            <span className="text-fg-muted group-hover:text-accent">{worker.worker}</span>
-          </button>
+          {peekable ? (
+            <button
+              type="button"
+              onClick={() => onPeek(session.id)}
+              className="group text-left cursor-pointer focus-mark"
+              title={`Open ${rig} · ${worker.worker} transcript`}
+            >
+              {label}
+            </button>
+          ) : (
+            <span>{label}</span>
+          )}
           {bead && (
             <Link
               to={`/beads?bead=${encodeURIComponent(bead.id)}`}
@@ -112,9 +124,11 @@ function WorkerRow({
               available — no name→id remap (unlike the Agents roster, where
               SessionInfo carries only the name). Peek opens that session's
               transcript in the shared LiveSessionPeek modal. */}
-          <Button size="sm" tone="quiet" onClick={() => onPeek(session.id)}>
-            Peek
-          </Button>
+          {peekable && (
+            <Button size="sm" tone="quiet" onClick={() => onPeek(session.id)}>
+              Peek
+            </Button>
+          )}
         </div>
       </div>
     </li>
@@ -191,7 +205,7 @@ export function WorkInFlight({
           <ul className="space-y-1">
             {active.workers.map((worker, i) => (
               <WorkerRow
-                key={worker.session.id}
+                key={worker.session.id || worker.session.session_name}
                 worker={worker}
                 accent={i === accentIndex}
                 onPeek={setPeekSessionId}

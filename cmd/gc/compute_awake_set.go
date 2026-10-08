@@ -165,10 +165,13 @@ type AwakeDecision struct {
 	// work. Destructive idle recovery must never recycle a live claim holder.
 	AssignedWorkClaimed bool
 	// RequiresFreshCycle is true when an alive session's recorded
-	// currently_processing_bead_id differs from AssignedWorkBeadID. The
-	// reconciler combines this with wake_mode=fresh to trigger a
-	// restart-style cycle so the next wake starts a fresh conversation on
-	// the newly assigned bead.
+	// currently_processing_bead_id differs from AssignedWorkBeadID. It is a
+	// SUSPICION, not proof of a reassignment: this function sees one tick's
+	// work list, and a bead the session still holds can be missing from it
+	// (open but not ready, a bounded list, a failed read). For
+	// wake_mode=fresh the reconciler hands it to
+	// cycleAliveSessionForFreshReassign, which reads the recorded bead and
+	// cycles only when it has really left the session (vn-9y7tkv1).
 	RequiresFreshCycle bool
 }
 
@@ -438,8 +441,10 @@ func computeAwakeSetKeyed(input AwakeInput, keyBy awakeKey) map[string]AwakeDeci
 	// matching work bead as the anchor so crash recovery brings a session
 	// back to the bead it last owned even when other beads share the
 	// assignee. If no candidate matches the recorded current bead, fall back
-	// to the first matching work bead and flag the divergence — the
-	// reconciler reads this to decide whether to cycle the conversation for
+	// to the first matching work bead and flag the divergence. The fallback
+	// is always another bead assigned to this SAME session, so the flag alone
+	// never proves a reassignment; see RequiresFreshCycle, which the
+	// reconciler reads to decide whether to cycle the conversation for
 	// wake_mode=fresh.
 	assignedAnchor := make(map[string]string) // key → matched work bead ID
 	for _, bead := range input.SessionBeads {

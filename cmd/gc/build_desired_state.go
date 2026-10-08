@@ -474,8 +474,23 @@ func buildDesiredState(
 // store-contention regressions can be attributed without ad-hoc rebuilds.
 // RecordControllerOperation is nil-receiver-safe, so callers without an
 // active trace (e.g. buildDesiredState outside the tick) cost one branch.
-func recordDemandSubPhase(trace *sessionReconcilerTraceCycle, name string, start time.Time, fields map[string]any) {
-	trace.RecordControllerOperation(TraceSiteDemandSnapshot, TraceReasonRetained, TraceOutcomeComplete, name, trace.demandSince(start), fields)
+// demandSubPhaseStart marks where one demand sub-phase began: the trace's
+// demand clock (durationClock, so a test can fake it) and the bd exec meter
+// at that moment. Start a sub-phase with startDemandSubPhase and record it
+// with recordDemandSubPhase; the record then carries bd_calls and bd_ms
+// beside duration_ms, the same two fields every controller-tick phase
+// carries (tickPhaseStart). A bare time.Time cannot be passed by mistake.
+type demandSubPhaseStart struct {
+	tickPhaseStart
+}
+
+// startDemandSubPhase is nil-safe: without a trace it reads the wall clock.
+func startDemandSubPhase(trace *sessionReconcilerTraceCycle) demandSubPhaseStart {
+	return demandSubPhaseStart{tickPhaseStart{at: trace.demandNow(), bd: beads.ReadBDExecTotals()}}
+}
+
+func recordDemandSubPhase(trace *sessionReconcilerTraceCycle, name string, start demandSubPhaseStart, fields map[string]any) {
+	trace.RecordControllerOperation(TraceSiteDemandSnapshot, TraceReasonRetained, TraceOutcomeComplete, name, trace.demandSince(start.at), start.withBDCost(fields))
 }
 
 func buildDesiredStateWithSessionBeads(
@@ -537,7 +552,7 @@ func buildDesiredStateWithSessionBeadsAt(
 	// pass labels every store the pass reads by the census leg that serves it;
 	// it is nil, and records nothing, without a trace.
 	pass := newDemandPassTrace(trace, cfg)
-	subPhaseStart := trace.demandNow()
+	subPhaseStart := startDemandSubPhase(trace)
 	allOpenSessionInfos, openSessionBeadsErr := collectAllOpenSessionInfos(cityPath, cfg, store, rigStores, suspendedRigPaths, pass)
 	bp.sessionOccupancyInfos = allOpenSessionInfos
 	recordDemandSubPhase(trace, "demand_snapshot.collect_open_session_beads", subPhaseStart, map[string]any{
@@ -550,7 +565,15 @@ func buildDesiredStateWithSessionBeadsAt(
 	}
 
 	desired := make(map[string]TemplateParams)
+	// The agent scan resolves each pool's scale_check env, which can shell out
+	// per agent; it ran untimed until vn-z3xmcnp.
+	subPhaseStart = startDemandSubPhase(trace)
 	targets := buildDemandTargets(cityName, cityPath, cfg, store, rigStores, suspendedRigPaths, allOpenSessionInfos, controllerQueryRuntimeEnv, stderr)
+	recordDemandSubPhase(trace, "demand_snapshot.scan_agents", subPhaseStart, map[string]any{
+		"agents":          len(cfg.Agents),
+		"pending_pools":   len(targets.pendingPools),
+		"default_targets": len(targets.defaultScaleTargets),
+	})
 
 	// Collect work beads with assignees — used for both pool demand and
 	// named session on_demand wake. Hoisted out of the store block so
@@ -582,7 +605,7 @@ func buildDesiredStateWithSessionBeadsAt(
 	// second cache created below. See readyDemandCache.
 	assignedReadyCache := newTracedReadyDemandCache(pass, demandReadPointAssigned)
 	if store != nil {
-		subPhaseStart = trace.demandNow()
+		subPhaseStart = startDemandSubPhase(trace)
 		assignedWorkBeads, assignedWorkStores, assignedWorkStoreRefs, readyAssigned, storePartial = collectAssignedWorkBeadsWithStores(cityPath, cfg, store, rigStores, suspendedRigPaths, sessionBeads, assignedReadyCache)
 		recordDemandSubPhase(trace, "demand_snapshot.collect_assigned_work", subPhaseStart, map[string]any{
 			"beads":   len(assignedWorkBeads),
@@ -602,7 +625,7 @@ func buildDesiredStateWithSessionBeadsAt(
 		// it would read pre-stamp metadata and could undo a legitimate fresh
 		// stamp. Repair reads the snapshot it was collected with; the live
 		// stamp gets the last word.
-		repairsStart := trace.demandNow()
+		repairsStart := startDemandSubPhase(trace)
 		repairPoolSlotWorkDirClobber(cfg, assignedWorkBeads, assignedWorkStores, stderr)
 		repairDone := trace.demandNow()
 		// Durably record which session is executing each in-progress work
@@ -623,7 +646,7 @@ func buildDesiredStateWithSessionBeadsAt(
 		// collect_assigned_work and collect_unassigned_routed records.
 		recordDemandSubPhase(trace, "demand_snapshot.assigned_repairs", repairsStart, map[string]any{
 			"beads":           len(assignedWorkBeads),
-			"repair_ms":       repairDone.Sub(repairsStart).Milliseconds(),
+			"repair_ms":       repairDone.Sub(repairsStart.at).Milliseconds(),
 			"stamp_ms":        stampDone.Sub(repairDone).Milliseconds(),
 			"canonicalize_ms": trace.demandSince(stampDone).Milliseconds(),
 		})
@@ -634,7 +657,7 @@ func buildDesiredStateWithSessionBeadsAt(
 		// work_query/claim path match gc.routed_to canonically by raw string, so
 		// the route must be canonicalized before demand is counted or the cold
 		// pool never wakes for it.
-		subPhaseStart = trace.demandNow()
+		subPhaseStart = startDemandSubPhase(trace)
 		var unassignedRoutedPartial bool
 		unassignedRoutedBeads, unassignedRoutedStores, unassignedRoutedStoreRefs, unassignedRoutedPartial = collectOpenUnassignedRoutedWork(cityPath, cfg, store, rigStores, suspendedRigPaths, stderr, pass, nil)
 		// Same repair as above, over the open/unassigned collection: a bead
@@ -643,7 +666,7 @@ func buildDesiredStateWithSessionBeadsAt(
 		// reopened. Ordered first here for the same reason as the assigned
 		// site: the sweep reads the snapshot it was collected with, before any
 		// later pass writes through the store behind it.
-		repairsStart = trace.demandNow()
+		repairsStart = startDemandSubPhase(trace)
 		repairPoolSlotWorkDirClobber(cfg, unassignedRoutedBeads, unassignedRoutedStores, stderr)
 		repairDone = trace.demandNow()
 		canonicalizeLegacyBoundUnassignedRoutedWork(cfg, unassignedRoutedBeads, unassignedRoutedStores, stderr)
@@ -661,7 +684,7 @@ func buildDesiredStateWithSessionBeadsAt(
 		// the two records overlap and must not be summed.
 		recordDemandSubPhase(trace, "demand_snapshot.unassigned_repairs", repairsStart, map[string]any{
 			"beads":                len(unassignedRoutedBeads),
-			"repair_ms":            repairDone.Sub(repairsStart).Milliseconds(),
+			"repair_ms":            repairDone.Sub(repairsStart.at).Milliseconds(),
 			"canonicalize_ms":      canonicalizeDone.Sub(repairDone).Milliseconds(),
 			"collapse_ms":          collapseDone.Sub(canonicalizeDone).Milliseconds(),
 			"dispatcher_repair_ms": trace.demandSince(collapseDone).Milliseconds(),
@@ -684,13 +707,13 @@ func buildDesiredStateWithSessionBeadsAt(
 			ColdWakeTemplates:       targets.coldWakeTemplates,
 			NamedOnDemandTemplates:  targets.namedOnDemandTemplates,
 		}
-		subPhaseStart = trace.demandNow()
+		subPhaseStart = startDemandSubPhase(trace)
 		collected.CustomCounts, collected.CustomPartials = evaluatePendingPoolsMap(cfg, targets.pendingPools, stderr, trace)
 		recordDemandSubPhase(trace, "demand_snapshot.evaluate_pending_pools", subPhaseStart, map[string]any{
 			"pools": len(targets.pendingPools),
 		})
 		if len(targets.defaultScaleTargets) > 0 {
-			subPhaseStart = trace.demandNow()
+			subPhaseStart = startDemandSubPhase(trace)
 			var errs []error
 			collected.DefaultProbed = true
 			collected.DefaultCounts, collected.DefaultDemand, collected.DefaultPartials, errs = defaultScaleCheckCountsAndDemand(cfg, targets.defaultScaleTargets, demandReadyCache)
@@ -707,7 +730,7 @@ func buildDesiredStateWithSessionBeadsAt(
 		}
 		if len(targets.defaultNamedScaleTargets) > 0 {
 			var namedErrs []error
-			subPhaseStart = trace.demandNow()
+			subPhaseStart = startDemandSubPhase(trace)
 			namedDefaultDemand, collected.NamedPartials, namedErrs = defaultNamedSessionDemand(targets.defaultNamedScaleTargets, cfg, cityName, demandReadyCache)
 			recordDemandSubPhase(trace, "demand_snapshot.named_session_demand", subPhaseStart, map[string]any{
 				"targets": len(targets.defaultNamedScaleTargets),
@@ -726,7 +749,7 @@ func buildDesiredStateWithSessionBeadsAt(
 		if len(scaleCheckPartialTemplates) > 0 {
 			fmt.Fprintf(stderr, "scaleCheck: PARTIAL — scale_check failed for %s, retaining affected sessions\n", strings.Join(sortedBoolMapKeys(scaleCheckPartialTemplates), ",")) //nolint:errcheck
 		}
-		subPhaseStart = trace.demandNow()
+		subPhaseStart = startDemandSubPhase(trace)
 		poolWorkBeads := filterAssignedWorkBeadsForPoolDemand(cfg, cityPath, store, sessionBeads.OpenInfos(), assignedWorkBeads, assignedWorkStoreRefs)
 		bp.assignedWorkBeads = poolWorkBeads
 		bp.poolScaleCheckPartialTemplates = poolScaleCheckPartialTemplates
@@ -747,7 +770,8 @@ func buildDesiredStateWithSessionBeadsAt(
 		})
 		// Realization is where the demand pass writes: fresh pool session-bead
 		// creates, trigger-bead bindings, and template resolution per request.
-		subPhaseStart = trace.demandNow()
+		subPhaseStart = startDemandSubPhase(trace)
+		resolveBefore := bp.resolveCost.totals()
 		var realized poolRealizeStats
 		probe := &poolRealizeProbe{now: trace.demandNow}
 		bp.realizeProbe = probe
@@ -763,7 +787,7 @@ func buildDesiredStateWithSessionBeadsAt(
 			realized.add(realizePoolDesiredSessionsAt(bp, cfgAgent, poolState, poolDecisionTime, desired, stderr))
 		}
 		bp.realizeProbe = nil
-		recordDemandSubPhase(trace, "demand_snapshot.realize_pools", subPhaseStart, map[string]any{
+		recordDemandSubPhase(trace, "demand_snapshot.realize_pools", subPhaseStart, bp.resolveCost.addSince(resolveBefore, map[string]any{
 			"pools":             len(poolDesiredStates),
 			"requests":          realized.requests,
 			"creates":           realized.creates,
@@ -778,7 +802,7 @@ func buildDesiredStateWithSessionBeadsAt(
 			"bind_ms":           realized.bind.Milliseconds(),
 			"resolve_ms":        realized.resolve.Milliseconds(),
 			"side_effects_ms":   realized.sideEffects.Milliseconds(),
-		})
+		}))
 	} else {
 		// No store — use scale_check counts directly.
 		scaleCheckCounts, _ = evaluatePendingPoolsMap(cfg, targets.pendingPools, stderr, trace)
@@ -810,7 +834,8 @@ func buildDesiredStateWithSessionBeadsAt(
 	// entries. "always" mode sessions are unconditionally materialized;
 	// "on_demand" sessions are materialized only when they already have a
 	// canonical bead or direct assigned work.
-	subPhaseStart = trace.demandNow()
+	subPhaseStart = startDemandSubPhase(trace)
+	resolveBefore := bp.resolveCost.totals()
 	namedMaterialized := 0
 	named := computeNamedSessionDemand(cityName, cityPath, cfg, store, suspendedRigPaths, namedDefaultDemand, assignedWorkBeads, assignedWorkStoreRefs, readyAssigned, scaleCheckCounts, stderr)
 	for identity, spec := range named.specs {
@@ -845,24 +870,25 @@ func buildDesiredStateWithSessionBeadsAt(
 		desired[tp.SessionName] = tp
 		namedMaterialized++
 	}
-	recordDemandSubPhase(trace, "demand_snapshot.named_session_materialize", subPhaseStart, map[string]any{
+	recordDemandSubPhase(trace, "demand_snapshot.named_session_materialize", subPhaseStart, bp.resolveCost.addSince(resolveBefore, map[string]any{
 		"specs":        len(named.specs),
 		"materialized": namedMaterialized,
-	})
+	}))
 
 	baseDesired := cloneDesiredState(desired)
 
 	// Phase 2: discover session beads created outside config iteration
 	// (e.g., by "gc session new"). Include them in desired state if they
 	// have a valid template and are not held/closed.
-	subPhaseStart = trace.demandNow()
+	subPhaseStart = startDemandSubPhase(trace)
+	resolveBefore = bp.resolveCost.totals()
 	applySessionBeadDesiredOverlay(bp, cfg, desired, suspendedRigPaths, poolPartialRetentionTemplates, namedScaleCheckPartialTemplates, stderr)
-	recordDemandSubPhase(trace, "demand_snapshot.session_overlay", subPhaseStart, map[string]any{
+	recordDemandSubPhase(trace, "demand_snapshot.session_overlay", subPhaseStart, bp.resolveCost.addSince(resolveBefore, map[string]any{
 		"base":    len(baseDesired),
 		"desired": len(desired),
-	})
+	}))
 
-	subPhaseStart = trace.demandNow()
+	subPhaseStart = startDemandSubPhase(trace)
 	var continuationClaimCandidates []ContinuationClaimCandidate
 	continuationClaimQueryPartial := storePartial
 	if !storePartial {
@@ -7185,11 +7211,17 @@ func resolveTemplatePrepared(bp *agentBuildParams, cfgAgent *config.Agent, quali
 		// settings (resolveTemplate).
 		return TemplateParams{}, errPlanOnlyEffect
 	}
+	start := time.Now()
 	if err := validateAgentSessionTransportForBuild(bp, cfgAgent, qualifiedName); err != nil {
+		bp.resolveCost.add(time.Since(start), 0, 0)
 		return TemplateParams{}, err
 	}
+	validated := time.Now()
 	prepareTemplateResolution(bp, cfgAgent, qualifiedName, bp.stderr)
-	return resolveTemplate(bp, cfgAgent, qualifiedName, fpExtra)
+	prepared := time.Now()
+	tp, err := resolveTemplate(bp, cfgAgent, qualifiedName, fpExtra)
+	bp.resolveCost.add(validated.Sub(start), prepared.Sub(validated), time.Since(prepared))
+	return tp, err
 }
 
 func validateAgentSessionTransportForBuild(bp *agentBuildParams, cfgAgent *config.Agent, qualifiedName string) error {

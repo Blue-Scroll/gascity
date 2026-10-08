@@ -576,6 +576,17 @@ func fenceHookClaimSession(cityPath string, cfg *config.City, sessionID string, 
 	if instanceToken == "" {
 		return 0, false
 	}
+	// A session that already ran `gc runtime drain-ack` has said "I am done and I
+	// hold nothing", and the controller will stop it. Its bead still reads awake
+	// until the reconciler gets to it, which took 6 minutes under load on
+	// 2026-10-07, so the state check below cannot see the ack. A claim made in that
+	// gap is killed with the session: twice that day a polecat drain-acked, claimed
+	// a review leg's first step, and died holding it, and the leg's later steps
+	// stayed assigned to the dead session (vn-sjk7olh).
+	if hookClaimSessionDrainAckedBySelf() {
+		fmt.Fprintf(stderr, "gc hook --claim: refusing session %s: it already acknowledged drain (gc runtime drain-ack), so it must exit, not claim\n", sessionID) //nolint:errcheck
+		return writeHookClaimStaleSessionDrain(opts, stdout, stderr), true
+	}
 	switch verdict, reason := classifyHookClaimSession(cityPath, cfg, sessionID, instanceToken); verdict {
 	case hookClaimSessionStale:
 		fmt.Fprintf(stderr, "gc hook --claim: refusing stale session %s: %s\n", sessionID, reason) //nolint:errcheck
@@ -589,6 +600,30 @@ func fenceHookClaimSession(cityPath string, cfg *config.City, sessionID string, 
 	default:
 		return 0, false
 	}
+}
+
+// hookClaimSessionDrainAckedBySelf reports whether this runtime's own session
+// has acknowledged drain. It is a variable so tests can stand in for the
+// runtime provider. Tests that swap it MUST NOT call t.Parallel().
+var hookClaimSessionDrainAckedBySelf = readHookClaimSessionDrainAckedBySelf
+
+// readHookClaimSessionDrainAckedBySelf resolves this runtime's session name the
+// way `gc runtime drain-ack` does (currentSessionRuntimeTarget) and asks
+// sessionDrainAckedByAgent. Any failure to resolve or read fails open, like the
+// rest of the fence: a provider hiccup must not refuse a healthy worker.
+func readHookClaimSessionDrainAckedBySelf() bool {
+	name := strings.TrimSpace(os.Getenv("GC_TMUX_SESSION"))
+	if name == "" {
+		name = strings.TrimSpace(os.Getenv("GC_SESSION_NAME"))
+	}
+	if name == "" {
+		return false
+	}
+	sp, err := newSessionProvider()
+	if err != nil || sp == nil {
+		return false
+	}
+	return sessionDrainAckedByAgent(sp, name)
 }
 
 // classifyHookClaimSession loads the session bead named by sessionID and reports
@@ -1149,8 +1184,9 @@ func workQueryHasReadyWork(output string) bool {
 
 // filterUnreadyHookCandidates strips beads from work_query output that fail
 // bd ready semantics: future defer_until, any open blocking dep in the row's
-// blocked_by array, the row's own is_blocked / status=="blocked" marker, or a
-// canonical dispatch hold label. The work_query is expected to gate these, but
+// blocked_by array, the row's own is_blocked / status=="blocked" marker, a
+// canonical dispatch hold label, or a graph.v2 workflow root (a latch, never
+// work). The work_query is expected to gate most of these, but
 // defensive filtering here prevents a single broken query from cascading into
 // agent action on a bead it cannot progress.
 // Pure function over JSON; takes time.Time so tests stay deterministic.
@@ -1186,6 +1222,9 @@ func filterUnreadyHookCandidates(output string, now time.Time) string {
 			continue
 		}
 		if isHeldHookCandidate(obj) {
+			continue
+		}
+		if isGraphWorkflowRootHookCandidate(obj) {
 			continue
 		}
 		filtered = append(filtered, obj)
@@ -1364,6 +1403,28 @@ func isHeldHookCandidate(item map[string]any) bool {
 		}
 	}
 	return false
+}
+
+// isGraphWorkflowRootHookCandidate reports whether item is the root of a
+// graph.v2 workflow. The root is a latch, and its steps are the work (see
+// isGraphWorkflowRootContract). The generated query cannot exclude it, because
+// bd has no flag to exclude a metadata value, so the hook drops it here, in the
+// one seam every hook path runs through. demandRowServable refuses the same
+// row, so the controller never spawns a seat for it either.
+//
+// This covers an already-held root too: a session that claimed one before this
+// filter existed is not served it again as its existing assignment, and moves
+// on to real work instead of sitting on the latch.
+func isGraphWorkflowRootHookCandidate(item map[string]any) bool {
+	metadata, ok := item["metadata"].(map[string]any)
+	if !ok {
+		return false
+	}
+	contract, ok := metadata[beadmeta.FormulaContractMetadataKey].(string)
+	if !ok {
+		return false
+	}
+	return isGraphWorkflowRootContract(contract)
 }
 
 // isClosedHookCandidate reports whether item is a closed bead. Defense-in-depth

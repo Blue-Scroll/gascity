@@ -1,9 +1,8 @@
-import { AnsiUp } from 'ansi_up';
-import { useMemo, type ReactNode } from 'react';
+import { useMemo } from 'react';
 import type { OutputTurn } from 'gas-city-dashboard-shared/gc-supervisor';
 import { formatClockTime, formatRelative, formatShortDate } from '../hooks/time';
 import { PROMPT_INJECTION_NOTICE } from '../lib/constants';
-import { stripTerminalControls } from '../lib/stripTerminalControls';
+import { ansiToReactNodes } from '../lib/ansi';
 import type { SessionTranscriptView } from '../supervisor/sessionReads';
 import { TranscriptBox } from './TranscriptBox';
 
@@ -134,45 +133,6 @@ function TurnBlock({ turn, index, now }: { turn: OutputTurn; index: number; now:
         {renderedText}
       </pre>
     </li>
-  );
-}
-
-function ansiToReactNodes(text: string): ReactNode[] {
-  // Strip OSC / non-SGR CSI / lone-ESC / bare C1 control bytes before
-  // ansi_up runs. ansi_up colorizes SGR but passes every other control
-  // sequence through as visible text, leaking `^[`, `\x9c`, OSC titles, etc.
-  // into the peek (gascity-dashboard-5e5v / xl07). SGR is preserved here so
-  // ansi_up can still render colour.
-  const cleaned = stripTerminalControls(text);
-  const renderer = new AnsiUp();
-  renderer.use_classes = true;
-  const html = renderer.ansi_to_html(cleaned);
-  if (typeof DOMParser === 'undefined') return [cleaned];
-
-  const doc = new DOMParser().parseFromString(`<body>${html}</body>`, 'text/html');
-  return Array.from(doc.body.childNodes).map((node, index) => htmlNodeToReact(node, String(index)));
-}
-
-function htmlNodeToReact(node: ChildNode, key: string): ReactNode {
-  if (node.nodeType === 3) return node.textContent ?? '';
-  if (node.nodeType !== 1) return null;
-
-  const element = node as Element;
-  const children = Array.from(element.childNodes).map((child, index) =>
-    htmlNodeToReact(child, `${key}-${index}`),
-  );
-
-  if (element.tagName.toLowerCase() === 'br') {
-    return <br key={key} />;
-  }
-  if (element.tagName.toLowerCase() !== 'span') {
-    return <span key={key}>{children}</span>;
-  }
-
-  return (
-    <span key={key} className={element.getAttribute('class') ?? undefined}>
-      {children}
-    </span>
   );
 }
 

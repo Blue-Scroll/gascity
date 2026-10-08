@@ -7831,6 +7831,9 @@
           "attached": {
             "type": "boolean"
           },
+          "id": {
+            "type": "string"
+          },
           "last_activity": {
             "format": "date-time",
             "type": "string"

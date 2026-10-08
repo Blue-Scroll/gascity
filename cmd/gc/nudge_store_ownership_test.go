@@ -92,7 +92,7 @@ func TestNudgeOwningFramesLeaveTheStorageRoutesServingALiveStore(t *testing.T) {
 		}},
 		{"maintenance sweep", func(t *testing.T, cityPath string) {
 			enqueueRoutedNudge(t, cityPath)
-			if err := runNudgeQueueMaintenanceSweep(cityPath, time.Now()); err != nil {
+			if err := runNudgeQueueMaintenanceSweep(cityPath, nil, time.Now()); err != nil {
 				t.Fatalf("maintenance sweep: %v", err)
 			}
 		}},
@@ -177,7 +177,7 @@ func TestNudgeOwningFramesCloseTheWorkStoreTheyOpenedOnARelocatedCity(t *testing
 			}
 		}},
 		{"maintenance sweep", func(t *testing.T, cityPath string, _ queuedNudge) {
-			if err := runNudgeQueueMaintenanceSweep(cityPath, time.Now()); err != nil {
+			if err := runNudgeQueueMaintenanceSweep(cityPath, nil, time.Now()); err != nil {
 				t.Fatalf("maintenance sweep: %v", err)
 			}
 		}},

@@ -113,7 +113,10 @@ func readyReaderFailurePropagation(federated bool) string {
 // unassigned, non-epic pool demand routed to target. gc.routed_to is the
 // canonical persisted routing key: the graph.v2 stamper and the legacy stamper
 // both stamp it on every routable bead, including the workflow root (ga-eld2x
-// retired the short-lived gc.run_target wire field). This predicate is the main
+// retired the short-lived gc.run_target wire field). The query therefore
+// returns a routed graph.v2 root too; bd has no flag to exclude it, so the hook
+// drops it in Go and the controller never counts it (cmd/gc
+// isGraphWorkflowRootContract). This predicate is the main
 // source of truth for "is there work on this routed queue?" that both the
 // worker (via EffectiveWorkQuery Tier 3) and the reconciler (via
 // EffectivePoolDemandQuery, count-form) ask; diverging the two re-introduces
@@ -1265,14 +1268,25 @@ func buildOnDeath(a *Agent, topo QueryTopology) string {
 		route = a.PoolName
 	}
 	_ = topo
+	holder := shellquote.Quote(a.QualifiedName())
 	ephemeralRead := bdQueryEphemeralStatusQuietShell("in_progress") + ` | ` +
-		`jq -r --arg assignee ` + shellquote.Quote(a.QualifiedName()) + ` '.[] | select((.assignee // "") == $assignee) | [.id, ` + jqMeta(beadmeta.RunTargetMetadataKey) + `, ` + jqMeta(beadmeta.RoutedToMetadataKey) + `] | @tsv' 2>/dev/null; `
+		`jq -r --arg assignee ` + holder + ` '.[] | select((.assignee // "") == $assignee) | [.id, ` + jqMeta(beadmeta.RunTargetMetadataKey) + `, ` + jqMeta(beadmeta.RoutedToMetadataKey) + `] | @tsv' 2>/dev/null; `
 	// Reset both assignee and status: clearing assignee alone leaves the bead
 	// invisible to every work_query tier (Tier 1 needs assignee match, Tiers
 	// 2/3 only match "ready" status). The next worker re-claims via Tier 3.
 	// If routed metadata is missing entirely, backfill the canonical
 	// gc.run_target route so reopened direct-assigned work does not stay
 	// invisible.
+	//
+	// Each release runs as the dead instance (--actor). The controller runs
+	// this hook, and bd refuses to strip an in_progress claim held by anyone
+	// but the actor (bd-98s5c, AssigneeNotStolen). Without --actor every
+	// release of a claimed bead failed with "cannot reassign ...: held by
+	// <this instance>", and the bead stayed claimed by a dead session until
+	// the reconciler's dead-assignee sweep reopened it (vn-dk85wxz). Acting
+	// as the holder, not --force, keeps the guard for the case that matters:
+	// if another actor took the bead after the list above, the write is still
+	// refused and their claim stands.
 	return `{ ` +
 		`bd list --assignee=` + a.QualifiedName() +
 		` --status=in_progress --json 2>/dev/null | ` +
@@ -1282,8 +1296,8 @@ func buildOnDeath(a *Agent, topo QueryTopology) string {
 		`while IFS="$(printf '\t')" read -r id run_target routed_to; do ` +
 		`[ -z "$id" ] && continue; ` +
 		`if [ -n "$run_target" ] || [ -n "$routed_to" ]; then ` +
-		`if ! err=$(bd update "$id" --assignee "" --status open 2>&1 >/dev/null); then printf 'gc-recovery: on_death release failed for %s: %s\n' "$id" "$err"; fi; ` +
-		`else if ! err=$(bd update "$id" --assignee "" --status open --set-metadata ` + shellquote.Quote(beadmeta.RunTargetMetadataKey+"="+route) + ` 2>&1 >/dev/null); then printf 'gc-recovery: on_death release failed for %s: %s\n' "$id" "$err"; fi; ` +
+		`if ! err=$(bd update "$id" --assignee "" --status open --actor ` + holder + ` 2>&1 >/dev/null); then printf 'gc-recovery: on_death release failed for %s: %s\n' "$id" "$err"; fi; ` +
+		`else if ! err=$(bd update "$id" --assignee "" --status open --set-metadata ` + shellquote.Quote(beadmeta.RunTargetMetadataKey+"="+route) + ` --actor ` + holder + ` 2>&1 >/dev/null); then printf 'gc-recovery: on_death release failed for %s: %s\n' "$id" "$err"; fi; ` +
 		`fi; ` +
 		`done`
 }
@@ -1302,20 +1316,33 @@ func (a *Agent) EffectiveOnBootFor(topo QueryTopology) string {
 	return a.effectiveQuery(queryOnBoot, topo)
 }
 
+// skipGraphWorkflowRootsJQClause returns a jq select(...) clause that drops a
+// graph.v2 workflow root. on_boot reopens in_progress, ownerless routed work so
+// a worker can claim it again, and a graph.v2 root is exactly that shape while
+// its workflow runs: it goes in_progress at launch and nobody owns it. Reopening
+// it made it look like ready work, so every controller restart could spawn
+// another session to claim a latch bead (vn-rfn0d9g). The root is not work (the
+// hook and the demand loop in cmd/gc refuse it too, see
+// isGraphWorkflowRootContract there), so recovery leaves it alone.
+func skipGraphWorkflowRootsJQClause() string {
+	return ` | select((` + jqMeta(beadmeta.FormulaContractMetadataKey) + ` | ascii_downcase) != "` + beadmeta.FormulaContractGraphV2 + `")`
+}
+
 func buildOnBoot(a *Agent, topo QueryTopology) string {
 	template := a.QualifiedName()
 	if a.PoolName != "" {
 		template = a.PoolName
 	}
 	_ = topo
+	skipRoots := skipGraphWorkflowRootsJQClause()
 	ephemeralRead := bdQueryEphemeralStatusQuietShell("in_progress") + ` | ` +
-		`jq -r --arg template "$template" '.[] | select((.assignee // "") == "") | select((` + jqMeta(beadmeta.RoutedToMetadataKey) + ` == $template) or ((` + jqMeta(beadmeta.RoutedToMetadataKey) + ` == "") and (` + jqMeta(beadmeta.RunTargetMetadataKey) + ` == $template) and (` + jqMeta(beadmeta.KindMetadataKey) + ` == "` + beadmeta.KindWorkflow + `"))) | .id' 2>/dev/null; `
+		`jq -r --arg template "$template" '.[] | select((.assignee // "") == "") | select((` + jqMeta(beadmeta.RoutedToMetadataKey) + ` == $template) or ((` + jqMeta(beadmeta.RoutedToMetadataKey) + ` == "") and (` + jqMeta(beadmeta.RunTargetMetadataKey) + ` == $template) and (` + jqMeta(beadmeta.KindMetadataKey) + ` == "` + beadmeta.KindWorkflow + `")))` + skipRoots + ` | .id' 2>/dev/null; `
 	return `template=` + shellquote.Quote(template) + `; ` +
 		`{ ` +
 		`bd list --metadata-field "` + beadmeta.RoutedToMetadataKey + `=$template" --status=in_progress --no-assignee --json 2>/dev/null | ` +
-		`jq -r '.[].id' 2>/dev/null; ` +
+		`jq -r '.[]` + skipRoots + ` | .id' 2>/dev/null; ` +
 		`bd list --metadata-field "` + beadmeta.RunTargetMetadataKey + `=$template" --metadata-field "` + beadmeta.KindMetadataKey + `=` + beadmeta.KindWorkflow + `" --status=in_progress --no-assignee --json 2>/dev/null | ` +
-		`jq -r '.[] | select(` + jqMeta(beadmeta.RoutedToMetadataKey) + ` == "") | .id' 2>/dev/null; ` +
+		`jq -r '.[] | select(` + jqMeta(beadmeta.RoutedToMetadataKey) + ` == "")` + skipRoots + ` | .id' 2>/dev/null; ` +
 		ephemeralRead +
 		`} | awk 'NF && !seen[$0]++' | ` +
 		`xargs -rI{} sh -c 'if ! err=$(bd update "$1" --status open 2>&1 >/dev/null); then printf "gc-recovery: on_boot reopen failed for %s: %s\n" "$1" "$err"; fi' _ {}`

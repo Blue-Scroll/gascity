@@ -669,3 +669,7 @@ func TestEnqueuePingsWakeSocket(t *testing.T) {
 		t.Fatal("wakeCh not signaled after enqueue")
 	}
 }
+
+// The sweep used to dead-letter a pending row whose session bead was closed
+// ("session replaced", hq-02cr3); that pass gave way to upstream's re-fence in
+// bd8a9bb51, which delivers such a row to the seat's live incarnation instead.

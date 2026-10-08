@@ -80,8 +80,14 @@ func infoFromPersistedBeadFrozen(b beads.Bead) Info {
 		PrimedAtMetadata:           b.Metadata[PrimedAtMetadataKey],
 		PrimingAttemptedAtMetadata: b.Metadata[PrimingAttemptedAtMetadataKey],
 		PromptHashMetadata:         b.Metadata[PromptHashMetadataKey],
-		MCPIdentity:                b.Metadata[MCPIdentityMetadataKey],
-		MCPServersSnapshot:         b.Metadata[MCPServersSnapshotMetadataKey],
+		// Drain-record mirrors (verbatim).
+		DrainReasonMetadata:      b.Metadata[DrainReasonMetadataKey],
+		DrainInitiatorMetadata:   b.Metadata[DrainInitiatorMetadataKey],
+		DrainRequestedAtMetadata: b.Metadata[DrainRequestedAtMetadataKey],
+		DrainCanceledAtMetadata:  b.Metadata[DrainCanceledAtMetadataKey],
+		DrainCancelCountMetadata: b.Metadata[DrainCancelCountMetadataKey],
+		MCPIdentity:              b.Metadata[MCPIdentityMetadataKey],
+		MCPServersSnapshot:       b.Metadata[MCPServersSnapshotMetadataKey],
 
 		ProviderTerminalError: b.Metadata["provider_terminal_error"],
 		HealthState:           b.Metadata["session_health"],

@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"slices"
 	"strings"
 
 	sessionpkg "github.com/gastownhall/gascity/internal/session"
@@ -66,6 +67,38 @@ func (w workAssignment) OpenAssignedTo(assignee, status string, tierMode beads.T
 		return nil, err
 	}
 	return excludeMailMessageBeads(items), nil
+}
+
+// AssignedToInStatuses returns the WORK beads in this store, from both tiers,
+// that are assigned to the given identity and whose status is one of statuses.
+// It is ONE store read, always live.
+//
+// It is the read behind every "does this session still hold work?" probe.
+// Those probes used to read each status and each tier on its own: 2 statuses x
+// (1 issues read + 2 wisp reads, since a wisp read is bd list plus bd query) =
+// 6 bd subprocesses per identity per store. This read is 2. It leaves the
+// status unset, so the store returns every status that is not closed in one
+// go, and the status match happens here. TierBoth is the union of the two
+// tiers by contract, so the answer is the same as the six narrow reads.
+//
+// Mail message beads are excluded, as in OpenAssignedTo.
+func (w workAssignment) AssignedToInStatuses(assignee string, statuses []string) ([]beads.Bead, error) {
+	store := w.unwrapped()
+	if store == nil || len(statuses) == 0 {
+		return nil, nil
+	}
+	items, err := store.List(beads.ListQuery{Assignee: assignee, Live: true, TierMode: beads.TierBoth})
+	if err != nil {
+		return nil, err
+	}
+	out := items[:0:0]
+	for _, item := range items {
+		if !slices.Contains(statuses, item.Status) {
+			continue
+		}
+		out = append(out, item)
+	}
+	return excludeMailMessageBeads(out), nil
 }
 
 // CachedOpenAssignedWisps returns cached open-assigned wisp-tier WORK beads when

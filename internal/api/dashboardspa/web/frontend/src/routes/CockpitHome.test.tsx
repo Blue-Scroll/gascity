@@ -597,4 +597,93 @@ describe('<CockpitHomePage>', () => {
     await act(() => vi.advanceTimersByTimeAsync(15_000));
     expect(mocks.cityUsage).toHaveBeenCalledTimes(2);
   });
+
+  it('shows a disabled "Mayor not running" button when no mayor session runs', async () => {
+    render(router(<CockpitHomePage />));
+
+    const button = await screen.findByRole('button', { name: 'Mayor not running' });
+    expect((button as HTMLButtonElement).disabled).toBe(true);
+    expect(screen.queryByRole('link', { name: 'Mayor' })).toBeNull();
+  });
+
+  it('draws the page before a slow sessions list lands, then links the mayor', async () => {
+    const slow = deferred<unknown>();
+    mocks.listSessions.mockReturnValue(slow.promise);
+
+    render(router(<CockpitHomePage />));
+
+    // The page is up while the sessions list is still out.
+    expect(await screen.findByRole('status', { name: 'model calls today: 42' })).toBeTruthy();
+    const waiting = screen.getByRole('button', { name: 'Mayor' });
+    expect(waiting.getAttribute('aria-busy')).toBe('true');
+
+    await act(async () => {
+      slow.resolve({
+        items: [
+          {
+            id: 'hq-eh0ta',
+            session_name: 'gastown__mayor',
+            title: 'gastown.mayor',
+            provider: 'claude',
+            template: 'gastown.mayor',
+            state: 'active',
+            attached: false,
+            running: true,
+            created_at: '2026-09-25T10:00:00Z',
+          },
+        ],
+        total: 1,
+      });
+    });
+
+    const link = await screen.findByRole('link', { name: 'Mayor' });
+    expect(link.getAttribute('href')).toBe(
+      '/session/hq-eh0ta?back=%2F&label=Mayor&tmux=gastown__mayor',
+    );
+  });
+
+  it('asks again soon for a partial sessions list, so the mayor link fills in before the next poll', async () => {
+    vi.useFakeTimers();
+    const mayorRow = {
+      session_name: 'gastown__mayor',
+      title: 'gastown.mayor',
+      provider: 'claude',
+      template: 'gastown.mayor',
+      state: 'active',
+      attached: false,
+      running: true,
+    };
+    // While the bead store is slow, GET /sessions answers from the live
+    // sessions alone: the template is there, the id and created_at are not.
+    mocks.listSessions
+      .mockReset()
+      .mockResolvedValueOnce({
+        items: [{ ...mayorRow, id: '', created_at: '' }],
+        total: 1,
+        partial: true,
+      })
+      .mockResolvedValue({
+        items: [{ ...mayorRow, id: 'hq-eh0ta', created_at: '2026-09-25T10:00:00Z' }],
+        total: 1,
+      });
+
+    render(router(<CockpitHomePage />));
+    await act(async () => undefined);
+    expect(mocks.listSessions).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole('button', { name: 'Mayor' }).getAttribute('aria-busy')).toBe('true');
+
+    // One partial refresh (3s), far sooner than the 15s poll.
+    await act(() => vi.advanceTimersByTimeAsync(2_999));
+    expect(mocks.listSessions).toHaveBeenCalledTimes(1);
+    await act(() => vi.advanceTimersByTimeAsync(1));
+    expect(mocks.listSessions).toHaveBeenCalledTimes(2);
+    expect(screen.getByRole('link', { name: 'Mayor' }).getAttribute('href')).toBe(
+      '/session/hq-eh0ta?back=%2F&label=Mayor&tmux=gastown__mayor',
+    );
+
+    // A full answer stops the extra asks: nothing at 6s, 9s or 12s. Only the
+    // normal 15s poll is left.
+    await act(() => vi.advanceTimersByTimeAsync(9_000));
+    expect(mocks.listSessions).toHaveBeenCalledTimes(2);
+  });
 });

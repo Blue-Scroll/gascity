@@ -539,10 +539,10 @@ func (t *cityRunTailer) build(proj *runproj.Projector, prevMarks map[string]runp
 	// it also carries message, session, and gc:-labeled control beads that can
 	// share a run root — would let unrelated beads distort lane status, counts,
 	// recent changes, and detail nodes. Filtering once here feeds the same clean
-	// slice to both the summary and the detail projection. FilterRunBeads returns
+	// slice to both the summary and the detail projection. RunBeads returns
 	// a fresh first-seen-ordered slice of the immutable-after-decode bead values,
 	// so the published snapshot is safe to read concurrently.
-	beadSlice := runproj.FilterRunBeads(proj.Beads())
+	beadSlice := proj.RunBeads()
 	summary, censusLanes := runproj.BuildRunSummaryWithAllLanes(beadSlice)
 	census := runproj.CountCanonicalRunStatuses(beadSlice, censusLanes)
 

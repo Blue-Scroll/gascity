@@ -29,6 +29,8 @@ import {
   replyMail as postSupervisorMailReply,
   respondSession as postSupervisorSessionRespond,
   sendMail as postSupervisorMail,
+  sendSessionMessage as postSupervisorSessionMessage,
+  submitSession as postSupervisorSessionSubmit,
 } from 'gas-city-dashboard-shared/gc-supervisor';
 import type {
   Bead,
@@ -72,6 +74,7 @@ import type {
   StreamSessionData,
   WorkflowSnapshotResponse,
 } from 'gas-city-dashboard-shared/gc-supervisor';
+import { REQUEST_BUDGET_MS } from '../api/requestBudget';
 import { SupervisorApiError, unwrapSupervisorResult, type SupervisorResult } from './errors';
 import {
   SUPERVISOR_PROXY_BASE_URL,
@@ -80,7 +83,7 @@ import {
   supervisorUrl,
 } from './url';
 
-export const SUPERVISOR_REQUEST_TIMEOUT_MS = 60_000;
+export const SUPERVISOR_REQUEST_TIMEOUT_MS = REQUEST_BUDGET_MS;
 export const GC_MUTATION_HEADERS = {
   'X-GC-Request': 'dashboard',
 } as const;
@@ -153,6 +156,7 @@ export interface SupervisorApi {
     sessionId: string,
     afterCursor?: string,
     format?: SessionStreamFormat,
+    includeThinking?: boolean,
   ): string;
   listSessions(cityName: string): Promise<ListBodySessionResponse>;
   sessionPending(cityName: string, sessionId: string): Promise<SessionPendingResponse>;
@@ -166,6 +170,35 @@ export interface SupervisorApi {
     sessionId: string,
     format?: SessionTranscriptFormat,
   ): Promise<SessionTranscriptGetResponse>;
+  /**
+   * A page of a session transcript. `before` walks backwards from a stable
+   * entry id, which is what lets a long session be read a window at a time
+   * instead of held whole in the browser.
+   */
+  sessionTranscriptPage(
+    cityName: string,
+    sessionId: string,
+    query: {
+      format?: SessionTranscriptFormat;
+      tail?: string;
+      before?: string;
+      after?: string;
+      include_thinking?: boolean;
+    },
+  ): Promise<SessionTranscriptGetResponse>;
+  /** Send a message to a running session, as the operator. */
+  sendSessionMessage(cityName: string, sessionId: string, message: string): Promise<unknown>;
+  /**
+   * Submit with an intent. `interrupt_now` cuts the current run short and
+   * delivers this message in its place, which is the only interrupt the API
+   * offers: it requires a message, so a bare "stop" is still a message.
+   */
+  submitSession(
+    cityName: string,
+    sessionId: string,
+    message: string,
+    intent?: 'default' | 'follow_up' | 'interrupt_now',
+  ): Promise<unknown>;
   workflowRun(
     cityName: string,
     workflowId: string,
@@ -443,10 +476,13 @@ export function createSupervisorApi(options: CreateSupervisorApiOptions = {}): S
         afterSeq === undefined ? undefined : { after_seq: afterSeq },
       );
     },
-    sessionStreamUrl(cityName, sessionId, afterCursor, format) {
+    sessionStreamUrl(cityName, sessionId, afterCursor, format, includeThinking) {
       const query: Record<string, string> = {};
       if (afterCursor !== undefined) query.after_cursor = afterCursor;
       if (format !== undefined) query.format = format;
+      // Thinking text is redacted unless asked for, so a reader that shows it
+      // has to say so on every request and on the stream.
+      if (includeThinking) query.include_thinking = 'true';
       return supervisorUrl(
         baseUrl,
         `/v0/city/${encodeURIComponent(cityName)}/session/${encodeURIComponent(sessionId)}/stream`,
@@ -508,6 +544,38 @@ export function createSupervisorApi(options: CreateSupervisorApiOptions = {}): S
           body,
         }) as Promise<SupervisorResult<RespondSessionResponse>>,
         'gc supervisor session respond response was empty',
+      );
+    },
+    sessionTranscriptPage(cityName, sessionId, query) {
+      return unwrapSupervisorResult<SessionTranscriptGetResponse>(
+        getV0CityByCityNameSessionByIdTranscript({
+          client,
+          path: { cityName, id: sessionId },
+          query,
+        }) as Promise<SupervisorResult<SessionTranscriptGetResponse>>,
+        'gc supervisor transcript response was empty',
+      );
+    },
+    submitSession(cityName, sessionId, message, intent) {
+      return unwrapSupervisorResult<unknown>(
+        postSupervisorSessionSubmit({
+          client,
+          path: { cityName, id: sessionId },
+          headers: GC_MUTATION_HEADERS,
+          body: { message, ...(intent ? { intent } : {}) },
+        }) as Promise<SupervisorResult<unknown>>,
+        'gc supervisor session submit response was empty',
+      );
+    },
+    sendSessionMessage(cityName, sessionId, message) {
+      return unwrapSupervisorResult<unknown>(
+        postSupervisorSessionMessage({
+          client,
+          path: { cityName, id: sessionId },
+          headers: GC_MUTATION_HEADERS,
+          body: { message },
+        }) as Promise<SupervisorResult<unknown>>,
+        'gc supervisor session message response was empty',
       );
     },
     sessionTranscript(cityName, sessionId, format) {

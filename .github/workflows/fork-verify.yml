@@ -39,13 +39,109 @@ jobs:
         run: go build ./...
       - name: Vet changed package
         run: go vet ./cmd/gc/...
+      - name: docs/reference/cli.md matches gc gen-doc (vn-s9oydtn)
+        # The file says "do not edit" and nothing else here runs this test, so
+        # a changed help string or flag used to merge with a stale page.
+        run: go test ./cmd/gc/ -run 'TestCLIDocsFreshness|TestGenDoc' -count=1 -v
       - name: Unit tests — cross-store work delivery
         run: go test ./cmd/gc/ -run 'TestFilterAssignedWorkBeads|TestAssignedWork|TestFirstStoreWithWork|TestCrossStoreClaimDir|TestRunBDForBead|TestGateOpenWorkBounded|TestCrossStorePipeline' -count=1 -v
       - name: Unit tests — cross-store reachability predicate + fail-loud guard
         run: |
           go test ./internal/agentutil/ -run 'TestAgentReachesWorkflowStore|TestAgentIsCrossStoreEligible' -count=1 -v
           go test ./internal/sling/ -run 'TestValidateBuiltInRouteStoreReachableAllowsCityScopedTarget|TestDoSlingRefusesCrossStore' -count=1 -v
+      - name: Unit tests, the dispatch budget goes to the most overdue order (hq-ggxthx)
+        run: go test ./cmd/gc/ -run 'TestOrderDispatchUrgency|TestOrderDispatchBudget|TestOrderDispatchMissedTurns|TestOrderDispatchRotationResumes|TestOrderDispatchRespectsMaxDispatchesPerTick|TestOrderDispatchMaxDispatchesPerTickConfig|TestOrderDispatchTriggerEnvFailuresRespectMaxDispatchesPerTick' -count=1 -v
       - name: Unit tests — order scope (#2830)
         run: go test ./internal/orders/ -run 'TestParseScope|TestValidateRejectsUnknownScope|TestValidateAcceptsCityAndRigScope|TestParseEnv' -count=1 -v
       - name: Unit tests — scale from zero (#2819)
         run: go test ./cmd/gc/ -run 'TestBuildDesiredState_ScaleFromZero' -count=1 -v
+      - name: Unit tests, a fresh pool seat survives its own claim (vn-n5abuk0)
+        # The chaos tests are here because they pull a seat out of the desired
+        # set and expect a drain, so they are the ones the spawn grace can break.
+        run: go test ./cmd/gc/ -run 'TestPoolSpawnGrace|TestPoolSeatInSpawnGrace|TestSessionLifecycleChaosPendingInteraction' -count=1 -v
+      - name: Unit tests, the nudge sweep borrows the store and prunes gone shadows (hq-ga1qga)
+        # The supervisor tick opened a fresh store every pass for dead-letter
+        # rows it could never prune. These pin the borrow, the open gate and
+        # the prune, plus the older sweep and open-count tests they sit beside.
+        run: go test ./cmd/gc/ -run 'TestPruneDeadQueuedNudges|TestNudgeMaintenanceSkipsStoreOpen|TestRunNudgeQueueMaintenanceSweep|TestNudgePollHelpers' -count=1 -v
+      - name: Unit tests, worktree spawn guard and pool-name identity (vn-rm9u8g)
+        run: |
+          go test ./internal/workdir/ -run 'TestValidateAncestorWorktreesNotStale|TestValidateNotNestedInSessionWorktree|TestValidateSpawnTarget' -count=1 -v
+          go test ./internal/config/ -run 'TestValidateSemanticsNamepool|TestValidateSemanticsSameNamepoolNameInTwoRigsIsFine|TestLoadReportsNamepoolCollisionFromDisk' -count=1 -v
+      - name: Unit tests, the agent and session lists read each bead store once and never wait on a slow one (hq-xujh6g, vn-fzant5y)
+        # The agent list once ran one store query per agent and took 8 minutes
+        # on a 419-slot town. These pin one read per store per request. The
+        # BoundedListBuild and ListBuilds tests pin the 1s answer while the
+        # store is slow, and that a panic in a build cannot stop the supervisor.
+        run: go test ./internal/api/ -run 'TestAgentList|ActiveBead|TestHandleSessionList|TestSessionList|TestBoundedListBuild|TestListBuilds' -count=1 -v
+      - name: Unit tests, the orphan scan never names a tmux server as an agent (vn-p4rwdst)
+        # A tmux server can carry an agent's GC_SESSION_ID and is PPID 1, so
+        # the orphan kill once took the whole socket down with it. The linux
+        # case runs only here: no town Mac can run a linux-tagged test.
+        run: go test ./internal/runtime/proctable/ -run 'TestScanWithRoot|TestIsRecordScanRoot|TestDarwinPSCommand' -count=1 -v
+      - name: Unit tests — spawn-storm detector counts resets, not runs (hq-2yztr2)
+        run: |
+          # The detector is a shell script and needs jq. Say so here rather
+          # than letting every row fail for a reason the log does not name.
+          jq --version
+          go test ./examples/gastown/ -run 'TestSpawnStorm' -count=1 -v
+
+  dashboard:
+    # The dashboard gc embeds (internal/api/dashboardspa). Since phone dashboard
+    # F1 (vn-9kvo79d) the page is FROZEN on this fork. It moved to its own repo,
+    # Blue-Scroll/gascity-dashboard, so web/ and dist/ must not change here.
+    #
+    # This job checks two things:
+    #   1. web/ and dist/ still have the git tree hashes PAGE_FROZEN pins.
+    #   2. The Go around the page still passes: the embedded handler (and its
+    #      helper-path 404) and the BFF.
+    #
+    # It used to also run npm ci, vitest and `make dashboard-ci`. They were
+    # dropped on purpose (design T45). `make dashboard-ci` fails when the page's
+    # generated API client differs from one made fresh from openapi.json. With
+    # the page frozen, the only fix for that is an edit under web/, which check 1
+    # refuses. So every gc change to the API spec, and every upstream merge,
+    # would go red with no way to go green. Do not add them back while
+    # PAGE_FROZEN exists.
+    #
+    # The cost, said plainly: while frozen, a gc API change leaves gc's own
+    # embedded page one change behind. The page in gascity-dashboard is the one
+    # that keeps up.
+    #
+    # D1 deletes PAGE_FROZEN and swaps check 1 for a merge-base diff against
+    # upstream, in the same commit.
+    if: ${{ github.repository != 'gastownhall/gascity' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - name: The page is frozen (web/ and dist/ match PAGE_FROZEN, vn-9kvo79d)
+        # No history is needed: `git rev-parse HEAD:<path>` reads the tree hash
+        # straight from the checked-out commit.
+        run: |
+          pin=internal/api/dashboardspa/PAGE_FROZEN
+          if [ ! -f "$pin" ]; then
+            echo "::error file=$pin::$pin is missing. Only D1 may delete it, in the same commit that replaces this step."
+            exit 1
+          fi
+          fail=0
+          for key in web dist; do
+            want=$(awk -v k="$key" '$1 == k && $2 == "=" { print $3 }' "$pin")
+            if ! printf '%s' "$want" | grep -Eq '^[0-9a-f]{40}$'; then
+              echo "::error file=$pin::$pin must have exactly one '$key = <40 hex>' line."
+              fail=1
+              continue
+            fi
+            have=$(git rev-parse "HEAD:internal/api/dashboardspa/$key")
+            if [ "$have" = "$want" ]; then
+              echo "ok: $key/ is still the frozen tree $want"
+            else
+              echo "::error::internal/api/dashboardspa/$key/ changed (tree $have, frozen at $want). The page is frozen on this fork: make page changes in Blue-Scroll/gascity-dashboard, and keep town's $key/ as it is when taking upstream."
+              fail=1
+            fi
+          done
+          exit "$fail"
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
+        with:
+          go-version-file: go.mod
+      - name: Go tests for the embedded page handler and the BFF
+        run: go test ./internal/api/dashboardspa/... ./internal/api/dashboardbff/... -count=1

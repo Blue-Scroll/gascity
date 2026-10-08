@@ -198,8 +198,9 @@ describe('useFormulaRunDetail warming poll (F4)', () => {
   // The loader polls warming 503s for up to ~180s (covered in runDetail.test.ts)
   // and signals each one via onWarming. The hook's job: surface that signal on
   // the loading state (so the route can render honest "may still be being
-  // recorded" copy), clear it when the poll settles, and supersede a stale poll
-  // (unmount/refresh) so it stops issuing GETs and cannot write stale state.
+  // recorded" copy), clear it when the poll settles, and stop a stale poll on
+  // unmount so it stops issuing GETs and cannot write stale state. A refresh
+  // mid-poll waits for that poll instead of replacing it (useCachedData).
 
   it('surfaces the loader warming signal (unknown_run) on the loading state', async () => {
     mockLoadDetail.mockImplementation((_runId: string, options?: LoadRunDetailOptions) => {
@@ -260,23 +261,33 @@ describe('useFormulaRunDetail warming poll (F4)', () => {
     expect(captured?.keepPolling?.()).toBe(false);
   });
 
-  it('supersedes an in-flight warming poll when a refresh starts a newer load', async () => {
+  it('keeps one warming poll when a refresh lands mid-poll, and loads again once it settles (hq-subxy4)', async () => {
     const options: LoadRunDetailOptions[] = [];
+    const settle: Array<(detail: FormulaRunDetail) => void> = [];
     mockLoadDetail.mockImplementation((_runId: string, opts?: LoadRunDetailOptions) => {
       if (opts) options.push(opts);
-      return new Promise<FormulaRunDetail>(() => {});
+      return new Promise<FormulaRunDetail>((resolve) => {
+        settle.push(resolve);
+      });
     });
 
     const { result } = renderHook(() => useFormulaRunDetail('wf-1', 'city', 'test-city'));
     await waitFor(() => expect(options).toHaveLength(1));
-    expect(options[0]?.keepPolling?.()).toBe(true);
 
     act(() => {
       void result.current.refresh();
     });
 
+    // The refresh waits for the poll in flight instead of restarting it, so a
+    // stream of live events can no longer reset a warming poll to zero.
+    expect(options).toHaveLength(1);
+    expect(options[0]?.keepPolling?.()).toBe(true);
+
+    await act(async () => {
+      settle[0]!(runDetail({ title: 'first poll' }));
+    });
     await waitFor(() => expect(options).toHaveLength(2));
-    // The older poll is dead; the newest owns the warming state.
+    // The settled poll is done; the newer load owns the warming state.
     expect(options[0]?.keepPolling?.()).toBe(false);
     expect(options[1]?.keepPolling?.()).toBe(true);
   });

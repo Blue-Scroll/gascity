@@ -208,6 +208,19 @@ describe('WorkInFlight (Workers active)', () => {
     expect(beadLinks.some((l) => l.getAttribute('href') === '/beads?bead=gc-5rarj')).toBe(true);
   });
 
+  it('shows a live worker that has no id yet, with nothing to peek at', () => {
+    // While the bead store is slow, /sessions answers with live rows that have
+    // no id (vn-fzant5y). The worker still counts, but there is no session to open.
+    const sessions = [
+      session({ id: '', session_name: 'gascity--furiosa', template: 'polecat', rig: 'gascity' }),
+      session({ id: 'gc-2', template: 'polecat', rig: 'gascity' }),
+    ];
+    renderSection([], sessions);
+
+    expect(screen.getByText(/2 workers active/i)).toBeTruthy();
+    expect(screen.getAllByRole('button', { name: /peek/i })).toHaveLength(1);
+  });
+
   it('renders no Peek control when there are no active workers', () => {
     renderSection([], [session({ id: 'gc-m', template: 'mayor', rig: '' })]);
     expect(screen.queryByRole('button', { name: /peek/i })).toBeNull();

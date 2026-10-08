@@ -5,12 +5,14 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gastownhall/gascity/internal/agent"
 	"github.com/gastownhall/gascity/internal/agentutil"
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
+	"github.com/gastownhall/gascity/internal/runtime"
 	workdirutil "github.com/gastownhall/gascity/internal/workdir"
 )
 
@@ -86,9 +88,29 @@ type poolLimits struct {
 }
 
 type sessionInfo struct {
+	// ID is the session bead id that every /session/{id} route takes.
+	// A client uses it to open the live pane straight from an agent row,
+	// with no sessions list in between. That list can take a minute on a
+	// busy town, and the link waited on it (hq-subxy4). Empty when the
+	// runtime session carries no GC_SESSION_ID.
+	ID           string     `json:"id,omitempty"`
 	Name         string     `json:"name"`
 	LastActivity *time.Time `json:"last_activity,omitempty"`
 	Attached     bool       `json:"attached"`
+}
+
+// runningSessionInfo reads what an agent row shows about its live session.
+// Call it only for a running session: every read is a runtime call.
+func runningSessionInfo(sp runtime.Provider, sessionName string) *sessionInfo {
+	si := &sessionInfo{Name: sessionName}
+	if t, err := sp.GetLastActivity(sessionName); err == nil && !t.IsZero() {
+		si.LastActivity = &t
+	}
+	si.Attached = sp.IsAttached(sessionName)
+	if id, err := sp.GetMeta(sessionName, "GC_SESSION_ID"); err == nil {
+		si.ID = strings.TrimSpace(id)
+	}
+	return si
 }
 
 // expandedAgent holds a single (possibly pool-expanded) agent identity.
@@ -184,6 +206,29 @@ func agentPoolLimits(a config.Agent) *poolLimits {
 // sessionLister is the subset of session.Provider needed for pool discovery.
 type sessionLister interface {
 	ListRunning(prefix string) ([]string, error)
+}
+
+// runningSessionsOnce answers ListRunning(prefix) for one request from a
+// single full listing. expandAgent asks once per unlimited pool, and on tmux
+// every ask is a list-sessions exec: 72 pools cost 2.2s per agent list on
+// the town (hq-xujh6g). Errors pass through unchanged, so a pool still fails
+// closed when the listing is partial.
+type runningSessionsOnce struct {
+	sp   sessionLister
+	once sync.Once
+	all  []string
+	err  error
+}
+
+func (r *runningSessionsOnce) ListRunning(prefix string) ([]string, error) {
+	r.once.Do(func() { r.all, r.err = r.sp.ListRunning("") })
+	var matched []string
+	for _, name := range r.all {
+		if strings.HasPrefix(name, prefix) {
+			matched = append(matched, name)
+		}
+	}
+	return matched, r.err
 }
 
 // discoverUnlimitedPool finds running instances of an unlimited pool by
@@ -334,66 +379,23 @@ func findAgent(cfg *config.City, name string) (config.Agent, bool) {
 	return config.Agent{}, false
 }
 
-// findActiveBeadForAssignees returns the ID of the first in_progress bead
-// assigned to the given identities using the cached active snapshot. If rig is
-// non-empty, only that rig's store is searched; otherwise all stores are
-// searched. Returns "" if no match.
-func (s *Server) findActiveBeadForAssignees(rig string, assignees ...string) string {
-	return s.findActiveBeadForAssigneesWithFreshness(rig, false, assignees...)
-}
-
 // findLiveActiveBeadForAssignees returns the ID of the first in_progress bead
 // assigned to the given identities, bypassing the cache. Use this on
 // lower-frequency detail views where external reassignment freshness matters.
+// A list view must use activeBeadIndex instead: this runs one store query per
+// assignee per rig.
 func (s *Server) findLiveActiveBeadForAssignees(rig string, assignees ...string) string {
-	return s.findActiveBeadForAssigneesWithFreshness(rig, true, assignees...)
-}
-
-// findActiveBeadForAssigneesWithFreshness uses a targeted ListQuery with
-// Limit=1 instead of broad scans so active-bead lookup stays cheap even when
-// bead counts are large.
-func (s *Server) findActiveBeadForAssigneesWithFreshness(rig string, live bool, assignees ...string) string {
 	stores := s.state.BeadStores()
-	var rigNames []string
-	if rig != "" {
-		if _, ok := stores[rig]; ok {
-			rigNames = []string{rig}
-		}
-	}
-	if rigNames == nil {
-		rigNames = sortedRigNames(stores)
-	}
-	seen := make(map[string]bool, len(assignees))
-	var unique []string
-	for _, assignee := range assignees {
-		assignee = strings.TrimSpace(assignee)
-		if assignee == "" || seen[assignee] {
-			continue
-		}
-		seen[assignee] = true
-		unique = append(unique, assignee)
-	}
-	for _, assignee := range unique {
+	rigNames := activeBeadRigNames(stores, sortedRigNames(stores), rig)
+	for _, assignee := range uniqueAssignees(assignees) {
 		for _, rn := range rigNames {
-			query := beads.ListQuery{
+			matches, err := stores[rn].List(beads.ListQuery{
 				Assignee: assignee,
 				Status:   "in_progress",
-				Live:     live,
+				Live:     true,
 				Limit:    1,
 				Sort:     beads.SortCreatedDesc,
-			}
-			if !live {
-				if cached, ok := stores[rn].(cachedListStore); ok {
-					matches, cacheOK := cached.CachedList(query)
-					if cacheOK {
-						if len(matches) > 0 {
-							return matches[0].ID
-						}
-						continue
-					}
-				}
-			}
-			matches, err := stores[rn].List(query)
+			})
 			if err != nil {
 				continue
 			}
@@ -403,6 +405,137 @@ func (s *Server) findActiveBeadForAssigneesWithFreshness(rig string, live bool, 
 		}
 	}
 	return ""
+}
+
+// activeBeadFinder answers "which in_progress bead does one of these
+// identities hold?" There are two kinds. A list builds ONE activeBeadIndex
+// per request and shares it across every row. A single-item view that must
+// see external reassignment at once uses liveActiveBeadFinder.
+type activeBeadFinder interface {
+	lookup(rig string, assignees ...string) string
+}
+
+// liveActiveBeadFinder reads the bead stores fresh on every lookup.
+type liveActiveBeadFinder struct{ s *Server }
+
+func (f liveActiveBeadFinder) lookup(rig string, assignees ...string) string {
+	return f.s.findLiveActiveBeadForAssignees(rig, assignees...)
+}
+
+// activeBeadIndex answers "which in_progress bead does this assignee hold?"
+// for every agent in one list request. It reads each rig store at most once,
+// the first time an agent in that rig asks, and keeps the answer for the rest
+// of the request.
+//
+// Do not go back to one query per agent. On a town of 419 pool slots that
+// was about 1,200 store reads per request whenever the cache was dirty, and
+// the agent list took 8 minutes (hq-xujh6g).
+//
+// It is safe to call from many goroutines at once.
+type activeBeadIndex struct {
+	stores  map[string]beads.Store
+	allRigs []string
+	// byStore is keyed by store, not rig name: two rigs that share one
+	// store (the file provider) share one read.
+	byStore map[beads.Store]*rigActiveBeads
+}
+
+// rigActiveBeads is one rig store's in_progress beads, keyed by assignee.
+// Each assignee maps to its NEWEST in_progress bead, which is the same bead
+// the old per-agent query (Limit 1, newest first) returned.
+type rigActiveBeads struct {
+	once       sync.Once
+	byAssignee map[string]string
+}
+
+func (s *Server) newActiveBeadIndex() *activeBeadIndex {
+	stores := s.state.BeadStores()
+	byStore := make(map[beads.Store]*rigActiveBeads, len(stores))
+	for _, store := range stores {
+		if _, ok := byStore[store]; !ok {
+			byStore[store] = &rigActiveBeads{}
+		}
+	}
+	return &activeBeadIndex{stores: stores, allRigs: sortedRigNames(stores), byStore: byStore}
+}
+
+// lookup returns the ID of the first in_progress bead held by the given
+// identities, trying them in order. A non-empty rig that names a store
+// searches only that store; otherwise every store is searched in name order.
+// Returns "" when nothing matches.
+func (x *activeBeadIndex) lookup(rig string, assignees ...string) string {
+	for _, assignee := range uniqueAssignees(assignees) {
+		for _, rn := range activeBeadRigNames(x.stores, x.allRigs, rig) {
+			if id := x.load(rn)[assignee]; id != "" {
+				return id
+			}
+		}
+	}
+	return ""
+}
+
+// load reads one rig store's in_progress beads, once per store per index.
+// It uses the in-memory cache when the cache is clean and falls back to one
+// store List when it is not. A failed List reads as "no active beads in this rig", which
+// is what the old per-agent lookup did too.
+func (x *activeBeadIndex) load(rig string) map[string]string {
+	store := x.stores[rig]
+	entry := x.byStore[store]
+	entry.once.Do(func() {
+		query := beads.ListQuery{Status: "in_progress", Sort: beads.SortCreatedDesc}
+		var rows []beads.Bead
+		cacheOK := false
+		if cached, ok := store.(cachedListStore); ok {
+			rows, cacheOK = cached.CachedList(query)
+		}
+		if !cacheOK {
+			var err error
+			if rows, err = store.List(query); err != nil {
+				rows = nil
+			}
+		}
+		entry.byAssignee = make(map[string]string, len(rows))
+		for _, b := range rows {
+			assignee := strings.TrimSpace(b.Assignee)
+			if assignee == "" {
+				continue
+			}
+			// Rows are newest first, so the first bead seen for an
+			// assignee is the one to keep.
+			if _, seen := entry.byAssignee[assignee]; !seen {
+				entry.byAssignee[assignee] = b.ID
+			}
+		}
+	})
+	return entry.byAssignee
+}
+
+// activeBeadRigNames lists the stores an active-bead lookup searches: just
+// the agent's own rig when it has a store, otherwise all of them (allRigs, from
+// sortedRigNames).
+func activeBeadRigNames(stores map[string]beads.Store, allRigs []string, rig string) []string {
+	if rig != "" {
+		if _, ok := stores[rig]; ok {
+			return []string{rig}
+		}
+	}
+	return allRigs
+}
+
+// uniqueAssignees trims the identities and drops blanks and repeats, keeping
+// the caller's order (the order is the lookup priority).
+func uniqueAssignees(assignees []string) []string {
+	seen := make(map[string]bool, len(assignees))
+	unique := make([]string, 0, len(assignees))
+	for _, assignee := range assignees {
+		assignee = strings.TrimSpace(assignee)
+		if assignee == "" || seen[assignee] {
+			continue
+		}
+		seen[assignee] = true
+		unique = append(unique, assignee)
+	}
+	return unique
 }
 
 // providerPathCheck returns the binary name to check for PATH availability.

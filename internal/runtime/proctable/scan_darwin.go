@@ -50,9 +50,6 @@ func scanRecordsBySessionID(records map[int]psRecord, id string) []runtime.LiveR
 			continue
 		}
 		sessionID := record.env["GC_SESSION_ID"]
-		if sessionID == "" {
-			continue
-		}
 		if id != "" && sessionID != id {
 			continue
 		}
@@ -120,28 +117,6 @@ func IsScanRoot(pid int) bool {
 		return false
 	}
 	return isRecordScanRoot(records, record)
-}
-
-// isRecordScanRoot is the pure half of IsScanRoot. Infrastructure is never a
-// root (see scanRecordsBySessionID), so a kill path that asks about the tmux
-// server is told no.
-func isRecordScanRoot(records map[int]psRecord, record psRecord) bool {
-	if isInfrastructureCommand(record.command) {
-		return false
-	}
-	sessionID := record.env["GC_SESSION_ID"]
-	if sessionID == "" {
-		return false
-	}
-	parent, ok := records[record.ppid]
-	return !ok || parent.env["GC_SESSION_ID"] != sessionID || isInfrastructureCommand(parent.command)
-}
-
-type psRecord struct {
-	pid     int
-	ppid    int
-	command string
-	env     map[string]string
 }
 
 func psRecords() (map[int]psRecord, error) {

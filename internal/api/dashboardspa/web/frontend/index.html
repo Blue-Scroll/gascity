@@ -2,7 +2,19 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <!-- Saved to a phone home screen this runs with no browser chrome: no URL
+         bar, no back gesture. Every way out has to be inside the app. -->
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+    <meta name="apple-mobile-web-app-title" content="gas city" />
+    <meta name="theme-color" content="#f6f1ec" media="(prefers-color-scheme: light)" />
+    <meta name="theme-color" content="#16130f" media="(prefers-color-scheme: dark)" />
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <link rel="apple-touch-icon" href="/favicon-calm.svg" />
+    <!-- Where a browser terminal is served, when the deployment provides one.
+         Empty or absent = no terminal links anywhere in the app. -->
+    <meta name="gc-terminal-base" content="/term/" />
     <title>gas city · ds-research</title>
     <!-- gascity-dashboard-kb3 R8: useFaviconSignal mutates href in place
          to flip between the calm and alert SVGs on a 2-cycle hysteresis. -->

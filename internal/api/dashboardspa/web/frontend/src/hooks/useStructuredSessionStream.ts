@@ -144,6 +144,7 @@ export function useStructuredSessionStream(
             sessionId,
             envelope.history.cursor.resume_token,
             'structured',
+            true,
           ),
           { withCredentials: true },
         );

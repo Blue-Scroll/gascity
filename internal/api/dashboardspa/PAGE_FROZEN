@@ -1,0 +1,19 @@
+# The phone dashboard page is FROZEN on this fork (vn-9kvo79d, phone dashboard F1).
+#
+# The page moved to its own repo, Blue-Scroll/gascity-dashboard. A change to it
+# made here would be thrown away when D1 hands web/ and dist/ back to upstream,
+# so make it there instead.
+#
+# fork-verify's dashboard job compares the git tree hash of web/ and dist/ at
+# the pushed commit to the two lines below, and goes red on any difference.
+# Do not edit these lines to make a page change pass. That is the change the
+# freeze exists to stop.
+#
+# An upstream merge before D1 keeps town's web/ and dist/ exactly as they are,
+# so these lines still match (gas-city docs/tool-forks.md, "What town holds
+# today"). D1 deletes this file and replaces the check with a merge-base diff.
+#
+# key = value, one per line. Read with awk, never sourced.
+parent = 922d5fa36cc586aae53fc863e08fab48e4eb9a77
+web = b7fbaaf4f1b39396ede65e0edc9cac2dc42e5438
+dist = 2ac007b54e7531013d8ca87ac99c828de8f57e65

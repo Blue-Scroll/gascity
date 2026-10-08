@@ -27,6 +27,17 @@ export async function listSupervisorSessions(): Promise<SupervisorSessionList> {
   return supervisorApi().listSessions(activeCityOrThrow('list supervisor sessions'));
 }
 
+/**
+ * Whether a session row carries its id. While the bead store is slow, GET
+ * /sessions answers at once with the live sessions and marks the list partial
+ * (vn-fzant5y). Those rows have no id yet, because the id lives on the session
+ * bead. Use them to show who is running. Never use one to open, peek at or
+ * link a session: check this first.
+ */
+export function hasSessionId(session: SupervisorSession): boolean {
+  return session.id !== '';
+}
+
 export async function fetchSupervisorSessionTranscript(
   sessionId: string,
 ): Promise<SessionTranscriptView> {
@@ -47,12 +58,69 @@ export async function fetchSupervisorSessionTranscript(
 export async function fetchStructuredTranscript(
   sessionId: string,
 ): Promise<SessionStreamStructuredMessageEvent | null> {
-  const transcript = await supervisorApi().sessionTranscript(
+  const transcript = await supervisorApi().sessionTranscriptPage(
     activeCityOrThrow('fetch structured session transcript'),
     sessionId,
-    'structured',
+    // Thinking text is redacted unless asked for; a reader that offers to show
+    // it has to ask, or every fold opens on nothing.
+    { format: 'structured', include_thinking: true },
   );
   return structuredTranscriptOrNull(transcript);
+}
+
+/**
+ * One window of a session's structured transcript. `before` is a message id;
+ * the server returns the entries immediately before it, which is how the
+ * session view pages backwards without ever holding the whole log.
+ */
+export async function fetchStructuredTranscriptPage(
+  sessionId: string,
+  opts: { before?: string; tail?: string; includeThinking?: boolean } = {},
+): Promise<{
+  event: SessionStreamStructuredMessageEvent | null;
+  hasOlder: boolean;
+  totalCount: number;
+}> {
+  const transcript = await supervisorApi().sessionTranscriptPage(
+    activeCityOrThrow('fetch structured session transcript page'),
+    sessionId,
+    {
+      format: 'structured',
+      tail: opts.tail ?? '0',
+      ...(opts.before ? { before: opts.before } : {}),
+      ...(opts.includeThinking ? { include_thinking: true } : {}),
+    },
+  );
+  const pagination = (
+    transcript as { pagination?: { has_older_messages?: boolean; total_message_count?: number } }
+  ).pagination;
+  return {
+    event: structuredTranscriptOrNull(transcript),
+    hasOlder: pagination?.has_older_messages ?? false,
+    totalCount: pagination?.total_message_count ?? 0,
+  };
+}
+
+export async function sendMessageToSession(sessionId: string, message: string): Promise<void> {
+  await supervisorApi().sendSessionMessage(
+    activeCityOrThrow('send a message to a session'),
+    sessionId,
+    message,
+  );
+}
+
+/**
+ * Cut the current run short. gc's only interrupt is a submit that replaces the
+ * run's remaining work with a message, so an empty one is refused by the API;
+ * the caller passes whatever the operator had typed, or a plain stop.
+ */
+export async function interruptSession(sessionId: string, message: string): Promise<void> {
+  await supervisorApi().submitSession(
+    activeCityOrThrow('interrupt a session'),
+    sessionId,
+    message.trim() === '' ? 'stop' : message,
+    'interrupt_now',
+  );
 }
 
 export function structuredTranscriptOrNull(
@@ -66,7 +134,8 @@ export function structuredTranscriptOrNull(
 }
 
 export function normalizeSessions(list: ListBodySessionResponse): DashboardSession[] {
-  return (list.items ?? []).map(normalizeSession);
+  // A row with no id cannot be joined to anything; the list is already partial.
+  return (list.items ?? []).filter(hasSessionId).map(normalizeSession);
 }
 
 function normalizeSession(session: SessionResponse): DashboardSession {

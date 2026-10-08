@@ -21,6 +21,7 @@ import {
   StatusLamps,
   type LampState,
 } from '../components/cockpit/Instruments';
+import { MayorButton, mayorLink } from '../components/cockpit/MayorButton';
 import {
   burnPerHour,
   laneToRing,
@@ -29,6 +30,7 @@ import {
 } from '../components/cockpit/model';
 import { PageHeader } from '../components/PageHeader';
 import { useCachedData } from '../hooks/useCachedData';
+import { useRefreshWhilePartial } from '../hooks/useRefreshWhilePartial';
 import { useRunSummary } from '../runs/runSummarySubscription';
 import { SUPERVISOR_REQUEST_TIMEOUT_MS, supervisorApi } from '../supervisor/client';
 
@@ -63,6 +65,16 @@ export function CockpitHomePage() {
   usePoll(statusState.refresh, statusState.loading, pausedRef);
   usePoll(runsState.refresh, runsState.loading, pausedRef);
   usePoll(sessionsState.refresh, sessionsState.loading, pausedRef);
+  // While the bead store is slow, the sessions list answers at once with the
+  // live sessions and no ids, marked partial (vn-fzant5y). Ask again soon
+  // instead of waiting a whole poll, so the Mayor button gets its link as soon
+  // as the full list is ready. This runs while paused too: the button reads
+  // live, and it stops by itself once an answer is not partial.
+  useRefreshWhilePartial(
+    sessionsState.data?.partial === true,
+    sessionsState.fetchedAt,
+    sessionsState.refresh,
+  );
 
   const usageReading = useFrozenWhilePaused(useReadingSnapshot(usageState, cityKey), paused);
   const statusReading = useFrozenWhilePaused(useReadingSnapshot(statusState, cityKey), paused);
@@ -82,6 +94,9 @@ export function CockpitHomePage() {
   const canonicalRuns = runsReading.data;
   const sessions = sessionsReading.data;
   const richRuns = runProjection.source;
+  // Read live, not frozen: pausing the instruments must not strand the
+  // button on a mayor session that has since restarted.
+  const mayor = mayorLink(sessionsState.data, sessionsState.loading);
 
   const [activitySamples, setActivitySamples] = useState<number[]>([]);
   const lastUsageSampleRef = useRef<string | null>(null);
@@ -304,6 +319,7 @@ export function CockpitHomePage() {
       <PageHeader
         title="Home"
         synopsis={synopsis}
+        action={<MayorButton link={mayor} />}
         meta={
           <button
             type="button"
@@ -453,10 +469,10 @@ function usePoll(
   pausedRef: MutableRefObject<boolean>,
 ) {
   useEffect(() => {
-    // A fixed interval can supersede every response that takes longer than the
-    // cadence because useCachedData publishes only its latest run. Keep one
-    // timer instead: poll after settlement, or elect a recovery attempt after
-    // the supervisor request budget if a broken fetch never settles.
+    // Poll after settlement, not on a fixed interval, so a response slower than
+    // the cadence is never followed by a queued refresh. If a fetch never
+    // settles, elect a recovery attempt after the supervisor request budget:
+    // useCachedData lets a refresh replace a fetch that old.
     let stopped = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
 

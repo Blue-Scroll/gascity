@@ -597,7 +597,7 @@ function ActivitySection({
 
 function ActivityTable({ children, label }: { children: ReactNode; label: string }) {
   return (
-    <div className="overflow-x-auto">
+    <div className="overflow-x-auto bleed-x">
       <table aria-label={label} className="w-full text-body tnum">
         {children}
       </table>

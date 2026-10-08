@@ -867,3 +867,27 @@ func TestScanWithRootReportsWhetherTheParentIsProviderInfrastructure(t *testing.
 			"and killing it signals the process group whose SIGTERM handler stops the city's shared dolt sql-server")
 	}
 }
+
+// The process table from vn-p4rwdst: a tmux server that carries the deacon's
+// GC_SESSION_ID and is PPID 1, the deacon's pane shell under it, and a real
+// escaped orphan. Only the server must drop out; killing it kills every
+// session on the socket.
+func TestScanWithRootNeverReturnsTheTmuxServer(t *testing.T) {
+	root := t.TempDir()
+	env := map[string]string{"GC_SESSION_ID": "ga-deacon"}
+	buildFakeProcUnder(t, root, 100, 1, "tmux: server", env)
+	buildFakeProcUnder(t, root, 200, 100, "zsh", env)
+	buildFakeProcUnder(t, root, 300, 1, "zsh", env)
+
+	got, err := scanWithRoot(root, "ga-deacon")
+	if err != nil {
+		t.Fatalf("scanWithRoot error: %v", err)
+	}
+	var pids []int
+	for _, r := range got {
+		pids = append(pids, r.PID)
+	}
+	if len(pids) != 2 || pids[0] != 200 || pids[1] != 300 {
+		t.Fatalf("scanWithRoot roots = %v, want [200 300] (pane under tmux + escaped orphan, never the tmux server 100)", pids)
+	}
+}

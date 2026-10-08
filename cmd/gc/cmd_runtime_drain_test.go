@@ -1607,3 +1607,50 @@ func TestFindAgentByNameNoMatch(t *testing.T) {
 		t.Error("expected no match for nonexistent agent")
 	}
 }
+
+// TestSessionDrainAckedByAgent pins the read half of setDrainAck. Only an ack the
+// agent wrote may stop gc hook --claim (vn-sjk7olh): the reconciler writes the
+// same flag for a deferred drain it can still cancel, and refusing work on THAT
+// would keep a session that was about to be kept from claiming it. The agent row
+// is written through the real setDrainAck, so the reader cannot drift from the
+// writer without this test going red.
+func TestSessionDrainAckedByAgent(t *testing.T) {
+	const name = "worker-1"
+	for _, tc := range []struct {
+		name  string
+		setup func(t *testing.T, sp *runtime.Fake)
+		want  bool
+	}{
+		{"no ack", func(*testing.T, *runtime.Fake) {}, false},
+		{"agent ack", func(t *testing.T, sp *runtime.Fake) {
+			if err := newDrainOps(sp).setDrainAck(name); err != nil {
+				t.Fatalf("setDrainAck: %v", err)
+			}
+		}, true},
+		{"reconciler ack", func(t *testing.T, sp *runtime.Fake) {
+			for key, value := range map[string]string{"GC_DRAIN_ACK": "1", reconcilerDrainAckSourceKey: reconcilerDrainAckSourceValue} {
+				if err := sp.SetMeta(name, key, value); err != nil {
+					t.Fatalf("SetMeta %s: %v", key, err)
+				}
+			}
+		}, false},
+		{"ack with no source", func(t *testing.T, sp *runtime.Fake) {
+			if err := sp.SetMeta(name, "GC_DRAIN_ACK", "1"); err != nil {
+				t.Fatalf("SetMeta: %v", err)
+			}
+		}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sp := runtime.NewFake()
+			tc.setup(t, sp)
+			if got := sessionDrainAckedByAgent(sp, name); got != tc.want {
+				t.Fatalf("sessionDrainAckedByAgent = %v, want %v", got, tc.want)
+			}
+		})
+	}
+	t.Run("provider read fails", func(t *testing.T) {
+		if sessionDrainAckedByAgent(runtime.NewFailFake(), name) {
+			t.Fatal("sessionDrainAckedByAgent = true on a failing provider, want false so the claim fence fails open")
+		}
+	})
+}

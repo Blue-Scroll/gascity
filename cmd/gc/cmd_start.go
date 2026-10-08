@@ -1536,13 +1536,18 @@ func configuredWorkDirPath(cityPath, cityName, qualifiedName string, a *config.A
 	if err != nil {
 		return "", err
 	}
-	// Guard against spawning into a path whose ancestor has a stale
-	// worktree pointer — see gascity#1556. Fails closed before MkdirAll
-	// so the operator sees the broken ancestor instead of a structurally
-	// orphaned spawn. workDir is already absolute (ResolveWorkDirPathStrict
-	// returns through ResolveDirPath), so no further resolution is needed.
+	// Guard against spawning into a path that cannot hold its own worktree:
+	// an ancestor with a stale worktree pointer (gascity#1556), or an
+	// ancestor that is itself a live checkout, which makes the child resolve
+	// through its parent so two sessions share one tree (vn-rm9u8g). Fails
+	// closed before MkdirAll, so the operator sees the broken ancestor
+	// instead of a spawn that looks fine and eats the neighbour's work.
+	// workDir is already absolute (ResolveWorkDirPathStrict returns through
+	// ResolveDirPath), so no further resolution is needed. ValidateSpawnTarget
+	// is the one door that runs both checks, so a spawn path cannot wire half
+	// the guard.
 	if validate {
-		if err := workdirutil.ValidateAncestorWorktreesNotStale(workDir); err != nil {
+		if err := workdirutil.ValidateSpawnTarget(workDir, workdirutil.WorktreesRoot(cityPath)); err != nil {
 			return "", err
 		}
 	}

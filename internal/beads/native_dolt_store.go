@@ -19,21 +19,29 @@ import (
 
 const nativeDoltStoreActor = "gascity"
 
-// nativeDoltOpenReadyStatuses lists the upstream bd statuses Ready() queries
-// GetReadyWork for. This must match IsReadyCandidateForTier's contract of
-// "open status ... and no future defer_until": only StatusOpen (bd's own
-// status-category table marks it the sole "active" category status) and
-// StatusDeferred (kept only because IsDeferred independently re-checks
-// DeferUntil, so an expired deferral must still resurface) belong here.
-// blocked/hooked are bd's "wip" category and pinned is "frozen" — bd's own
-// ready semantics already exclude them, and Gas City has no analogous
-// re-check for them the way it does for deferred, so querying for them let
-// dependency-blocked beads erase their status to "open" via mapBdStatus and
-// pass IsReadyCandidateForTier's status gate. See ga-3mv5d3 bead notes for
-// the full investigation.
+// nativeDoltOpenReadyStatuses lists the upstream bd statuses Ready() asks
+// GetReadyWork for. It must be exactly the set a worker can be served AND can
+// claim, or the controller counts demand that no seat can take.
+//
+// That set is StatusOpen alone. `bd ready` asks for Status "open" and nothing
+// else (cmd/bd/ready.go). `bd update --claim` also accepts custom statuses in
+// the "active" category (ClaimableSourceStatusesInTx), but `bd ready` never
+// serves those, so "open" is the only status both allow.
+//
+// StatusDeferred used to be here, so that an expired `bd defer --until` would
+// come back. It never comes back in bd: the row keeps status=deferred after
+// defer_until passes, until someone runs `bd undefer`. So gc called it ready,
+// mapBdStatus turned its status into "open", the controller spawned a seat for
+// it, and the seat's `bd ready` query never saw it. That repeated every few
+// minutes for as long as the row stayed deferred (vn-et2emvw). An open row with
+// a past defer_until is still ready here; IsDeferred handles the future case.
+//
+// blocked/hooked are bd's "wip" category and pinned is "frozen", and bd's own
+// ready semantics exclude them. Querying for them let a dependency-blocked
+// bead erase its status to "open" via mapBdStatus and pass
+// IsReadyCandidateForTier's status gate (ga-3mv5d3).
 var nativeDoltOpenReadyStatuses = []beadslib.Status{
 	beadslib.StatusOpen,
-	beadslib.StatusDeferred,
 }
 
 var (
@@ -83,10 +91,6 @@ func nativeGraphApplyDeadline(plan *GraphApplyPlan) time.Duration {
 	}
 	const perItem = 2 * time.Second
 	return d + time.Duration(len(plan.Nodes)+len(plan.Edges))*perItem
-}
-
-func nativeDoltCleanupContext() (context.Context, context.CancelFunc) {
-	return context.WithTimeout(context.Background(), bdCommandTimeout)
 }
 
 // ProcessEnvSnapshotExcludingNativeDoltOpen returns a process environment
@@ -1369,6 +1373,17 @@ func (s *NativeDoltStore) SupportsEphemeralGraphApply() bool {
 // explicit id is honored verbatim, provided it carries one of the store's
 // reserved namespaces when the store is fenced
 // (WithNativeDoltStoreReservedIDPrefixes).
+//
+// The bead row and every one of its dependency rows, the parent-child edge
+// included, are written in ONE transaction. They used to be two separate
+// writes with a compensating delete if the second one returned an error. A
+// returned error was never the problem: when the PROCESS DIED between the two
+// writes nothing compensated, and the bead row survived with no parent edge. A
+// step bead like that is invisible to everything that reaches a step through
+// its molecule, so it can never be run and never be swept, and it just piles
+// up. 72 of them existed on 2026-09-20 (vn-g3yqvvk). Nothing can compensate
+// for a dead process, so the fix is that there is no longer a window to die
+// in.
 func (s *NativeDoltStore) Create(b Bead) (Bead, error) {
 	return s.create(b, false)
 }
@@ -1396,7 +1411,8 @@ func (s *NativeDoltStore) CreateWithForeignID(b Bead) (Bead, error) {
 // handle is acquired, before any read. That ordering is the contract: a refused
 // id must reach nothing, so it cannot write a row, cannot move the mint
 // sequence, and cannot reveal through its refusal whether the store already
-// holds a relic under that id.
+// holds a relic under that id. The write itself is createInTx, the same body
+// the Store.Tx path runs, so the two routes cannot drift.
 func (s *NativeDoltStore) create(b Bead, allowForeign bool) (Bead, error) {
 	if err := s.readOnlyGuard(); err != nil {
 		return Bead{}, err
@@ -1406,36 +1422,33 @@ func (s *NativeDoltStore) create(b Bead, allowForeign bool) (Bead, error) {
 			return Bead{}, err
 		}
 	}
-	issue, err := nativeIssueFromBead(b)
-	if err != nil {
-		return Bead{}, err
-	}
 	storage, release, err := s.acquireStorage()
 	if err != nil {
 		return Bead{}, err
 	}
 	defer release()
-	ctx, cancel := nativeDoltOperationContext(context.TODO())
-	defer cancel()
-	pendingDependencies := cloneNativeDependencies(issue.Dependencies)
-	if err := s.validateCreatedDependencies(ctx, storage, issue.ID, pendingDependencies); err != nil {
-		return Bead{}, err
+	commitMsg := "gc: create bead"
+	if id := strings.TrimSpace(b.ID); id != "" {
+		commitMsg += " " + id
 	}
-	if err := storage.CreateIssue(ctx, issue, s.actor); err != nil {
-		return Bead{}, err
-	}
-	createdDependencies, err := s.persistCreatedDependencies(ctx, storage, issue.ID, pendingDependencies)
+	var created Bead
+	// Retry a lost serialization race, for the same reason Update does. One
+	// transaction around the whole create means a conflict with a concurrent
+	// writer now fails the create outright instead of one statement, and a
+	// concurrent writer to the same bead store is normal.
+	err = retryOnNativeDoltSerializationConflict(func() error {
+		ctx, cancel := nativeDoltOperationContext(context.TODO())
+		defer cancel()
+		return storage.RunInTransaction(ctx, commitMsg, func(tx beadslib.Transaction) error {
+			var err error
+			created, err = s.createInTx(ctx, tx, b)
+			return err
+		})
+	})
 	if err != nil {
-		cleanupCtx, cleanupCancel := nativeDoltCleanupContext()
-		cleanupErr := s.compensateFailedCreate(cleanupCtx, storage, issue.ID, createdDependencies)
-		cleanupCancel()
-		if cleanupErr != nil {
-			return Bead{}, errors.Join(err, cleanupErr)
-		}
 		return Bead{}, err
 	}
-	issue.Dependencies = createdDependencies
-	return beadFromNativeIssue(issue)
+	return created, nil
 }
 
 // Get retrieves a bead by ID from the upstream beads storage layer.
@@ -1567,8 +1580,11 @@ func (s *NativeDoltStore) applyCloseInTx(ctx context.Context, tx beadslib.Transa
 }
 
 // applyCreateInTx creates a bead and its dependencies within an open
-// transaction. Unlike the standalone Create, no compensation is needed: a
-// mid-create failure rolls the whole transaction back.
+// transaction, for the Store.Tx path (many ops, one commit). The standalone
+// Create (one op, one commit) runs the same body, createInTx, inside its own
+// transaction, so a bead row and its edges are always written together or
+// not at all. No compensation is needed, and none is offered: a mid-create
+// failure rolls the whole transaction back.
 //
 // It fences the same way the standalone Create does. A transaction is not an
 // exemption: the bead it writes is as resident, and as unreachable by an
@@ -1580,15 +1596,38 @@ func (s *NativeDoltStore) applyCreateInTx(ctx context.Context, tx beadslib.Trans
 	if err := checkPinnedIDNamespace("native dolt tx create", b.ID, s.reservedPrefixes); err != nil {
 		return Bead{}, err
 	}
+	return s.createInTx(ctx, tx, b)
+}
+
+// createInTx is the one write body behind applyCreateInTx and create. It
+// does NOT fence: each caller has already run the fence that fits its route
+// (create skips it only for CreateWithForeignID), and fencing again here
+// would refuse the foreign id the migration copy must keep.
+func (s *NativeDoltStore) createInTx(ctx context.Context, tx beadslib.Transaction, b Bead) (Bead, error) {
 	issue, err := nativeIssueFromBead(b)
 	if err != nil {
 		return Bead{}, err
 	}
 	deps := cloneNativeDependencies(issue.Dependencies)
+	// Check the edge targets before minting the bead, so a dependency on a
+	// bead that exists nowhere is a clean ErrNotFound rather than a dangling
+	// edge. The transaction reads its own writes, so a target created earlier
+	// in this same transaction is found.
+	if err := s.validateCreatedDependencies(ctx, tx, issue.ID, deps); err != nil {
+		return Bead{}, err
+	}
+	// The library's single-issue create persists labels and comments and
+	// ignores Issue.Dependencies; only its batch path reads that field. Clear
+	// it so nobody reads this call as writing the edges, then write each edge
+	// with the call that really does.
 	issue.Dependencies = nil
 	if err := tx.CreateIssue(ctx, issue, s.actor); err != nil {
 		return Bead{}, err
 	}
+	// CreateIssue mints the ID when the caller did not pin one, so the edges
+	// learn which bead they belong to only here. Keep the copies that carry
+	// it: they, not the originals, are what was written.
+	persistedDeps := make([]*beadslib.Dependency, 0, len(deps))
 	for _, dep := range deps {
 		if dep == nil {
 			continue
@@ -1600,8 +1639,9 @@ func (s *NativeDoltStore) applyCreateInTx(ctx context.Context, tx beadslib.Trans
 		if err := tx.AddDependency(ctx, &persisted, s.actor); err != nil {
 			return Bead{}, fmt.Errorf("persisting native create dependency %q -> %q: %w", persisted.IssueID, persisted.DependsOnID, nativeStoreError(persisted.IssueID, err))
 		}
+		persistedDeps = append(persistedDeps, &persisted)
 	}
-	issue.Dependencies = deps
+	issue.Dependencies = persistedDeps
 	return beadFromNativeIssue(issue)
 }
 
@@ -1860,20 +1900,6 @@ func (s *NativeDoltStore) Ready(queries ...ReadyQuery) ([]Bead, error) {
 			return err
 		}
 		for _, issue := range issues {
-			// The StatusDeferred branch exists so an expired time-bound
-			// deferral (defer_until in the past) can resurface. An issue
-			// with no defer_until at all was never time-bound — it's bd
-			// defer's status-based indefinite deferral — and must stay
-			// hidden. beadFromNativeIssue now records that case as
-			// Bead.IndefinitelyDeferred and IsDeferred honors it, so the
-			// readiness filter already excludes such a row; this skip keeps
-			// it from being materialized at all. The per-status loop keyed
-			// this on the filter status it was querying for; with the whole
-			// set in one call the row's own raw status is the equivalent
-			// discriminator.
-			if issue.Status == beadslib.StatusDeferred && issue.DeferUntil == nil {
-				continue
-			}
 			bead, err := beadFromNativeIssue(issue)
 			if err != nil {
 				return err
@@ -2760,32 +2786,17 @@ func (s *NativeDoltStore) updateParentInTransaction(ctx context.Context, tx bead
 	return nil
 }
 
-func (s *NativeDoltStore) persistCreatedDependencies(ctx context.Context, storage beadslib.Storage, issueID string, deps []*beadslib.Dependency) ([]*beadslib.Dependency, error) {
-	if len(deps) == 0 {
-		return nil, nil
-	}
-	if strings.TrimSpace(issueID) == "" {
-		return nil, fmt.Errorf("persisting native create dependencies: upstream create did not assign an issue ID")
-	}
-	created := make([]*beadslib.Dependency, 0, len(deps))
-	for _, dep := range deps {
-		if dep == nil {
-			continue
-		}
-		persisted := *dep
-		if strings.TrimSpace(persisted.IssueID) == "" {
-			persisted.IssueID = issueID
-		}
-		if err := storage.AddDependency(ctx, &persisted, s.actor); err != nil {
-			return created, fmt.Errorf("persisting native create dependency %q -> %q: %w", persisted.IssueID, persisted.DependsOnID, nativeStoreError(persisted.IssueID, err))
-		}
-		depCopy := persisted
-		created = append(created, &depCopy)
-	}
-	return created, nil
+// nativeIssueReader is what dependency validation needs to read: the target
+// issue, and the store's issue_prefix config when the handle was built
+// without one (see parentIsLocalForCreate). Both an open transaction and the
+// bare storage handle serve it, and taking the narrow type means a validator
+// handed a transaction cannot read around it.
+type nativeIssueReader interface {
+	GetIssue(ctx context.Context, id string) (*beadslib.Issue, error)
+	GetConfig(ctx context.Context, key string) (string, error)
 }
 
-func (s *NativeDoltStore) validateCreatedDependencies(ctx context.Context, storage beadslib.Storage, issueID string, deps []*beadslib.Dependency) error {
+func (s *NativeDoltStore) validateCreatedDependencies(ctx context.Context, reader nativeIssueReader, issueID string, deps []*beadslib.Dependency) error {
 	for _, dep := range deps {
 		if dep == nil {
 			continue
@@ -2824,7 +2835,7 @@ func (s *NativeDoltStore) validateCreatedDependencies(ctx context.Context, stora
 		// the other dependency kinds use would then skip a parent this store
 		// owns — which is the one parent it can refuse before writing.
 		if dep.Type == beadslib.DepParentChild {
-			local, err := s.parentIsLocalForCreate(ctx, storage, issueID, targetID)
+			local, err := s.parentIsLocalForCreate(ctx, reader, issueID, targetID)
 			if err != nil {
 				return err
 			}
@@ -2834,7 +2845,7 @@ func (s *NativeDoltStore) validateCreatedDependencies(ctx context.Context, stora
 		} else if !shouldPrevalidateNativeDependency(issueID, targetID, s.idPrefix) {
 			continue
 		}
-		issue, err := storage.GetIssue(ctx, targetID)
+		issue, err := reader.GetIssue(ctx, targetID)
 		if err != nil {
 			return fmt.Errorf("validating native create dependency %q -> %q: %w", issueID, targetID, nativeStoreError(targetID, err))
 		}
@@ -2864,35 +2875,16 @@ func (s *NativeDoltStore) validateCreatedDependencies(ctx context.Context, stora
 // an empty one there means the ledger declares no namespace at all. Closing
 // the residual needs storage plumbed through the update arms too; ga-0fmv4
 // tracks it.
-func (s *NativeDoltStore) parentIsLocalForCreate(ctx context.Context, storage beadslib.Storage, issueID, parentID string) (bool, error) {
+func (s *NativeDoltStore) parentIsLocalForCreate(ctx context.Context, reader nativeIssueReader, issueID, parentID string) (bool, error) {
 	prefix := s.idPrefix
 	if prefix == "" && beadIDPrefix(issueID) == "" {
-		configured, err := storage.GetConfig(ctx, nativeIssuePrefixConfigKey)
+		configured, err := reader.GetConfig(ctx, nativeIssuePrefixConfigKey)
 		if err != nil {
 			return false, fmt.Errorf("reading native issue prefix: %w", err)
 		}
 		prefix = normalizeIDPrefix(configured)
 	}
 	return nativeParentIsLocal(issueID, parentID, prefix), nil
-}
-
-func (s *NativeDoltStore) compensateFailedCreate(ctx context.Context, storage beadslib.Storage, issueID string, deps []*beadslib.Dependency) error {
-	if strings.TrimSpace(issueID) == "" {
-		return nil
-	}
-	var errs []error
-	for _, dep := range deps {
-		if dep == nil {
-			continue
-		}
-		if err := storage.RemoveDependency(ctx, issueID, dep.DependsOnID, s.actor); err != nil {
-			errs = append(errs, fmt.Errorf("removing partial native dependency %q -> %q: %w", issueID, dep.DependsOnID, nativeStoreError(issueID, err)))
-		}
-	}
-	if err := storage.DeleteIssue(ctx, issueID); err != nil {
-		errs = append(errs, fmt.Errorf("deleting partial native issue %q: %w", issueID, nativeStoreError(issueID, err)))
-	}
-	return errors.Join(errs...)
 }
 
 func nativeCloseReasonFromIssue(issue *beadslib.Issue) string {

@@ -176,6 +176,20 @@ func drainAckInstanceTokenDigest(token string) string {
 	return hex.EncodeToString(sum[:])
 }
 
+// sessionDrainAckedByAgent reports whether the session's own agent wrote the
+// drain ack above. It is the read half of setDrainAck, kept beside it so the two
+// cannot drift. The source matters: the reconciler writes the same GC_DRAIN_ACK
+// for a deferred drain it may still cancel when work reappears, while an agent
+// ack is final (cancelSessionDrainInfo never cancels one). A read error answers
+// false, so a caller that refuses on true fails open.
+func sessionDrainAckedByAgent(sp runtime.Provider, sessionName string) bool {
+	if acked, err := sp.GetMeta(sessionName, "GC_DRAIN_ACK"); err != nil || acked != "1" {
+		return false
+	}
+	source, err := sp.GetMeta(sessionName, reconcilerDrainAckSourceKey)
+	return err == nil && source == drainAckSourceAgentValue
+}
+
 func (o *providerDrainOps) isDrainAcked(sessionName string) (bool, error) {
 	val, err := o.sp.GetMeta(sessionName, "GC_DRAIN_ACK")
 	if err != nil {

@@ -85,6 +85,9 @@ func TestIdleKillLadderFightsAwakeSetExemptions(t *testing.T) {
 			//     keeps StatusDeferred, justified by "IsDeferred independently
 			//     re-checks DeferUntil". But this bead's defer_until is NULL,
 			//     so the re-check finds no live deferral and it stays ready.
+			//     (Since fixed: the ready scan asks for StatusOpen only,
+			//     vn-et2emvw. This case still pins the engine's answer to
+			//     whatever rows reach it.)
 			//
 			// workBeadHasAwakeDemand (compute_awake_set.go:697) then returns
 			// true for open+Ready, anchoring permanent "assigned-work" demand.

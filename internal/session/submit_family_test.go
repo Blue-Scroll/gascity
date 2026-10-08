@@ -107,14 +107,30 @@ func TestWaitsForIdleAfterInterrupt_Kimi(t *testing.T) {
 	}
 }
 
-// TestUsesImmediateDefaultSubmit_WrappedGeminiDoesNot — only codex gets
-// the immediate-default treatment; gemini (even wrapped) must not.
+// TestUsesImmediateDefaultSubmit_WrappedClaude: a live claude pane (even a
+// wrapped alias) is typed into at once, and a resuming one waits for its TUI
+// to come up (vn-c5j2a29).
+func TestUsesImmediateDefaultSubmit_WrappedClaude(t *testing.T) {
+	wrapped := beads.Bead{Metadata: map[string]string{
+		"builtin_ancestor": "claude",
+		"provider":         "claude-opus-high",
+	}}
+	if !usesImmediateDefaultSubmit(wrapped) {
+		t.Error("a running wrapped claude should use immediate default submit")
+	}
+	if usesImmediateDefaultSubmit(wrapped, true) {
+		t.Error("a resuming wrapped claude must wait for idle: its TUI is still starting")
+	}
+}
+
+// TestUsesImmediateDefaultSubmit_WrappedGeminiDoesNot: a running gemini (even
+// wrapped) keeps the idle-wait submit path.
 func TestUsesImmediateDefaultSubmit_WrappedGeminiDoesNot(t *testing.T) {
 	wrapped := beads.Bead{Metadata: map[string]string{
 		"builtin_ancestor": "gemini",
 		"provider":         "gemini-fast",
 	}}
 	if usesImmediateDefaultSubmit(wrapped) {
-		t.Error("wrapped gemini must NOT use immediate default submit (codex-only behavior)")
+		t.Error("a running wrapped gemini must NOT use immediate default submit")
 	}
 }

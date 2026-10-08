@@ -43,14 +43,14 @@ var bootBeadReconcileMaintenancePhases = []tickPhase{
 
 var sweepDetachedHandoffOrphansPhase = tickPhase{name: "sweep_detached_handoff_orphans", run: func(cr *CityRuntime, p *tickPass) bool {
 	if cr.cityBeadStore() != nil {
-		cr.runDetachedHandoffOrphansDelta(p.recordPhase)
+		cr.runDetachedHandoffOrphansDelta(p.trace)
 	}
 	return false
 }}
 
 var nudgeDispatchTickPhase = tickPhase{name: "nudge_dispatch_tick", run: func(cr *CityRuntime, p *tickPass) bool {
 	if cr.cityBeadStore() != nil {
-		cr.runNudgeDispatchTick(p.ctx, p.recordPhase)
+		cr.runNudgeDispatchTick(p.ctx, p.trace)
 	}
 	return false
 }}

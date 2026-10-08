@@ -1,8 +1,11 @@
 package config
 
 import (
+	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/gastownhall/gascity/internal/fsys"
 )
 
 func TestValidateSemanticsNoWarnings(t *testing.T) {
@@ -293,5 +296,121 @@ func TestValidateAgentsPromptFlagWithFlagModeOK(t *testing.T) {
 	}
 	if err := ValidateAgents(agents); err != nil {
 		t.Errorf("should be valid: %v", err)
+	}
+}
+
+// A pool name is the session identity, so two slots must never offer one name
+// (vn-rm9u8g: one identity, two sessions, one work_dir, lost work).
+
+func TestValidateSemanticsNamepoolNameInTwoPoolsOfOneRig(t *testing.T) {
+	cfg := &City{
+		Agents: []Agent{
+			{Name: "polecat-opus-high", Dir: "vessel-network", NamepoolNames: []string{"nux", "dag"}},
+			{Name: "polecat-grok", Dir: "vessel-network", NamepoolNames: []string{"warrig", "nux"}},
+		},
+	}
+	warnings := ValidateSemantics(cfg, "city.toml")
+	if len(warnings) != 1 {
+		t.Fatalf("expected 1 warning, got %d: %v", len(warnings), warnings)
+	}
+	for _, want := range []string{"nux", "vessel-network/polecat-opus-high", "vessel-network/polecat-grok", "vessel-network/nux"} {
+		if !strings.Contains(warnings[0], want) {
+			t.Errorf("warning %q should mention %q", warnings[0], want)
+		}
+	}
+}
+
+func TestValidateSemanticsSameNamepoolNameInTwoRigsIsFine(t *testing.T) {
+	// Two rigs each run their own "nux". The identities differ by rig, so the
+	// sessions and their work_dirs differ too.
+	cfg := &City{
+		Agents: []Agent{
+			{Name: "polecat", Dir: "vessel-network", NamepoolNames: []string{"nux"}},
+			{Name: "polecat", Dir: "storagehero", NamepoolNames: []string{"nux"}},
+		},
+	}
+	if warnings := ValidateSemantics(cfg, "city.toml"); len(warnings) != 0 {
+		t.Errorf("expected no warnings for one name per rig, got: %v", warnings)
+	}
+}
+
+func TestValidateSemanticsNamepoolNameListedTwiceInOnePool(t *testing.T) {
+	cfg := &City{
+		Agents: []Agent{
+			{Name: "polecat", Dir: "vessel-network", NamepoolNames: []string{"nux", "dag", "nux"}},
+		},
+	}
+	warnings := ValidateSemantics(cfg, "city.toml")
+	if len(warnings) != 1 {
+		t.Fatalf("expected 1 warning, got %d: %v", len(warnings), warnings)
+	}
+	if !strings.Contains(warnings[0], "more than once") {
+		t.Errorf("warning %q should say the name is listed more than once", warnings[0])
+	}
+}
+
+func TestValidateSemanticsNamepoolCollisionSurvivesDifferentBindings(t *testing.T) {
+	// Two bindings of one pool template keep their own identity namespace, so
+	// the shared leaf name is not a collision.
+	cfg := &City{
+		Agents: []Agent{
+			{Name: "polecat", BindingName: "opus", Dir: "vessel-network", NamepoolNames: []string{"nux"}},
+			{Name: "polecat", BindingName: "grok", Dir: "vessel-network", NamepoolNames: []string{"nux"}},
+		},
+	}
+	if warnings := ValidateSemantics(cfg, "city.toml"); len(warnings) != 0 {
+		t.Errorf("expected no warnings when bindings separate the identities, got: %v", warnings)
+	}
+}
+
+// TestLoadReportsNamepoolCollisionFromDisk is the wiring proof. The rule reads
+// NamepoolNames, which only exist after loadNamepools has run, so a check that
+// sits before that call reports nothing on a real config and is not a check at
+// all (an unwired guard). This drives the whole loader off files on disk.
+func TestLoadReportsNamepoolCollisionFromDisk(t *testing.T) {
+	dir := t.TempDir()
+	packDir := filepath.Join(dir, "mypk")
+	writeTestFile(t, packDir, "pack.toml", `
+[pack]
+name = "mypk"
+schema = 1
+`)
+	// Convention layout, the shape a real town uses: one directory per pool,
+	// holding its own agent.toml and its own namepool.txt.
+	for _, pool := range []struct{ name, names string }{
+		{"polecat-opus", "nux\ndag\n"},
+		{"polecat-grok", "warrig\nnux\n"},
+	} {
+		agentDir := filepath.Join(packDir, "agents", pool.name)
+		writeTestFile(t, agentDir, "agent.toml", "max_active_sessions = 2\n")
+		writeTestFile(t, agentDir, "prompt.template.md", "# "+pool.name+"\n")
+		writeTestFile(t, agentDir, "namepool.txt", pool.names)
+	}
+
+	cityDir := filepath.Join(dir, "city")
+	writeTestFile(t, cityDir, "city.toml", `
+[workspace]
+name = "test"
+includes = ["../mypk"]
+`)
+
+	_, prov, err := LoadWithIncludes(fsys.OSFS{}, filepath.Join(cityDir, "city.toml"))
+	if err != nil {
+		t.Fatalf("LoadWithIncludes: %v", err)
+	}
+	var found string
+	for _, w := range prov.Warnings {
+		if strings.Contains(w, "pool name \"nux\"") {
+			found = w
+			break
+		}
+	}
+	if found == "" {
+		t.Fatalf("no warning names the shared pool name; warnings: %v", prov.Warnings)
+	}
+	for _, want := range []string{"polecat-opus", "polecat-grok"} {
+		if !strings.Contains(found, want) {
+			t.Errorf("warning %q should name agent %q", found, want)
+		}
 	}
 }

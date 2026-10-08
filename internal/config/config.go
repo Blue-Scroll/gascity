@@ -2247,7 +2247,7 @@ type OrdersConfig struct {
 	// and event triggers) the supervisor dispatches per orders-lane pass, in
 	// a rotation that resumes where the previous pass stopped. The key keeps
 	// its historical name from when order dispatch ran once per controller
-	// tick. Unset keeps the built-in default of 4; set to 1 to drain overdue
+	// tick. Unset keeps the built-in default of 16; set to 1 to drain overdue
 	// cooldown orders one per pass at cold start instead of firing several
 	// concurrent goroutines at once. Condition-triggered orders are outside
 	// this budget: a passing check means work is pending right now, so they

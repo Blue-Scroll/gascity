@@ -106,7 +106,7 @@ export function TranscriptBox({ children, caption }: TranscriptBoxProps) {
           aria-modal="true"
           aria-labelledby={headingId}
           className={[
-            'fixed inset-[5%] z-[61] flex flex-col',
+            'fixed inset-[5%] max-h-[90dvh] z-[61] flex flex-col',
             'bg-surface border border-rule rounded-md',
             'transition-[opacity,transform] duration-150 ease-out motion-reduce:transition-none',
             visible ? 'opacity-100 scale-100' : 'opacity-0 scale-95',

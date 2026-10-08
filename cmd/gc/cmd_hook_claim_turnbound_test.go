@@ -68,6 +68,23 @@ func (r *turnBoundClaimRecorder) ops(t *testing.T, output string) hookClaimOps {
 	}
 }
 
+// orphanTheInvocation makes ops see a claim whose invoking turn is gone: the
+// parent recorded at the start was pid 4242, and the process has since been
+// reparented to init. A test that pins the fence refusing a DEAD turn needs
+// this, because the real parent of a test binary is `go test`, which is alive,
+// and a live parent stretches the window (hookClaimLiveParentWindowFactor).
+func orphanTheInvocation(ops *hookClaimOps) {
+	ops.InvokedParentPID = 4242
+	ops.ParentPID = func() int { return 1 }
+}
+
+// keepTheParentAlive makes ops see a claim whose invoking turn is still waiting:
+// the parent it started with is still its parent.
+func keepTheParentAlive(ops *hookClaimOps) {
+	ops.InvokedParentPID = 4242
+	ops.ParentPID = func() int { return 4242 }
+}
+
 func decodeTurnBoundResult(t *testing.T, stdout string) hookClaimJSONResult {
 	t.Helper()
 	var result hookClaimJSONResult
@@ -203,6 +220,7 @@ func TestHookClaimWindowExpiredRefusesFreshClaim(t *testing.T) {
 	ops := rec.ops(t, turnBoundRoutedWork)
 	ops.InvokedAt = time.Now().Add(-90 * time.Second)
 	ops.ClaimWindow = 45 * time.Second
+	orphanTheInvocation(&ops)
 
 	var stdout, stderr bytes.Buffer
 	code := doHookClaim("query", "/rig", hookClaimOptions{
@@ -357,6 +375,126 @@ func TestHookClaimWindowDefaultCoversWorkQueryBudget(t *testing.T) {
 	}
 }
 
+// TestHookClaimLiveParentOutlastsTheBaseWindow pins vn-buvmt78. A claim whose
+// reads spent 3m1s, past the 2m40s default window, while the turn that invoked
+// it was still alive and waiting, must CLAIM. One claim can run several work
+// queries in a row (one per federated store, plus a re-read and retries), and
+// each may honestly take the full hookWorkQueryTimeout, so the base window alone
+// refused every claim under store load. The same age with the parent gone is
+// TestHookClaimDeadParentKeepsTheBaseWindow, the control that still refuses.
+func TestHookClaimLiveParentOutlastsTheBaseWindow(t *testing.T) {
+	rec := &turnBoundClaimRecorder{}
+	ops := rec.ops(t, turnBoundRoutedWork)
+	keepTheParentAlive(&ops)
+	clk := time.Now()
+	ops.Now = func() time.Time { return clk }
+	ops.Runner = func(string, string) (string, error) {
+		clk = clk.Add(3*time.Minute + time.Second)
+		return turnBoundRoutedWork, nil
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := doHookClaim("query", "/rig", hookClaimOptions{
+		Assignee:     "worker-1",
+		RouteTargets: []string{"worker"},
+		JSON:         true,
+	}, ops, &stdout, &stderr)
+
+	if code != 0 {
+		t.Fatalf("code = %d, want 0: a slow read under a live parent must still claim; stderr=%s", code, stderr.String())
+	}
+	if len(rec.claims) != 1 || rec.claims[0] != "work-1" {
+		t.Fatalf("claims = %v, want [work-1]", rec.claims)
+	}
+	if len(rec.windowExpired) != 0 {
+		t.Fatalf("claim_window_expired fired with the parent alive: %+v", rec.windowExpired)
+	}
+	if len(rec.releases) != 0 {
+		t.Fatalf("releases = %v, want none: the claim landed inside the live-parent window", rec.releases)
+	}
+}
+
+// TestHookClaimDeadParentKeepsTheBaseWindow is the control for the live-parent
+// stretch: the same 3m1s read, with the parent gone, is an orphaned claim and
+// is refused at the base window, exactly as before.
+func TestHookClaimDeadParentKeepsTheBaseWindow(t *testing.T) {
+	rec := &turnBoundClaimRecorder{}
+	ops := rec.ops(t, turnBoundRoutedWork)
+	orphanTheInvocation(&ops)
+	clk := time.Now()
+	ops.Now = func() time.Time { return clk }
+	ops.Runner = func(string, string) (string, error) {
+		clk = clk.Add(3*time.Minute + time.Second)
+		return turnBoundRoutedWork, nil
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := doHookClaim("query", "/rig", hookClaimOptions{
+		Assignee:     "worker-1",
+		RouteTargets: []string{"worker"},
+		JSON:         true,
+	}, ops, &stdout, &stderr)
+
+	if code != 1 {
+		t.Fatalf("code = %d, want 1: an orphaned claim past the base window must be refused; stderr=%s", code, stderr.String())
+	}
+	if len(rec.claims) != 0 {
+		t.Fatalf("claims = %v, want none", rec.claims)
+	}
+	if len(rec.windowExpired) != 1 || rec.windowExpired[0].ParentAlive {
+		t.Fatalf("claim_window_expired events = %+v, want one with parent_alive=false", rec.windowExpired)
+	}
+}
+
+// TestHookClaimLiveParentStillHasACeiling pins that a live parent buys more
+// time, not unlimited time. A provider host can stop reading a slow command and
+// stay alive (ga-fylee), so past the stretched window the claim is refused even
+// with the parent alive, and the event says parent_alive=true.
+func TestHookClaimLiveParentStillHasACeiling(t *testing.T) {
+	rec := &turnBoundClaimRecorder{}
+	ops := rec.ops(t, turnBoundRoutedWork)
+	keepTheParentAlive(&ops)
+	ops.ClaimWindow = 45 * time.Second
+	ops.InvokedAt = time.Now().Add(-(45*time.Second*hookClaimLiveParentWindowFactor + time.Second))
+
+	var stdout, stderr bytes.Buffer
+	code := doHookClaim("query", "/rig", hookClaimOptions{
+		Assignee:     "worker-1",
+		RouteTargets: []string{"worker"},
+		JSON:         true,
+	}, ops, &stdout, &stderr)
+
+	if code != 1 {
+		t.Fatalf("code = %d, want 1: past the live-parent ceiling the claim must be refused; stderr=%s", code, stderr.String())
+	}
+	if len(rec.claims) != 0 {
+		t.Fatalf("claims = %v, want none", rec.claims)
+	}
+	if len(rec.windowExpired) != 1 || !rec.windowExpired[0].ParentAlive {
+		t.Fatalf("claim_window_expired events = %+v, want one with parent_alive=true", rec.windowExpired)
+	}
+}
+
+// TestHookClaimReparentedToASubreaperIsNotALiveParent pins the parent test
+// itself. Inside a container an orphan is reparented to the subreaper (tini,
+// systemd --user), not to pid 1, so the old "parent pid is not 1" test read
+// every orphan there as alive. The parent is alive only while it is the SAME
+// pid the invocation started with.
+func TestHookClaimReparentedToASubreaperIsNotALiveParent(t *testing.T) {
+	ops := hookClaimOps{InvokedParentPID: 4242, ParentPID: func() int { return 777 }}
+	if ops.parentAlive() {
+		t.Fatal("parentAlive() = true after the parent changed from 4242 to a subreaper at 777")
+	}
+	ops.ParentPID = func() int { return 4242 }
+	if !ops.parentAlive() {
+		t.Fatal("parentAlive() = false while the recorded parent 4242 is still the parent")
+	}
+	ops.ParentPID = func() int { return 1 }
+	if ops.parentAlive() {
+		t.Fatal("parentAlive() = true after reparenting to init")
+	}
+}
+
 // TestHookClaimWindowBoundsTheClaimWriteChild pins the ctx half of F-B: the
 // claim-write child's own deadline is the REMAINING window, not the flat
 // mutation timeout. Without it a claim started at second 44 of a 45s window
@@ -366,6 +504,7 @@ func TestHookClaimWindowBoundsTheClaimWriteChild(t *testing.T) {
 	ops := rec.ops(t, turnBoundRoutedWork)
 	ops.InvokedAt = time.Now().Add(-44 * time.Second)
 	ops.ClaimWindow = 45 * time.Second
+	orphanTheInvocation(&ops)
 
 	var stdout, stderr bytes.Buffer
 	doHookClaim("query", "/rig", hookClaimOptions{
@@ -457,6 +596,7 @@ func TestHookClaimStraddleUnwinds(t *testing.T) {
 	ops.Now = func() time.Time { return clock }
 	ops.InvokedAt = clock
 	ops.ClaimWindow = 40 * time.Second
+	orphanTheInvocation(&ops)
 	baseClaim := ops.Claim
 	ops.Claim = func(ctx context.Context, dir string, env []string, beadID, assignee string) (beads.Bead, bool, error) {
 		// The CAS commits, but only after the invoking process's window is spent —
@@ -629,6 +769,7 @@ func TestHookClaimStraddleLeavesSessionClaimUntouched(t *testing.T) {
 	ops.Now = func() time.Time { return clock }
 	ops.InvokedAt = clock
 	ops.ClaimWindow = 40 * time.Second
+	orphanTheInvocation(&ops)
 	baseClaim := ops.Claim
 	ops.Claim = func(ctx context.Context, dir string, env []string, beadID, assignee string) (beads.Bead, bool, error) {
 		// The CAS commits after the invoking process's window is spent — the straddle.

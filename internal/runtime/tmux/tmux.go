@@ -2277,12 +2277,21 @@ func (t *Tmux) sendHiddenAttachedText(target, text string) (bool, error) {
 	// trailing Enter is delivered, so a later GetSessionActivity discounts gc's
 	// echo instead of counting this nudge as the agent responding (see
 	// discountPokeActivity). A failed write records nothing.
-	commitPoke := t.beginPoke(target)
-	if err := client.write([]byte(text)); err != nil {
+	// The hidden client's trailing Enter submits the whole box, exactly like
+	// NudgeSession's, so it needs the same guard (hq-ibmvf).
+	alreadyDrafted, err := t.guardUnsentInput(target, text)
+	if err != nil {
 		return true, err
 	}
-	if t.cfg.DebounceMs > 0 {
-		time.Sleep(time.Duration(t.cfg.DebounceMs) * time.Millisecond)
+	commitPoke := t.beginPoke(target)
+	if !alreadyDrafted {
+		_ = t.recordNudgeDraft(target, text)
+		if err := client.write([]byte(text)); err != nil {
+			return true, err
+		}
+		if t.cfg.DebounceMs > 0 {
+			time.Sleep(time.Duration(t.cfg.DebounceMs) * time.Millisecond)
+		}
 	}
 	if err := client.write([]byte{'\r'}); err != nil {
 		return true, err
@@ -2314,8 +2323,19 @@ func nextPasteBufferName() string {
 	return fmt.Sprintf("gc-nudge-%d-%d", os.Getpid(), seq)
 }
 
+// sendLiteralText puts text into target's input. Only one short line is
+// typed as keys. Anything with a line break, or too long for one send-keys,
+// goes in as ONE bracketed paste.
+//
+// Why a line break forces the paste (hq-q1cpc): typed keys arrive as a fast
+// stream with no paste markers, so claude's input box has to guess where a
+// paste starts, and it sometimes guesses wrong and throws away the front of
+// the message. Measured 2026-09-21 on the mayor and deacon transcripts: 233 of
+// 1454 typed multi-line nudges arrived cut, some down to the last line
+// "</system-reminder>", while 0 of 150 bracketed pastes did. A cut message
+// still submits, so neither side sees an error.
 func (t *Tmux) sendLiteralText(target, text string) error {
-	if len(text) > maxSendKeysLiteralLen {
+	if len(text) > maxSendKeysLiteralLen || strings.ContainsAny(text, "\r\n") {
 		return t.pasteLiteralText(target, text)
 	}
 	_, err := t.run("send-keys", "-t", paneTarget(target), "-l", text)
@@ -2796,9 +2816,13 @@ func (t *Tmux) sendNudgeSubmitSequence(target string, keys []string) error {
 
 // NudgeSession sends a message to a Claude Code session reliably.
 // This is the canonical way to send messages to Claude sessions.
-// Uses: literal mode + 500ms debounce + separate Enter.
+// Uses: literal text (one bracketed paste when it has a line break, see
+// sendLiteralText) + 500ms debounce + separate Enter.
 // After sending, triggers SIGWINCH to wake Claude in detached sessions.
 // Verification is the Witness's job (AI), not this function.
+//
+// Returns ErrNudgeInputOccupied, and types nothing, when the input box already
+// holds text a person typed and did not send (see guardUnsentInput).
 //
 // If the agent TUI hasn't initialized yet (cold startup), retries with backoff
 // up to NudgeReadyTimeout before giving up. See sendKeysLiteralWithRetry.
@@ -2889,41 +2913,65 @@ func (t *Tmux) nudgeSession(
 		time.Sleep(midSessionDialogSettleDelay)
 	}
 
-	// 1. Clear any pending input already sitting on the line before pasting,
-	// mirroring SendKeysReplace (send-keys C-u). Without this, an earlier
-	// nudge's undelivered draft — e.g. a lost submit Enter (ga-bwm) — stays in
-	// the input box, and this paste concatenates on top of it instead of
-	// replacing it: stacked injections merge into one draft that Claude's TUI
-	// does not treat as a clean single-line submit (ra-3x46cy finding 2).
-	//
-	// Skip the clear when a client is attached, or when the probe cannot
-	// tell: a human may be mid-keystroke, and silently wiping their
-	// in-progress input is worse than the concatenation this clear otherwise
-	// prevents (#5192).
-	if attached, err := t.SessionAttachedWithError(session); err == nil && !attached {
-		if _, err := t.run("send-keys", "-t", paneTarget(target), "C-u"); err != nil {
-			return err
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-
-	// 1.5. Dismiss Claude Code's post-turn feedback survey if it is parked on
+	// 0.5. Dismiss Claude Code's post-turn feedback survey if it is parked on
 	// the pane (ga-zg7fjq). A parked survey reads idle to WaitForIdle (no
 	// busy indicator, composer prefix still matches), so this cannot be
 	// gated on an idle-wait failure the way DismissModelSwitchModalIfPresent
-	// is in Provider.Nudge -- it must run unconditionally, here.
+	// is in Provider.Nudge -- it must run unconditionally, here. It runs
+	// before the input guard below so the guard reads the prompt line, not
+	// the survey.
 	if err := t.DismissFeedbackSurveyModalIfPresent(session); err != nil {
 		return fmt.Errorf("dismissing feedback survey before nudge: %w", err)
 	}
 
-	// 2. Send text in literal mode with retry on transient errors
-	if err := sendText(target, message, t.cfg.NudgeReadyTimeout); err != nil {
+	// 1. Never paste into a box that holds somebody's unsent words: the Enter
+	// below would submit them too (hq-ibmvf). When the box already holds
+	// gc's own unsent paste of this message, skip straight to the submit.
+	alreadyDrafted, err := t.guardUnsentInput(target, message)
+	if err != nil {
 		return err
 	}
+	var pasteLabel string
+	if alreadyDrafted {
+		pasteLabel = t.draftPasteLabel(target)
+	} else {
+		_ = t.recordNudgeDraft(target, message)
 
-	// 3. Wait for paste to complete (tested, required). Kimi's TUI can take
-	// longer to accept large pasted prompts in detached panes.
-	time.Sleep(t.nudgeSubmitDebounce(target))
+		// 1.5. Clear any pending input still sitting on the line before pasting,
+		// mirroring SendKeysReplace (send-keys C-u). The guard above has already
+		// refused a person's words and recognized gc's own draft of this
+		// message; what is left to clear is a pane the guard cannot read (no
+		// recognizable prompt line) where an earlier nudge's undelivered draft,
+		// e.g. a lost submit Enter (ga-bwm), would otherwise have this paste
+		// concatenate on top of it: stacked injections merge into one draft
+		// that Claude's TUI does not treat as a clean single-line submit
+		// (ra-3x46cy finding 2).
+		//
+		// Skip the clear when a client is attached, or when the probe cannot
+		// tell: a human may be mid-keystroke, and silently wiping their
+		// in-progress input is worse than the concatenation this clear otherwise
+		// prevents (#5192).
+		if attached, err := t.SessionAttachedWithError(session); err == nil && !attached {
+			if _, err := t.run("send-keys", "-t", paneTarget(target), "C-u"); err != nil {
+				return err
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+
+		// 2. Send text in literal mode with retry on transient errors
+		if err := sendText(target, message, t.cfg.NudgeReadyTimeout); err != nil {
+			return err
+		}
+
+		// 3. Wait for paste to complete (tested, required). Kimi's TUI can take
+		// longer to accept large pasted prompts in detached panes.
+		time.Sleep(t.nudgeSubmitDebounce(target))
+
+		// Claude shows a multi-line paste as a label, not its words. Record
+		// that label so the submit check below, and a later guard, can
+		// recognize it as gc's own (hq-eez8jf).
+		pasteLabel = t.notePasteLabel(target)
+	}
 
 	// 4. Send Escape only for TUIs where it's an insert-mode escape, not a
 	// semantic input key. Claude, Codex, Gemini, and OpenCode all treat
@@ -2970,6 +3018,19 @@ func (t *Tmux) nudgeSession(
 			return fmt.Errorf("failed to send submit sequence: %w", err)
 		}
 		delivered = true
+		// A busy pane is not proof on its own: a pane that was busy before
+		// the Enter stays busy when the Enter is lost. When gc's paste label
+		// is on record, the box itself says whether it went (hq-eez8jf).
+		switch t.submitStrandedPaste(target, pasteLabel, sendSubmit) {
+		case pasteSubmitted:
+			confirmed = true
+		case pasteStranded:
+			confirmed = false
+		}
+		if confirmed {
+			// The box is empty again, so the draft marker has done its job.
+			t.forgetNudgeDraft(target)
+		}
 		if !confirmed {
 			// The window may have expired inside a large paste's ingest with
 			// every submit swallowed, leaving the draft staged in the
@@ -3086,13 +3147,24 @@ func (t *Tmux) NudgePane(pane, message string) error {
 		}
 	}()
 
-	// 1. Send text in literal mode with retry on transient errors
-	if err := t.sendKeysLiteralWithRetry(pane, message, t.cfg.NudgeReadyTimeout); err != nil {
+	// 0. Never paste into a box that holds somebody's unsent words (hq-ibmvf).
+	// See NudgeSession for alreadyDrafted and the paste label.
+	alreadyDrafted, err := t.guardUnsentInput(pane, message)
+	if err != nil {
 		return err
 	}
+	if !alreadyDrafted {
+		_ = t.recordNudgeDraft(pane, message)
 
-	// 2. Wait 500ms for paste to complete (tested, required)
-	time.Sleep(500 * time.Millisecond)
+		// 1. Send text in literal mode with retry on transient errors
+		if err := t.sendKeysLiteralWithRetry(pane, message, t.cfg.NudgeReadyTimeout); err != nil {
+			return err
+		}
+
+		// 2. Wait 500ms for paste to complete (tested, required)
+		time.Sleep(500 * time.Millisecond)
+		_ = t.notePasteLabel(pane)
+	}
 
 	// 3. See NudgeSession for why Escape is provider-specific.
 	if t.shouldSendEscapeBeforeEnter(pane) {

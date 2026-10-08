@@ -368,6 +368,7 @@ type startExecutionOptions struct {
 	asyncStopTracker               *asyncStartTracker
 	maxSessionAgeTr                maxSessionAgeTracker
 	assignedWorkDeferTr            assignedWorkDeferTracker
+	freshReassignGate              *freshReassignGate
 	workDirResolver                taskWorkDirResolver
 	stabilityWaiter                startStabilityWaiter
 	sessionStaleKeyDetectionWaiter sessionpkg.StaleKeyDetectionWaiter
@@ -450,6 +451,16 @@ func withMaxSessionAgeTracker(tr maxSessionAgeTracker) startExecutionOption {
 func withAssignedWorkDeferTracker(tr assignedWorkDeferTracker) startExecutionOption {
 	return func(opts *startExecutionOptions) {
 		opts.assignedWorkDeferTr = tr
+	}
+}
+
+// withFreshReassignGate installs the memory the fresh-mode reassign check
+// keeps between ticks. Nil still refuses unproven kills, but it can never
+// confirm a bead that is missing two ticks in a row, so a burned wisp does
+// not cycle its session.
+func withFreshReassignGate(gate *freshReassignGate) startExecutionOption {
+	return func(opts *startExecutionOptions) {
+		opts.freshReassignGate = gate
 	}
 }
 
@@ -542,6 +553,22 @@ type asyncStartTracker struct {
 	wg               sync.WaitGroup
 	stopping         bool
 	drainAckStopKeys sync.Map
+	// drainAckStopSkips remembers, per drain-ack stop key, the last reason a
+	// fenced stop was skipped. The finalizer re-queues a stop-pending session
+	// every tick, so without it the same skip line prints forever
+	// (vn-ard8cvj). A new reason (the name changed hands again) prints again.
+	drainAckStopSkips sync.Map
+	// startsInFlight counts, per session bead ID, the async starts whose
+	// goroutine is still running in THIS process. reapStaleSessionBeads reads
+	// it so a start that outlives its grace window is not closed out from
+	// under itself (hq-dx354v). It is a count, not a flag, so two overlapping
+	// starts for one session cannot have the first one to finish clear the
+	// mark while the second is still inside the provider. The map is
+	// per-process on purpose: after a supervisor restart nothing is in flight,
+	// so a bead left creating by a dead process is reaped on the old clock as
+	// before. startsMu guards it.
+	startsMu       sync.Mutex
+	startsInFlight map[string]int
 }
 
 func (t *asyncStartTracker) start() (func(), bool) {
@@ -555,6 +582,53 @@ func (t *asyncStartTracker) start() (func(), bool) {
 	}
 	t.wg.Add(1)
 	return t.wg.Done, true
+}
+
+// beginStart takes a tracker slot for one session's async start AND records
+// that session bead as having a start in flight. Use this, not start(), for a
+// provider start: the returned done clears both, so the in-flight mark can
+// never outlive the goroutine or be forgotten on an early return.
+func (t *asyncStartTracker) beginStart(sessionID string) (func(), bool) {
+	done, ok := t.start()
+	if !ok {
+		return nil, false
+	}
+	sessionID = strings.TrimSpace(sessionID)
+	if t == nil || sessionID == "" {
+		return done, true
+	}
+	t.startsMu.Lock()
+	if t.startsInFlight == nil {
+		t.startsInFlight = make(map[string]int)
+	}
+	t.startsInFlight[sessionID]++
+	t.startsMu.Unlock()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			t.startsMu.Lock()
+			if t.startsInFlight[sessionID] <= 1 {
+				delete(t.startsInFlight, sessionID)
+			} else {
+				t.startsInFlight[sessionID]--
+			}
+			t.startsMu.Unlock()
+		})
+		done()
+	}, true
+}
+
+// startInFlight reports whether this process is inside a provider start for the
+// given session bead right now. A start that is still running is not stale,
+// however old the bead's start boundary looks.
+func (t *asyncStartTracker) startInFlight(sessionID string) bool {
+	sessionID = strings.TrimSpace(sessionID)
+	if t == nil || sessionID == "" {
+		return false
+	}
+	t.startsMu.Lock()
+	defer t.startsMu.Unlock()
+	return t.startsInFlight[sessionID] > 0
 }
 
 func (t *asyncStartTracker) startDrainAckStop(key string) (func(), bool) {
@@ -577,6 +651,25 @@ func (t *asyncStartTracker) startDrainAckStop(key string) (func(), bool) {
 		t.drainAckStopKeys.Delete(key)
 		done()
 	}, true
+}
+
+// firstDrainAckStopSkip reports whether this skip reason is new for key, and
+// records it. A nil tracker has no memory, so every skip is new.
+func (t *asyncStartTracker) firstDrainAckStopSkip(key, reason string) bool {
+	if t == nil {
+		return true
+	}
+	prev, loaded := t.drainAckStopSkips.Swap(key, reason)
+	return !loaded || prev != reason
+}
+
+// forgetDrainAckStopSkip drops the remembered skip for key once a stop for it
+// goes ahead, so a later skip for the same key is reported again.
+func (t *asyncStartTracker) forgetDrainAckStopSkip(key string) {
+	if t == nil {
+		return
+	}
+	t.drainAckStopSkips.Delete(key)
 }
 
 func (t *asyncStartTracker) wait(timeout time.Duration) bool {
@@ -1523,6 +1616,9 @@ func applySchemaOptionOverridesForLaunch(agentCfg *runtime.Config, tp *TemplateP
 	}
 }
 
+// resolvePreparedTaskWorkDir picks the directory a session launches in from
+// the work_dir of the task bead it holds. It never hands back a directory that
+// another open session calls home: see taskWorkDirOwnedByOtherSession.
 func resolvePreparedTaskWorkDir(
 	candidate startCandidate,
 	cityPath string,
@@ -1530,23 +1626,66 @@ func resolvePreparedTaskWorkDir(
 	store beads.Store,
 	workDirResolver taskWorkDirResolver,
 ) string {
+	workDir := ""
 	// Prepared drain items only: the item step's copied metadata can still name
 	// the launcher checkout before prepare-worktree runs. Deliberately NOT the
-	// full resolveTaskBeadWorkDir chain — that would put the trigger bead ahead
+	// full resolveTaskBeadWorkDir chain: that would put the trigger bead ahead
 	// of the snapshot resolver for every pool session.
 	if triggerID := strings.TrimSpace(candidate.info.TriggerBeadID); triggerID != "" && store != nil {
 		if trigger, err := store.Get(triggerID); err == nil {
-			if workDir := resolveDrainSourceWorkDir(cityPath, store, trigger); workDir != "" {
-				return workDir
-			}
+			workDir = resolveDrainSourceWorkDir(cityPath, store, trigger)
 		}
 	}
-	if workDirResolver != nil {
-		if workDir := workDirResolver(candidate, cfg); workDir != "" {
-			return workDir
+	if workDir == "" && workDirResolver != nil {
+		workDir = workDirResolver(candidate, cfg)
+	}
+	if workDir == "" {
+		workDir = resolveTaskWorkDir(cityPath, store, taskWorkDirAssignees(candidate, cfg)...)
+	}
+	if workDir == "" || taskWorkDirOwnedByOtherSession(candidate, cityPath, store, workDir) {
+		return ""
+	}
+	return workDir
+}
+
+// taskWorkDirOwnedByOtherSession reports whether workDir is the home
+// directory of a DIFFERENT open session.
+//
+// A task bead's work_dir is a hint left by whoever worked the bead last. It
+// goes stale: a bead is released, re-slung, or claimed by a new pool seat, and
+// the field still names the old seat's tree. Launching there sets GC_DIR and
+// the pane's cwd to a tree another live agent is working in. Every tool that
+// then checks "am I in my own tree?" compares against GC_DIR, so the check
+// passes, and a reset or rebase lands on the other agent's uncommitted work
+// (hq-jw5qlu: measured 4 of 11 and 5 of 7 in-flight beads poisoned this way).
+//
+// The session registry is the owner of record for a directory, so it is the
+// independent witness here, not the bead. The match is exact on purpose: a
+// session whose home is a parent directory (a city or rig root) does not own
+// every worktree under it.
+func taskWorkDirOwnedByOtherSession(candidate startCandidate, cityPath string, store beads.Store, workDir string) bool {
+	if store == nil {
+		return false
+	}
+	if own := resolveWorkDirAgainstCity(cityPath, candidate.info.WorkDir); own != "" && samePath(own, workDir) {
+		return false
+	}
+	snapshot, err := loadSessionBeadSnapshot(store)
+	if err != nil {
+		// Unknown owner: launching in the session's own configured
+		// directory is always safe, a foreign tree is not.
+		return true
+	}
+	for _, other := range snapshot.OpenInfos() {
+		if other.ID == candidate.info.ID {
+			continue
+		}
+		otherDir := resolveWorkDirAgainstCity(cityPath, strings.TrimSpace(other.WorkDir))
+		if otherDir != "" && samePath(otherDir, workDir) {
+			return true
 		}
 	}
-	return resolveTaskWorkDir(cityPath, store, taskWorkDirAssignees(candidate, cfg)...)
+	return false
 }
 
 // generatedPreStartPrefixes are the exact command prefixes
@@ -3895,7 +4034,7 @@ func executePlannedStartsTraced(
 				var done func()
 				if startOpts.async {
 					var tracking bool
-					done, tracking = startOpts.asyncTracker.start()
+					done, tracking = startOpts.asyncTracker.beginStart(candidate.info.ID)
 					if !tracking {
 						logLifecycleOutcome(stderr, "start", wave, candidate.name(), candidate.logicalTemplate(cfg), "context_canceled", time.Time{}, time.Time{}, nil)
 						continue

@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -187,6 +188,47 @@ func TestDivergenceClassification(t *testing.T) {
 			wantClass: events.DemandClaimBenign, wantStat: "open",
 		},
 		{
+			// vn-w4huxh6: a blocker added after the controller counted the row.
+			// bd ready will not serve it, so no worker could have claimed it. The
+			// live-dep settlement confirms the open blocker; the row lands in the
+			// blocked bucket, never in the divergence count.
+			name: "open but blocked by an open dependency", triggerID: "wb-1",
+			bead: beads.Bead{
+				ID: "wb-1", Status: "open", Type: "task", Metadata: routed,
+				Dependencies: []beads.Dep{{IssueID: "wb-1", DependsOnID: "wb-0", Type: "blocks"}},
+			},
+			blocked:   true,
+			wantClass: events.DemandClaimBlocked, wantStat: "open",
+		},
+		{
+			name: "open and its only blocker is closed", triggerID: "wb-1",
+			bead: beads.Bead{
+				ID: "wb-1", Status: "open", Type: "task", Metadata: routed,
+				Dependencies: []beads.Dep{{IssueID: "wb-1", DependsOnID: "wb-0", Type: "blocks"}},
+			},
+			// The settlement finds the only blocker closed, so the row is claimable.
+			wantClass: events.DemandClaimDivergence, wantStat: "open",
+		},
+		{
+			// A parent-child edge never holds a row back from bd ready.
+			name: "open with only a non-blocking edge to an open bead", triggerID: "wb-1",
+			bead: beads.Bead{
+				ID: "wb-1", Status: "open", Type: "task", Metadata: routed,
+				Dependencies: []beads.Dep{{IssueID: "wb-1", DependsOnID: "wb-0", Type: "parent-child"}},
+			},
+			wantClass: events.DemandClaimDivergence, wantStat: "open",
+		},
+		{
+			// bd's projection reads true and the live deps agree: the blocker is
+			// still open. The projection alone is never the answer (it can read
+			// stale-true, see the case above), so the settlement is what lands
+			// the row in the blocked bucket.
+			name: "open and bd says is_blocked, settlement confirms", triggerID: "wb-1",
+			bead:      beads.Bead{ID: "wb-1", Status: "open", Type: "task", Metadata: routed, IsBlocked: &blockedTrue},
+			blocked:   true,
+			wantClass: events.DemandClaimBlocked, wantStat: "open",
+		},
+		{
 			name: "unreadable", triggerID: "wb-1", readErr: errors.New("store read failed"),
 			wantClass: events.DemandClaimUnknown, wantStat: "unreadable",
 		},
@@ -206,6 +248,31 @@ func TestDivergenceClassification(t *testing.T) {
 				t.Errorf("status = %q, want %q", status, tt.wantStat)
 			}
 		})
+	}
+}
+
+// A blocker that cannot be read is unknown, never a guess. Calling it unblocked
+// would print a false divergence; calling it blocked would hide a real one.
+func TestDivergenceBlockerReadFailureIsUnknown(t *testing.T) {
+	trigger := beads.Bead{
+		ID: "wb-1", Status: "open", Type: "task",
+		Metadata:     map[string]string{beadmeta.RoutedToMetadataKey: "rig/worker"},
+		Dependencies: []beads.Dep{{IssueID: "wb-1", DependsOnID: "wb-0", Type: "blocks"}},
+	}
+	ops := hookClaimOps{
+		ReadWorkMeta: func(_ context.Context, _ string, _ []string, id, _ string) (beads.Bead, error) {
+			if id == "wb-1" {
+				return trigger, nil
+			}
+			return beads.Bead{}, errors.New("store read failed")
+		},
+	}
+	status, class := classifyDemandTrigger("wb-1", "/rig", divergenceOptions(), ops)
+	if class != events.DemandClaimUnknown {
+		t.Fatalf("classification = %q, want unknown when a blocker read fails", class)
+	}
+	if status != "open" {
+		t.Fatalf("status = %q, want open", status)
 	}
 }
 

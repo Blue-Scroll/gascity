@@ -14673,3 +14673,79 @@ func TestBuildDesiredState_APICreatedAgentSessionBeadStaysDesired(t *testing.T) 
 		})
 	}
 }
+
+// TestBuildDesiredStateRecordsDemandTailSubPhases pins the records of the
+// demand build's tail. Before they existed, 38s to 157s of every demand build
+// ran with no record at all (vn-z3xmcnp), and a dropped record would quietly
+// hide it again. It runs the empty-config build so it asserts only the
+// sub-phases that fire on every store-backed build; the populated build and
+// its field values are TestBuildDesiredStateRecordsDemandSubPhases
+// (demand_trace_test.go).
+func TestBuildDesiredStateRecordsDemandTailSubPhases(t *testing.T) {
+	// The non-tick path passes no trace; the recorder must be nil-safe.
+	recordDemandSubPhase(nil, "demand_snapshot.collect_open_session_beads", startDemandSubPhase(nil), nil)
+
+	cityDir := t.TempDir()
+	clk := newLockedClock(time.Millisecond)
+	tracer, cycle := demandTraceCycle(t, cityDir, clk)
+	store := beads.NewMemStore()
+	sessionSnapshot, err := loadSessionBeadSnapshot(store)
+	if err != nil {
+		t.Fatalf("load session snapshot: %v", err)
+	}
+	var stderr strings.Builder
+	buildDesiredStateWithSessionBeads(
+		"trace-town", cityDir, time.Now().UTC(), &config.City{}, runtime.NewFake(),
+		store, nil, sessionSnapshot, cycle, &stderr,
+	)
+	byName := demandTraceRecords(t, cityDir, tracer, cycle)
+
+	for _, name := range []string{
+		"demand_snapshot.collect_open_session_beads",
+		"demand_snapshot.scan_agents",
+		"demand_snapshot.collect_assigned_work",
+		"demand_snapshot.assigned_repairs",
+		"demand_snapshot.collect_unassigned_routed",
+		"demand_snapshot.evaluate_pending_pools",
+		"demand_snapshot.realize_pools",
+		"demand_snapshot.named_session_materialize",
+		"demand_snapshot.session_overlay",
+		"demand_snapshot.continuation_candidates",
+	} {
+		if len(byName[name]) == 0 {
+			t.Errorf("missing demand sub-phase operation record %q", name)
+		}
+	}
+	// Every demand sub-phase record says how much of its time went to bd
+	// subprocesses, the same two fields every controller-tick phase carries
+	// (hq-ltq0n7). A store_read record is not a sub-phase: it is one read
+	// inside one, its whole duration IS the bd call, and it names the leg and
+	// op instead.
+	for name, records := range byName {
+		if name == "demand_snapshot.store_read" {
+			continue
+		}
+		for _, r := range records {
+			for _, field := range []string{"bd_calls", "bd_ms"} {
+				if _, ok := r.Fields[field]; !ok {
+					t.Errorf("demand sub-phase %q is missing field %q", name, field)
+				}
+			}
+		}
+	}
+	// Records that spend time resolving session templates say how much, so a
+	// trace can tell file copying (prepare) apart from template building.
+	for _, name := range []string{
+		"demand_snapshot.realize_pools",
+		"demand_snapshot.named_session_materialize",
+		"demand_snapshot.session_overlay",
+	} {
+		for _, r := range byName[name] {
+			for _, field := range []string{"templates_resolved", "template_validate_ms", "template_prepare_ms", "template_resolve_ms"} {
+				if _, ok := r.Fields[field]; !ok {
+					t.Errorf("demand sub-phase %q is missing field %q", name, field)
+				}
+			}
+		}
+	}
+}

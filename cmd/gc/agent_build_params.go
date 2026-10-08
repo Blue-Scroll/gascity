@@ -152,6 +152,12 @@ type agentBuildParams struct {
 	// etc.). Used by the skill materialization integration to decide
 	// stage-2 eligibility.
 	sessionProvider string
+
+	// resolveCost adds up the time this build spends in
+	// resolveTemplatePrepared. It is a pointer so a copied params value
+	// (see resolveTemplateForSessionBeadInfo) still adds to the same total.
+	// Nil records nothing.
+	resolveCost *templateResolveCost
 }
 
 // hasCompleteSessionSnapshot reports whether a store-backed build has a
@@ -280,6 +286,10 @@ func baseAgentBuildParams(cityName, cityPath string, cfg *config.City, sp runtim
 		beadNames:       make(map[string]string),
 		stderr:          stderr,
 		sessionProvider: cfg.Session.Provider,
+		// One cost per build: copies of this params value share the pointer
+		// (see resolveTemplateForSessionBeadInfo), so the demand sub-phase
+		// records sum every resolveTemplatePrepared call of the build.
+		resolveCost: &templateResolveCost{},
 	}
 }
 

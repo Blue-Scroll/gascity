@@ -1,7 +1,11 @@
 package runproj
 
 import (
+	"bytes"
 	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/gastownhall/gascity/internal/beads"
@@ -111,4 +115,67 @@ func equalIDs(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+func TestProjectorRunBeadsMatchesTheTwoPassFilter(t *testing.T) {
+	message, _ := json.Marshal(beads.Bead{ID: "m", Status: "open", Type: "message"})
+	control, _ := json.Marshal(beads.Bead{ID: "g", Status: "open", Type: "task", Labels: []string{"gc:control"}})
+	p := NewProjector()
+	p.Apply([]events.Event{
+		beadEvent(1, events.BeadCreated, "b", "open"),
+		{Seq: 2, Type: events.BeadCreated, Payload: message},
+		beadEvent(3, events.BeadCreated, "a", "open"),
+		{Seq: 4, Type: events.BeadCreated, Payload: control},
+	})
+
+	got := idsOf(p.RunBeads())
+	if want := idsOf(FilterRunBeads(p.Beads())); !equalIDs(got, want) {
+		t.Fatalf("RunBeads = %v, want the two-pass filter's %v", got, want)
+	}
+	if !equalIDs(got, []string{"b", "a"}) {
+		t.Fatalf("RunBeads = %v, want [b a]: the message and gc: beads are not run beads", got)
+	}
+}
+
+// TestProjectorColdLoadFoldsAcrossWalkBatches proves the batched cold load
+// folds exactly like one Apply over the whole log: an update that lands in a
+// later batch still wins, and first-seen order holds across the seam.
+func TestProjectorColdLoadFoldsAcrossWalkBatches(t *testing.T) {
+	const creates = 600 // more than two walk batches
+	var log []events.Event
+	for i := 1; i <= creates; i++ {
+		log = append(log, beadEvent(uint64(i), events.BeadCreated, fmt.Sprintf("b%03d", i), "open"))
+	}
+	log = append(log,
+		beadEvent(creates+1, events.BeadUpdated, "b001", "closed"),
+		beadEvent(creates+2, events.BeadDeleted, "b002", "open"),
+	)
+	path := filepath.Join(t.TempDir(), "events.jsonl")
+	var body bytes.Buffer
+	enc := json.NewEncoder(&body)
+	for _, e := range log {
+		if err := enc.Encode(e); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(path, body.Bytes(), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cold := NewProjector()
+	if err := cold.ColdLoad(path); err != nil {
+		t.Fatalf("ColdLoad: %v", err)
+	}
+	whole := NewProjector()
+	whole.Apply(log)
+
+	if got, want := idsOf(cold.Beads()), idsOf(whole.Beads()); !equalIDs(got, want) {
+		t.Fatalf("cold-load order differs from one whole Apply (%d vs %d ids)", len(got), len(want))
+	}
+	if cold.LastSeq() != creates+2 {
+		t.Fatalf("lastSeq = %d, want %d", cold.LastSeq(), creates+2)
+	}
+	if got := cold.Beads()[0]; got.ID != "b001" || got.Status != "closed" {
+		t.Fatalf("first bead = %s/%s, want b001/closed from the later batch", got.ID, got.Status)
+	}
 }

@@ -516,7 +516,7 @@ func queueDrainAckForcedTermination(
 		if err := workerKillSessionTargetWithConfig(cityPath, store, sp, cfg, name); err != nil && !runtime.IsSessionGone(err) {
 			fmt.Fprintf(stderr, "%s: stopping %s: %v\n", drainAckEscalationLabel, name, err) //nolint:errcheck
 		}
-		if confirmDrainAckRuntimeDead(cityPath, store, sp, cfg, name, expectedToken, processNames, stderr, confirmTimeout, confirmPoll) {
+		if confirmDrainAckRuntimeDead(cityPath, store, sp, cfg, drainAckStopTargetFromInfo(info), processNames, stderr, confirmTimeout, confirmPoll) {
 			recordDrainAckEscalation(cfg, info, name, reason, "stopped_without_force", attempt, rec)
 			// The caller suppresses its ordinary stop on a true return, so this
 			// goroutine also owns that stop's poke: the runtime is gone but the

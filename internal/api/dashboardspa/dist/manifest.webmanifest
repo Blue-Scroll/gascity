@@ -1,0 +1,12 @@
+{
+  "name": "gas city",
+  "short_name": "gas city",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#f6f1ec",
+  "theme_color": "#f6f1ec",
+  "icons": [
+    { "src": "/favicon-calm.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" }
+  ]
+}

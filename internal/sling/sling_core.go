@@ -648,31 +648,10 @@ func attachFormulaToBead(opts SlingOpts, deps SlingDeps, querier BeadQuerier, be
 	// The graph path returned above, so this is the legacy (non-graph) region:
 	// isGraph is always false here, so the former `isGraph && opts.Force`
 	// live-workflow allowance could never fire. Attachments are always checked
-	// with CheckNoMoleculeChildren on this path.
-	if err := CheckNoMoleculeChildren(querier, beadID, deps.Store, &result); err != nil {
-		var molErr *MoleculeAttachedError
-		if fallbackToPlainOnMoleculeConflict && errors.As(err, &molErr) {
-			// The caller never asked for this formula attach -- it was only
-			// implied by the target's default_sling_formula config -- so an
-			// unrelated live molecule/wisp is not a reason to block the
-			// sling. Warn and route as a plain bead instead, so gc.routed_to
-			// still gets set. A workflow conflict or metadata-clear error is
-			// not this specific error class and keeps hard-failing above.
-			result.BeadWarnings = append(result.BeadWarnings, fmt.Sprintf("skipped attaching %s %q on %s: %v; routed as a plain bead instead", errLabel, formulaName, beadID, molErr))
-			// The fallback above only warns about the molecule conflict. If the
-			// bead is also still assigned to someone other than this sling's
-			// target, plain routing sets gc.routed_to but nothing the target
-			// queries (bd ready, a wisp) can ever reach it: the hand-off is
-			// undeliverable, not merely downgraded. Surface that distinctly
-			// (gm-2kyaqy) instead of reporting unqualified success.
-			if w, ok := undeliverableHandoffWarning(querier, deps, beadID, a, molErr); ok {
-				result.BeadWarnings = append(result.BeadWarnings, w)
-			}
-			return finalize(opts, deps, beadID, "bead", result)
-		}
-		return result, fmt.Errorf("%w", err)
-	}
-	run := func() (SlingResult, error) {
+	// with CheckNoMoleculeChildren on this path, and that check runs inside
+	// the per-source-bead lock below (withLegacyAttachLock), so a second
+	// router cannot pass it while the first is still pouring.
+	attach := func() (SlingResult, error) {
 		mResult, err := InstantiateSlingFormula(context.Background(), formulaName, SlingFormulaSearchPaths(deps, a), molecule.Options{
 			Title:            opts.Title,
 			Vars:             formulaVars,
@@ -705,21 +684,40 @@ func attachFormulaToBead(opts SlingOpts, deps SlingDeps, querier BeadQuerier, be
 		// work. See gastownhall/gascity#2848 and TestOnFormulaAttachesAndRoutes.
 		return finalize(opts, deps, beadID, method, result)
 	}
-	runGraph := func() (pendingSourceWorkflowLaunch, error) {
-		mResult, err := InstantiateSlingFormula(context.Background(), formulaName, SlingFormulaSearchPaths(deps, a), molecule.Options{
-			Title:            opts.Title,
-			Vars:             formulaVars,
-			PriorityOverride: BeadPriorityOverride(querier, beadID),
-		}, beadID, opts.ScopeKind, opts.ScopeRef, a, deps)
-		if err != nil {
-			return pendingSourceWorkflowLaunch{}, fmt.Errorf("instantiating %s %q on %s: %w", errLabel, formulaName, beadID, err)
+	// A molecule conflict found by the check is remembered here so the
+	// fallback below can tell it from a failure of the attach itself.
+	var fallbackMolErr *MoleculeAttachedError
+	attached, err := withLegacyAttachLock(context.Background(), deps, beadID, &result, func() error {
+		err := CheckNoMoleculeChildren(querier, beadID, deps.Store, &result)
+		var molErr *MoleculeAttachedError
+		if err != nil && fallbackToPlainOnMoleculeConflict && errors.As(err, &molErr) {
+			fallbackMolErr = molErr
 		}
-		return pendingGraphWorkflowLaunch(mResult.RootID, beadID, beadID, SlingMergeStrategy(opts.Merge, beadID, deps, a), a, method, formulaName, deps), nil
+		return err
+	}, attach)
+	if fallbackMolErr != nil {
+		// The caller never asked for this formula attach -- it was only
+		// implied by the target's default_sling_formula config -- so an
+		// unrelated live molecule/wisp is not a reason to block the
+		// sling. Warn and route as a plain bead instead, so gc.routed_to
+		// still gets set. A workflow conflict or metadata-clear error is
+		// not this specific error class and keeps hard-failing below.
+		// attached is the caller's own result as the check left it (auto-burn
+		// ids, bead warnings), which withLegacyAttachLock hands back on a
+		// refusal.
+		attached.BeadWarnings = append(attached.BeadWarnings, fmt.Sprintf("skipped attaching %s %q on %s: %v; routed as a plain bead instead", errLabel, formulaName, beadID, fallbackMolErr))
+		// The fallback above only warns about the molecule conflict. If the
+		// bead is also still assigned to someone other than this sling's
+		// target, plain routing sets gc.routed_to but nothing the target
+		// queries (bd ready, a wisp) can ever reach it: the hand-off is
+		// undeliverable, not merely downgraded. Surface that distinctly
+		// (gm-2kyaqy) instead of reporting unqualified success.
+		if w, ok := undeliverableHandoffWarning(querier, deps, beadID, a, fallbackMolErr); ok {
+			attached.BeadWarnings = append(attached.BeadWarnings, w)
+		}
+		return finalize(opts, deps, beadID, "bead", attached)
 	}
-	if !isGraph {
-		return run()
-	}
-	return withSourceWorkflowLaunchLock(context.Background(), deps, beadID, opts.Force, runGraph)
+	return attached, err
 }
 
 // slingPlainBead handles plain bead routing (no formula).
@@ -1548,6 +1546,56 @@ func withSourceWorkflowLaunchLock(ctx context.Context, deps SlingDeps, sourceBea
 	return result, err
 }
 
+// withLegacyAttachLock runs the legacy (non-graph) formula attach for one
+// source bead under the same per-source-bead lock the two graph paths above
+// use, and runs the "is a molecule already attached?" check INSIDE it.
+//
+// Both halves matter, because attaching is a check-then-act that is minutes
+// wide. InstantiateSlingFormula mints the molecule root and one bead per step
+// first, and the source bead only gets its molecule_id afterwards. For that
+// whole gap the bead still reads open, unassigned, unrouted and unmoleculed,
+// so a second router picks it up and slings it again. Both slings then finish
+// and the bead ends up with two live molecule roots and a full set of orphan
+// step beads for the loser.
+//
+// Measured 2026-09-20 on vn-5ogw5pv: root vn-3w1trsn was made at 13:06:54Z and
+// a second root vn-0iqcywg at 13:09:08Z, three seconds before the first route
+// even landed, leaving 11 stray open beads. Nine work beads in that rig carried
+// two open roots at 13:17Z.
+//
+// With the lock the loser waits, re-runs the check, and sees the winner's
+// molecule. It does not refuse: checkNoMoleculeChildren auto-burns a live
+// molecule when the source bead is unassigned, which every pool bead is, so the
+// loser closes the winner's molecule and pours its own. That is the designed
+// re-sling behaviour and this lock leaves it alone. What changes is the count:
+// exactly one molecule root stays open either way.
+//
+// sourceworkflow.WithLock is an in-process mutex plus an on-disk flock, so this
+// holds across two `gc sling` processes, which is the case that was measured.
+// See vn-7cw0yut.
+//
+// check is re-run under the lock and its error is returned unchanged. onFree
+// runs only when check passes. pending is the caller's own result, which check
+// writes into (auto-burn ids, bead warnings); it is what a refusal reports, so
+// read it AFTER the lock body and never copy it before.
+func withLegacyAttachLock(ctx context.Context, deps SlingDeps, sourceBeadID string, pending *SlingResult, check func() error, onFree func() (SlingResult, error)) (SlingResult, error) {
+	var attached SlingResult
+	ran := false
+	err := sourceworkflow.WithLock(ctx, deps.CityPath, sourceWorkflowLockScope(deps), sourceBeadID, func() error {
+		if err := check(); err != nil {
+			return err
+		}
+		var runErr error
+		attached, runErr = onFree()
+		ran = true
+		return runErr
+	})
+	if !ran {
+		return *pending, err
+	}
+	return attached, err
+}
+
 func withGraphV2SourceWorkflowLock(ctx context.Context, deps SlingDeps, sourceBeadID string, fn func() (SlingResult, error)) (SlingResult, error) {
 	sourceBeadID = sourceworkflow.NormalizeSourceBeadID(sourceBeadID)
 	if sourceBeadID == "" {
@@ -1675,32 +1723,56 @@ func sourceWorkflowRootByIDInStore(store beads.Store, sourceBeadID, workflowID, 
 	}, true, "matched", nil
 }
 
-// attachBatchFormula launches one batch-child formula. The caller passes the
-// pre-computed isGraph flag from the one-shot formula compile at the top of
-// DoSlingBatch so that compiling N times for N children becomes a single
-// compile per batch.
-func attachBatchFormula(ctx context.Context, opts SlingOpts, deps SlingDeps, child beads.Bead, a config.Agent, formulaName, formulaLabel, method string, isGraph bool) (SlingResult, error) {
-	childVars := BuildSlingFormulaVars(formulaName, child.ID, opts.Vars, a, deps)
-	run := func() (SlingResult, error) {
-		mResult, err := InstantiateSlingFormula(ctx, formulaName, SlingFormulaSearchPaths(deps, a), molecule.Options{
+// batchAttach holds every value a batch-child formula attach needs that is the
+// same for all children. DoSlingBatch builds it once, above the loop, and the
+// loop varies only the child. Bundling them also keeps the three adjacent
+// strings (formula name, label, method) from being handed over in the wrong
+// order, which a 10-argument call could not stop.
+type batchAttach struct {
+	opts  SlingOpts
+	deps  SlingDeps
+	agent config.Agent
+	// querier is what the per-child molecule check reads the child back
+	// from. It must be the same querier DoSlingBatch expanded the convoy
+	// with, or the check looks in a store the children are not in.
+	querier      BeadChildQuerier
+	formulaName  string
+	formulaLabel string
+	method       string
+	// isGraph is the one-shot formula compile from the top of DoSlingBatch,
+	// so N children still cost one compile, not N.
+	isGraph bool
+	// batch is the caller's own batch result. The per-child molecule check
+	// writes its auto-burned molecule ids here, the same field the up-front
+	// CheckBatchNoMoleculeChildren writes to, so `gc sling` reports every
+	// burn from one list.
+	batch *SlingResult
+}
+
+// attachBatchFormula launches the formula for one child of a convoy.
+func attachBatchFormula(ctx context.Context, b batchAttach, child beads.Bead) (SlingResult, error) {
+	opts, deps, a := b.opts, b.deps, b.agent
+	childVars := BuildSlingFormulaVars(b.formulaName, child.ID, opts.Vars, a, deps)
+	attach := func() (SlingResult, error) {
+		mResult, err := InstantiateSlingFormula(ctx, b.formulaName, SlingFormulaSearchPaths(deps, a), molecule.Options{
 			Title:            opts.Title,
 			Vars:             childVars,
 			PriorityOverride: ClonePriorityPtr(child.Priority),
 		}, child.ID, opts.ScopeKind, opts.ScopeRef, a, deps)
 		if err != nil {
-			return SlingResult{}, fmt.Errorf("instantiating %s %q on %s: %w", formulaLabel, formulaName, child.ID, err)
+			return SlingResult{}, fmt.Errorf("instantiating %s %q on %s: %w", b.formulaLabel, b.formulaName, child.ID, err)
 		}
 		if mResult.GraphWorkflow || IsGraphWorkflowAttachment(deps.graphStore(), mResult.RootID) {
-			wfResult, wfErr := doStartGraphWorkflow(mResult.RootID, child.ID, child.ID, SlingMergeStrategy(opts.Merge, child.ID, deps, a), a, method, deps)
-			wfResult.FormulaName = formulaName
+			wfResult, wfErr := doStartGraphWorkflow(mResult.RootID, child.ID, child.ID, SlingMergeStrategy(opts.Merge, child.ID, deps, a), a, b.method, deps)
+			wfResult.FormulaName = b.formulaName
 			return wfResult, wfErr
 		}
 		result := SlingResult{
 			BeadID:      child.ID,
 			Target:      a.QualifiedName(),
-			Method:      method,
+			Method:      b.method,
 			WispRootID:  mResult.RootID,
-			FormulaName: formulaName,
+			FormulaName: b.formulaName,
 		}
 		if err := deps.Store.SetMetadata(child.ID, beadmeta.MoleculeIDMetadataKey, mResult.RootID); err != nil {
 			result.MetadataErrors = append(result.MetadataErrors,
@@ -1709,20 +1781,45 @@ func attachBatchFormula(ctx context.Context, opts SlingOpts, deps SlingDeps, chi
 		return result, nil
 	}
 	runGraph := func() (pendingSourceWorkflowLaunch, error) {
-		mResult, err := InstantiateSlingFormula(ctx, formulaName, SlingFormulaSearchPaths(deps, a), molecule.Options{
+		mResult, err := InstantiateSlingFormula(ctx, b.formulaName, SlingFormulaSearchPaths(deps, a), molecule.Options{
 			Title:            opts.Title,
 			Vars:             childVars,
 			PriorityOverride: ClonePriorityPtr(child.Priority),
 		}, child.ID, opts.ScopeKind, opts.ScopeRef, a, deps)
 		if err != nil {
-			return pendingSourceWorkflowLaunch{}, fmt.Errorf("instantiating %s %q on %s: %w", formulaLabel, formulaName, child.ID, err)
+			return pendingSourceWorkflowLaunch{}, fmt.Errorf("instantiating %s %q on %s: %w", b.formulaLabel, b.formulaName, child.ID, err)
 		}
-		return pendingGraphWorkflowLaunch(mResult.RootID, child.ID, child.ID, SlingMergeStrategy(opts.Merge, child.ID, deps, a), a, method, formulaName, deps), nil
+		return pendingGraphWorkflowLaunch(mResult.RootID, child.ID, child.ID, SlingMergeStrategy(opts.Merge, child.ID, deps, a), a, b.method, b.formulaName, deps), nil
 	}
-	if !isGraph {
-		return run()
+	if b.isGraph {
+		return withSourceWorkflowLaunchLock(ctx, deps, child.ID, opts.Force, runGraph)
 	}
-	return withSourceWorkflowLaunchLock(ctx, deps, child.ID, opts.Force, runGraph)
+	// Legacy (non graph.v2) path, and the reason this child is locked one at
+	// a time instead of trusting the convoy-wide check above.
+	//
+	// CheckBatchNoMoleculeChildren runs ONCE in DoSlingBatch, before any
+	// child is touched, off a snapshot of the children taken before that.
+	// Attaching then takes minutes: InstantiateSlingFormula mints the
+	// molecule root and one bead per step first, and the child only gets its
+	// molecule_id at the very end. So every child reads free from that one
+	// batch check until its own molecule_id write, and two routers expanding
+	// the same convoy both pass it and both build a molecule for every child.
+	//
+	// The fix is the same shape as the single-bead one (vn-7cw0yut): take the
+	// per-source-bead lock, and re-run the check INSIDE it, per child, off a
+	// fresh read of the child. CheckNoMoleculeChildren re-reads the bead, so
+	// it sees the winner's molecule_id where the batch check's stale snapshot
+	// could not.
+	//
+	// The loser does not refuse. checkNoMoleculeChildren auto-burns a live
+	// molecule when the child is unassigned, which every pool bead is, so it
+	// closes the winner's molecule and pours its own. That is the designed
+	// re-sling behaviour. What changes is the count: exactly one molecule root
+	// stays open per child. See vn-w7bhfu2.
+	refused := SlingResult{BeadID: child.ID, Target: a.QualifiedName(), Method: b.method}
+	return withLegacyAttachLock(ctx, deps, child.ID, &refused, func() error {
+		return CheckNoMoleculeChildren(b.querier, child.ID, deps.Store, b.batch)
+	}, attach)
 }
 
 func isGraphSlingFormula(ctx context.Context, formulaName string, searchPaths []string, vars map[string]string) (bool, error) {
@@ -2035,7 +2132,17 @@ func DoSlingBatch(opts SlingOpts, deps SlingDeps, querier BeadChildQuerier) (Sli
 			if opts.OnFormula == "" {
 				formulaLabel = "default formula"
 			}
-			formulaResult, err := attachBatchFormula(context.Background(), opts, deps, child, a, useFormula, formulaLabel, batchMethod, isGraph)
+			formulaResult, err := attachBatchFormula(context.Background(), batchAttach{
+				opts:         opts,
+				deps:         deps,
+				agent:        a,
+				querier:      querier,
+				formulaName:  useFormula,
+				formulaLabel: formulaLabel,
+				method:       batchMethod,
+				isGraph:      isGraph,
+				batch:        &batchResult,
+			}, child)
 			if err != nil {
 				childResult.Failed = true
 				childResult.FailReason = err.Error()

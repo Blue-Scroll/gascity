@@ -47,7 +47,7 @@ func TestRunNudgeQueueMaintenanceSweep_BoundedPassPreservesBacklogThenConverges(
 	// touching any item, not silently ignore the stale `now` and drain the
 	// whole backlog like an unbounded (24h-deadline) pass would.
 	staleNow := base.Add(-30 * time.Minute)
-	if err := runNudgeQueueMaintenanceSweep(dir, staleNow); err != nil {
+	if err := runNudgeQueueMaintenanceSweep(dir, nil, staleNow); err != nil {
 		t.Fatalf("runNudgeQueueMaintenanceSweep(staleNow): %v", err)
 	}
 	state, err := nudgequeue.LoadState(dir)
@@ -63,7 +63,7 @@ func TestRunNudgeQueueMaintenanceSweep_BoundedPassPreservesBacklogThenConverges(
 
 	// A fresh `now` gives the pass a deadline safely in the future, so it
 	// must fully converge the preserved backlog.
-	if err := runNudgeQueueMaintenanceSweep(dir, time.Now()); err != nil {
+	if err := runNudgeQueueMaintenanceSweep(dir, nil, time.Now()); err != nil {
 		t.Fatalf("runNudgeQueueMaintenanceSweep(fresh now): %v", err)
 	}
 	state, err = nudgequeue.LoadState(dir)
@@ -164,7 +164,7 @@ func TestQueuedNudgeMaintenanceDebounce_SkipsRedundantSameTickSweep(t *testing.T
 	if err := enqueueQueuedNudge(dir, first); err != nil {
 		t.Fatalf("enqueueQueuedNudge(first): %v", err)
 	}
-	if err := runNudgeQueueMaintenanceSweep(dir, t0); err != nil {
+	if err := runNudgeQueueMaintenanceSweep(dir, nil, t0); err != nil {
 		t.Fatalf("runNudgeQueueMaintenanceSweep(t0): %v", err)
 	}
 	state, err := nudgequeue.LoadState(dir)
@@ -182,7 +182,7 @@ func TestQueuedNudgeMaintenanceDebounce_SkipsRedundantSameTickSweep(t *testing.T
 
 	// Within the debounce window: this sweep must be skipped entirely, so
 	// the newly-enqueued (already-expired) second item stays pending.
-	if err := runNudgeQueueMaintenanceSweep(dir, t0.Add(200*time.Millisecond)); err != nil {
+	if err := runNudgeQueueMaintenanceSweep(dir, nil, t0.Add(200*time.Millisecond)); err != nil {
 		t.Fatalf("runNudgeQueueMaintenanceSweep(t0+200ms): %v", err)
 	}
 	state, err = nudgequeue.LoadState(dir)
@@ -197,7 +197,7 @@ func TestQueuedNudgeMaintenanceDebounce_SkipsRedundantSameTickSweep(t *testing.T
 	}
 
 	// Past the debounce window: the sweep must run again and converge.
-	if err := runNudgeQueueMaintenanceSweep(dir, t0.Add(2*time.Second)); err != nil {
+	if err := runNudgeQueueMaintenanceSweep(dir, nil, t0.Add(2*time.Second)); err != nil {
 		t.Fatalf("runNudgeQueueMaintenanceSweep(t0+2s): %v", err)
 	}
 	state, err = nudgequeue.LoadState(dir)

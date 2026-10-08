@@ -133,7 +133,7 @@ func dispatchAllQueuedNudges(cityPath string, cfg *config.City, store, sessStore
 	// (target agent has no open session, and never will again) can never
 	// reach — leaving it in Pending past its ExpiresAt forever. See
 	// ra-oudpha finding-3.
-	if err := runNudgeQueueMaintenanceSweep(cityPath, now); err != nil {
+	if err := runNudgeQueueMaintenanceSweep(cityPath, store, now); err != nil {
 		return 0, fmt.Errorf("nudge queue maintenance sweep: %w", err)
 	}
 	state, err := nudgequeue.LoadState(cityPath)
@@ -237,7 +237,16 @@ func dispatchAllQueuedNudges(cityPath string, cfg *config.City, store, sessStore
 			logNudgeDispatchSkip(debugOut, "not-running", target.agentKey(), target.sessionName, "")
 			continue
 		}
-		ok, err := tryDeliverQueuedNudgesByPoller(target, store, sessStore, sp, defaultNudgePollQuiescence, obs)
+		// Quiescence 0 turns off the "pane quiet for 3s" gate on this path
+		// (pollerSessionIdleEnough treats <= 0 as idle). A live Claude pane
+		// repaints its footer every second, so tmux window_activity always
+		// reads "now" and a 3s gate never opens; every queued nudge then
+		// sits in Pending forever (hq-02cr3). The idle-claim backstop
+		// (nudge_backstop.go) already nudges busy panes with no such gate
+		// and lands all day, so the gate protects nothing here.
+		// defaultNudgePollQuiescence still applies to the legacy
+		// `gc nudge poll` sidecar through its --quiescence flag.
+		ok, err := tryDeliverQueuedNudgesByPoller(target, store, sessStore, sp, 0, obs)
 		if err != nil && firstErr == nil {
 			firstErr = err
 		}
@@ -246,11 +255,12 @@ func dispatchAllQueuedNudges(cityPath string, cfg *config.City, store, sessStore
 			continue
 		}
 		// Matched a live, running session, yet nothing was claimed/delivered
-		// this tick — e.g. the poller quiescence gate (pollerSessionIdleEnough)
-		// hasn't cleared, or claimDueQueuedNudgesForTarget found nothing
-		// claimable (already claimed by a concurrent drain path). Either way
-		// this is the class of skip ra-oudpha finding-3 could not otherwise
-		// distinguish from "not matched" or "not running" without a trace.
+		// this tick. For example the live-generation check
+		// (nudgeTargetLiveGenerationMatches) saw a reused session name, or
+		// claimDueQueuedNudgesForTarget found nothing claimable (already
+		// claimed by a concurrent drain path). Either way this is the class
+		// of skip ra-oudpha finding-3 could not otherwise distinguish from
+		// "not matched" or "not running" without a trace.
 		reason := "not-delivered"
 		if err != nil {
 			reason = "not-delivered-error"

@@ -31,7 +31,15 @@ export function Modal({
       if (e.key === 'Escape') onClose();
     };
     document.addEventListener('keydown', handleKey);
-    return () => document.removeEventListener('keydown', handleKey);
+    // Without this the page behind the scrim keeps scrolling once the dialog's
+    // own scroller hits its end — on a phone that silently loses the operator's
+    // place in the list they opened the dialog from.
+    const prev = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+    return () => {
+      document.removeEventListener('keydown', handleKey);
+      document.body.style.overflow = prev;
+    };
   }, [open, onClose]);
 
   if (!open) return null;
@@ -44,7 +52,7 @@ export function Modal({
       onClick={onClose}
     >
       <div
-        className={`w-full ${widthClass} bg-surface border border-rule rounded-md flex flex-col max-h-[90vh]`}
+        className={`w-full ${widthClass} bg-surface border border-rule rounded-md flex flex-col max-h-[90dvh]`}
         onClick={(e) => e.stopPropagation()}
       >
         <div className="flex items-start justify-between gap-3 px-5 py-4 border-b border-rule">
@@ -60,7 +68,7 @@ export function Modal({
             type="button"
             onClick={onClose}
             aria-label="Close"
-            className="text-fg-muted hover:text-fg transition-colors duration-150 ease-out-quart focus-mark text-lg leading-none px-1"
+            className="-mr-2 inline-flex h-11 w-11 shrink-0 items-center justify-center text-fg-muted hover:text-fg transition-colors duration-150 ease-out-quart focus-mark text-lg leading-none"
           >
             ×
           </button>

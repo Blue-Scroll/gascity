@@ -34,6 +34,10 @@ const CockpitHomePage = lazy(() =>
   import('./routes/CockpitHome').then((m) => ({ default: m.CockpitHomePage })),
 );
 const BeadsPage = lazy(() => import('./routes/Beads').then((m) => ({ default: m.BeadsPage })));
+const TerminalPage = lazy(() =>
+  import('./routes/Terminal').then((m) => ({ default: m.TerminalPage })),
+);
+const SessionPage = lazy(() => import('./routes/Session').then((m) => ({ default: m.SessionPage })));
 const MailPage = lazy(() => import('./routes/Mail').then((m) => ({ default: m.MailPage })));
 const FormulaRunDetailPage = lazy(() =>
   import('./routes/FormulaRunDetail').then((m) => ({ default: m.FormulaRunDetailPage })),
@@ -156,6 +160,8 @@ function RoutedMain({
           />
           <Route path="/agents" element={<AgentsPage />} />
           <Route path="/agents/:slug" element={<AgentDetailPage />} />
+          <Route path="/terminal/:session" element={<TerminalPage />} />
+          <Route path="/session/:id" element={<SessionPage />} />
           <Route path="/beads" element={<BeadsPage />} />
           <Route path="/runs" element={<RunsPage />} />
           <Route path="/runs/:runId" element={<FormulaRunDetailPage />} />

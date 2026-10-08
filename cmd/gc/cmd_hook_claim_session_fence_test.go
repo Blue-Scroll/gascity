@@ -100,9 +100,13 @@ func installFenceWorkQueryProbe(t *testing.T) string {
 	return queryMarker
 }
 
-// setFenceClaimEnv points cmdHookWithOptions at the given session identity.
+// setFenceClaimEnv points cmdHookWithOptions at the given session identity. The
+// session has not acknowledged drain unless a test swaps
+// hookClaimSessionDrainAckedBySelf after calling this, so no case reads a real
+// runtime provider.
 func setFenceClaimEnv(t *testing.T, cityDir, sessionID, instanceToken string) {
 	t.Helper()
+	stubHookClaimDrainAck(t, false)
 	t.Setenv("GC_CITY", cityDir)
 	t.Setenv("GC_TEMPLATE", "worker")
 	t.Setenv("GC_ALIAS", "worker-1")
@@ -151,6 +155,53 @@ func TestHookCommandClaimStaleSessionDrainsBeforeWorkQuery(t *testing.T) {
 	}
 	if _, err := os.Stat(queryMarker); !os.IsNotExist(err) {
 		t.Fatalf("work query ran for stale session; stat error = %v", err)
+	}
+}
+
+// stubHookClaimDrainAck makes the claim fence see (or not see) an agent drain
+// ack on this runtime's session, restoring the real reader afterwards.
+func stubHookClaimDrainAck(t *testing.T, acked bool) {
+	t.Helper()
+	original := hookClaimSessionDrainAckedBySelf
+	t.Cleanup(func() { hookClaimSessionDrainAckedBySelf = original })
+	hookClaimSessionDrainAckedBySelf = func() bool { return acked }
+}
+
+// TestHookCommandClaimRefusesSessionThatAlreadyDrainAcked pins vn-sjk7olh. The
+// session bead still reads awake (the reconciler has not caught up), so only the
+// runtime's own drain ack can tell the fence this worker already said it was
+// done. On 2026-10-07 two polecats drain-acked, then claimed a review leg's first
+// step, and were killed holding it. The refusal must come before the work query,
+// and must be the same terminal stale_session drain a wrapper already knows how
+// to stop on.
+func TestHookCommandClaimRefusesSessionThatAlreadyDrainAcked(t *testing.T) {
+	clearGCEnv(t)
+	disableManagedDoltRecoveryForTest(t)
+	t.Setenv("GC_BEADS", "file")
+	cityDir := writeFenceTestCity(t)
+	sessionID := newFenceSessionBead(t, cityDir, session.StateAwake, "current-token")
+	queryMarker := installFenceWorkQueryProbe(t)
+	setFenceClaimEnv(t, cityDir, sessionID, "current-token")
+	stubHookClaimDrainAck(t, true)
+
+	var stdout, stderr bytes.Buffer
+	code := cmdHookWithOptions(nil, hookCommandOptions{Claim: true, JSON: true}, &stdout, &stderr)
+
+	if code != 1 {
+		t.Fatalf("code = %d, want 1; stdout=%q stderr=%s", code, stdout.String(), stderr.String())
+	}
+	var result hookClaimJSONResult
+	if err := json.Unmarshal(bytes.TrimSpace(stdout.Bytes()), &result); err != nil {
+		t.Fatalf("stdout is not a JSON drain result: %v\n%s", err, stdout.String())
+	}
+	if result.Action != "drain" || result.Reason != hookClaimReasonStaleSession {
+		t.Fatalf("result = %+v, want action=drain reason=stale_session", result)
+	}
+	if !strings.Contains(stderr.String(), "already acknowledged drain") {
+		t.Fatalf("stderr = %q, want the refusal to name the drain ack", stderr.String())
+	}
+	if _, err := os.Stat(queryMarker); !os.IsNotExist(err) {
+		t.Fatalf("work query ran for a session that already acknowledged drain; stat error = %v", err)
 	}
 }
 

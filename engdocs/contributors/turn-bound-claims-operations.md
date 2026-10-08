@@ -15,46 +15,45 @@ drain gives back any `in_progress` claim it is still holding (F-D).
 
 ## `GC_HOOK_CLAIM_WINDOW` — the one tuning knob
 
-Default **45s**. It bounds the time from `gc hook --claim` starting to a claim
-mutation being allowed to run. Past it the command exits 1, emits
-`execution.claim_window_expired`, and deliberately writes **no drain record** —
-a spent window is a dead invocation, not an idle store.
+It sets the **base** window: how long after `gc hook --claim` starts a claim
+mutation may still run. Past the window the command exits 1, emits
+`execution.claim_window_expired`, and deliberately writes **no drain record**.
+A spent window is a dead invocation, not an idle store.
 
-Raise it when honest claim latency approaches the window. The alarm that tells
-you to is `execution.claim_window_expired` volume: a steady stream of them with
-`parent_alive=true` means real claims are being refused (raise the window, or
-fix the store), while `parent_alive=false` means the claimer was orphaned by a
-dead provider tool call, which is the fence working as intended.
+The default base is `hookWorkQueryTimeout + hookClaimMutationTimeout`, which is
+**2m40s** today (150s + 10s). It is derived, not a literal, so it moves when
+either budget is retuned.
 
-Keep it **strictly below 90s** (`idleClaimNudgeGrace`, `cmd/gc/idle_nudge.go`).
-At or above that, the idle-claim backstop can re-nudge a seat whose claim is
-still running, and two live claim attempts for one seat is the state the window
-exists to prevent. 90s itself is not a legal value — the bound is exclusive.
+**A live parent stretches the window 4x** (`hookClaimLiveParentWindowFactor`),
+to 10m40s by default. "Live" means the process that started `gc hook --claim`
+is still its parent. One claim can run several work queries in a row (one per
+federated store, a re-read, and retries on a failed read), and each may take the
+full 150s. So under store load the reads alone can use up the base window while
+the turn is still waiting. Before the stretch, that refused every claim the
+command had just found (vn-buvmt78: refusals at 2m41s and 3m1s, from a turn
+with a 10 minute tool timeout). The stretch has a ceiling because a provider
+host can stop reading a slow command and stay alive (ga-fylee).
 
-### Deploy-lane override (interim)
+An orphaned claimer keeps the base window. It is detected by its parent pid
+changing, not by the parent being pid 1, so an orphan reparented to a subreaper
+inside a container is caught too.
 
-Cities whose observed claim latency runs 15–70s need more than the 45s default
-or the fence becomes fresh-claim starvation: honest claims are refused, seats
-exit 1, and the demand is re-served without ever being worked.
+Reading the alarm, `execution.claim_window_expired`:
 
-**75s** is the value to use. It clears the top of the observed latency band with
-headroom and still leaves 15s below the backstop grace, so neither end of the
-range races.
+- `parent_alive=false`: the claimer was orphaned by a dead provider tool call.
+  That is the fence working.
+- `parent_alive=true`: a live turn waited past even the stretched window. Either
+  the store is far too slow (fix the store), or the provider stopped reading the
+  command. A steady stream of these means real claims are being refused.
 
-```toml
-[[patches.agent]]
-name = "gc.run-operator"
-env = { GC_HOOK_CLAIM_WINDOW = "75s" }
-```
+Setting `GC_HOOK_CLAIM_WINDOW` below the default makes the fence stricter; the
+4x stretch scales with it. Do not lower it to "fix" a starved pool: that is the
+opposite of what a starved pool needs.
 
-Repeat the stanza for each role agent of the same class — the override is
-per-agent, and an unpatched sibling silently keeps the 45s default.
-
-This is **interim**. It exists because claim latency is currently dominated by
-read convergence, not by real work; it retires when the binding-first read lands
-(ga-4qdfn) and latency drops back under the default. Before removing it, check
-that `execution.claim_window_expired` with `parent_alive=true` is at zero for
-the class.
+The window can exceed `idleClaimNudgeGrace` (90s, `cmd/gc/idle_nudge.go`). A
+claim still reading when the backstop fires only earns the backstop's next
+idempotent re-nudge, never a double claim. The comment on
+`hookClaimWindowDefault` in `cmd/gc/cmd_hook_claim.go` has the reasoning.
 
 ## Failure shape: a leaked marker fences the whole fleet
 

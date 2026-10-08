@@ -615,7 +615,7 @@ func TestDemandSubPhaseTrace_SecondPoolComputeExcludesTheBuild(t *testing.T) {
 // realize_pools field each.
 func TestBuildDesiredStateRecordsDemandSubPhases(t *testing.T) {
 	// The non-tick path passes no trace; the recorder must be nil-safe.
-	recordDemandSubPhase(nil, "demand_snapshot.collect_open_session_beads", time.Now(), nil)
+	recordDemandSubPhase(nil, "demand_snapshot.collect_open_session_beads", startDemandSubPhase(nil), nil)
 
 	cityDir := t.TempDir()
 	cfg := &config.City{
