@@ -1212,6 +1212,15 @@ func unclaimWorkAssignedToRetiredSessionBead(
 // second implementation of "release this session's work" is a second chance to
 // disagree with the first.
 //
+// The one exception is the open siblings of a claim this pass gives back: the
+// open beads this session holds that share the released claim's root and
+// continuation group. Those were preassigned BECAUSE of that claim, and the claim
+// is going back to the pool, so they go with it. Left behind, they stay assigned
+// to a session that is stopping. The next claimer of the released step cannot
+// take them either, because preassignHookContinuationGroup skips any sibling that
+// already has an assignee. So the workflow stalls after its first step, and
+// nothing goes red (vn-sjk7olh).
+//
 // The leg set is sweepAssignedWorkLegs' — the same one the retired-session
 // sweep reads, which is the point: "demand and sweep read the same stores" holds
 // by construction, and a graph-resident claim is released here by the same leg
@@ -1258,6 +1267,7 @@ func releaseUnexecutedClaimsOnDrainAck(
 				fmt.Fprintf(stderr, "session beads: listing in-progress work held by draining session %s via %q: %v\n", sessionBead.ID, assignee, err) //nolint:errcheck
 				continue
 			}
+			releasedGroups := make(map[string]struct{})
 			for _, item := range work {
 				if session.IsSessionBeadOrRepairable(item) {
 					continue
@@ -1274,9 +1284,54 @@ func releaseUnexecutedClaimsOnDrainAck(
 				if err := wa.ReleaseWorkBead(item, ""); err != nil {
 					fmt.Fprintf(stderr, "session beads: releasing unexecuted claim %s held by draining session %s: %v\n", item.ID, sessionBead.ID, err) //nolint:errcheck
 				}
+				if group := continuationGroupKey(item); group != "" {
+					releasedGroups[group] = struct{}{}
+				}
+			}
+			if len(releasedGroups) == 0 {
+				continue
+			}
+			if time.Now().After(deadline) {
+				expired = true
+				fmt.Fprintf(stderr, "session beads: held-claim release for draining session %s ran out of its %s budget before its continuation siblings; they are left to the dead-assignee sweep\n", sessionBead.ID, budget) //nolint:errcheck
+				return
+			}
+			siblings, err := wa.OpenAssignedTo(assignee, "open", beads.TierBoth, true)
+			if err != nil {
+				fmt.Fprintf(stderr, "session beads: listing continuation siblings held by draining session %s via %q: %v\n", sessionBead.ID, assignee, err) //nolint:errcheck
+				continue
+			}
+			for _, item := range siblings {
+				if session.IsSessionBeadOrRepairable(item) {
+					continue
+				}
+				if _, ok := releasedGroups[continuationGroupKey(item)]; !ok {
+					continue
+				}
+				key := strconv.Itoa(storeIndex) + "\x00" + item.ID
+				if _, ok := seen[key]; ok {
+					continue
+				}
+				seen[key] = struct{}{}
+				if err := wa.ReleaseWorkBead(item, ""); err != nil {
+					fmt.Fprintf(stderr, "session beads: releasing continuation sibling %s held by draining session %s: %v\n", item.ID, sessionBead.ID, err) //nolint:errcheck
+				}
 			}
 		}
 	})
+}
+
+// continuationGroupKey names the continuation group a work bead belongs to:
+// its workflow root plus its gc.continuation_group, the same pair
+// preassignHookContinuationGroup lists siblings by. Empty when either is unset,
+// so a bead outside any group never matches another.
+func continuationGroupKey(item beads.Bead) string {
+	root := strings.TrimSpace(item.Metadata[beadmeta.RootBeadIDMetadataKey])
+	group := strings.TrimSpace(item.Metadata[beadmeta.ContinuationGroupMetadataKey])
+	if root == "" || group == "" {
+		return ""
+	}
+	return root + "\x00" + group
 }
 
 func reassignWorkAssignedToRetiredSessionBead(

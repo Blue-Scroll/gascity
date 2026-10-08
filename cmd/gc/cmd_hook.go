@@ -518,6 +518,17 @@ func fenceHookClaimSession(cityPath string, cfg *config.City, sessionID string, 
 	if sessionID == "" || instanceToken == "" {
 		return 0, false
 	}
+	// A session that already ran `gc runtime drain-ack` has said "I am done and I
+	// hold nothing", and the controller will stop it. Its bead still reads awake
+	// until the reconciler gets to it, which took 6 minutes under load on
+	// 2026-10-07, so the state check below cannot see the ack. A claim made in that
+	// gap is killed with the session: twice that day a polecat drain-acked, claimed
+	// a review leg's first step, and died holding it, and the leg's later steps
+	// stayed assigned to the dead session (vn-sjk7olh).
+	if hookClaimSessionDrainAckedBySelf() {
+		fmt.Fprintf(stderr, "gc hook --claim: refusing session %s: it already acknowledged drain (gc runtime drain-ack), so it must exit, not claim\n", sessionID) //nolint:errcheck
+		return writeHookClaimStaleSessionDrain(opts, stdout, stderr), true
+	}
 	switch verdict, reason := classifyHookClaimSession(cityPath, cfg, sessionID, instanceToken); verdict {
 	case hookClaimSessionStale:
 		fmt.Fprintf(stderr, "gc hook --claim: refusing stale session %s: %s\n", sessionID, reason) //nolint:errcheck
@@ -531,6 +542,30 @@ func fenceHookClaimSession(cityPath string, cfg *config.City, sessionID string, 
 	default:
 		return 0, false
 	}
+}
+
+// hookClaimSessionDrainAckedBySelf reports whether this runtime's own session
+// has acknowledged drain. It is a variable so tests can stand in for the
+// runtime provider. Tests that swap it MUST NOT call t.Parallel().
+var hookClaimSessionDrainAckedBySelf = readHookClaimSessionDrainAckedBySelf
+
+// readHookClaimSessionDrainAckedBySelf resolves this runtime's session name the
+// way `gc runtime drain-ack` does (currentSessionRuntimeTarget) and asks
+// sessionDrainAckedByAgent. Any failure to resolve or read fails open, like the
+// rest of the fence: a provider hiccup must not refuse a healthy worker.
+func readHookClaimSessionDrainAckedBySelf() bool {
+	name := strings.TrimSpace(os.Getenv("GC_TMUX_SESSION"))
+	if name == "" {
+		name = strings.TrimSpace(os.Getenv("GC_SESSION_NAME"))
+	}
+	if name == "" {
+		return false
+	}
+	sp, err := newSessionProvider()
+	if err != nil || sp == nil {
+		return false
+	}
+	return sessionDrainAckedByAgent(sp, name)
 }
 
 // classifyHookClaimSession loads the session bead named by sessionID and reports

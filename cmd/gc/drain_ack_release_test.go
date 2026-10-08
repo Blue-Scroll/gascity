@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gastownhall/gascity/internal/beadmeta"
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/beads/splittest"
 	"github.com/gastownhall/gascity/internal/config"
@@ -136,7 +137,9 @@ func TestDrainAckLeavesForeignClaimsAlone(t *testing.T) {
 // TestDrainAckLeavesPreassignedOpenSiblingsAlone is the continuation control.
 // Continuation preassignment writes an assignee onto OPEN siblings so they stay
 // with the live context; F-D releases only in_progress rows. Sweeping open rows
-// here would undo the preassignment the same claim just made.
+// here would undo the preassignment the same claim just made. (The exception,
+// siblings of a claim this pass releases, is pinned by
+// TestDrainAckReleasesTheReleasedClaimsContinuationSiblings.)
 func TestDrainAckLeavesPreassignedOpenSiblingsAlone(t *testing.T) {
 	work := splittest.NewWorkStore(t, "gc")
 	sibling := mustCreateDrainAckBead(t, work, beads.Bead{
@@ -149,6 +152,53 @@ func TestDrainAckLeavesPreassignedOpenSiblingsAlone(t *testing.T) {
 	status, assignee := drainAckBeadStatus(t, work, sibling.ID)
 	if status != "open" || assignee != "worker-1" {
 		t.Fatalf("preassigned open sibling %s became status=%q assignee=%q, want its preassignment kept", sibling.ID, status, assignee)
+	}
+}
+
+// TestDrainAckReleasesTheReleasedClaimsContinuationSiblings pins vn-sjk7olh.
+// A claim of a workflow's first step preassigns the open later steps of the same
+// root and continuation group to the same session. When drain-ack gives that
+// claim back, those siblings must go with it: left assigned to a stopping
+// session, no later claimer can take them (preassignment skips assigned rows),
+// and the workflow stalls after its first step. Open work outside that group,
+// and a sibling some other session holds, stay exactly as they were.
+func TestDrainAckReleasesTheReleasedClaimsContinuationSiblings(t *testing.T) {
+	work := splittest.NewWorkStore(t, "gc")
+	inGroup := func(root string) map[string]string {
+		return map[string]string{
+			beadmeta.RootBeadIDMetadataKey:        root,
+			beadmeta.ContinuationGroupMetadataKey: "pool-workflow",
+		}
+	}
+	claim := mustCreateDrainAckBead(t, work, beads.Bead{
+		Title: "load-assignment, claimed but never run", Type: "task", Metadata: inGroup("wf-1"),
+	}, "in_progress", "worker-1")
+	sibling := mustCreateDrainAckBead(t, work, beads.Bead{
+		Title: "write-report, preassigned with the claim", Type: "task", Metadata: inGroup("wf-1"),
+	}, "open", "worker-1")
+	otherWorkflow := mustCreateDrainAckBead(t, work, beads.Bead{
+		Title: "a step of a different workflow", Type: "task", Metadata: inGroup("wf-2"),
+	}, "open", "worker-1")
+	foreign := mustCreateDrainAckBead(t, work, beads.Bead{
+		Title: "same group, held by another session", Type: "task", Metadata: inGroup("wf-1"),
+	}, "open", "worker-2")
+
+	var stderr bytes.Buffer
+	releaseUnexecutedClaimsOnDrainAck("", nil, work, nil, drainAckSessionBead(), drainAckReleaseBudget, &stderr)
+
+	for _, tc := range []struct {
+		name, id, wantAssignee string
+	}{
+		{"released claim", claim.ID, ""},
+		{"its continuation sibling", sibling.ID, ""},
+		{"open step of another workflow", otherWorkflow.ID, "worker-1"},
+		{"sibling held by another session", foreign.ID, "worker-2"},
+	} {
+		status, assignee := drainAckBeadStatus(t, work, tc.id)
+		if status != "open" || assignee != tc.wantAssignee {
+			t.Errorf("%s %s: status=%q assignee=%q, want open and assignee %q; stderr=%s",
+				tc.name, tc.id, status, assignee, tc.wantAssignee, stderr.String())
+		}
 	}
 }
 
