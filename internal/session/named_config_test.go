@@ -1219,7 +1219,7 @@ func TestClosedNamedSessionBeadIndexMatchesPerIdentityLookup(t *testing.T) {
 
 	// idRepairable: the "repairable" shape from IsSessionBeadOrRepairable —
 	// Type == "" but LabelSession is present. Both the per-identity query
-	// (no type/label filter) and the index's Label-scoped leg must find it.
+	// (no type/label filter) and the index's identity-key read must find it.
 	create("closed", meta(idRepairable, map[string]string{"session_name": "rt-repairable"}), "", []string{LabelSession})
 
 	// idNonemptyBeatsFallback: older bead has no session_name, newer bead
@@ -1296,22 +1296,15 @@ func TestClosedNamedSessionBeadIndexMatchesPerIdentityLookup(t *testing.T) {
 	}
 }
 
-// TestClosedNamedSessionBeadIndexMissesBeadWithNeitherTypeNorLabel pins the
-// one documented, accepted divergence between the index and
-// FindClosedNamedSessionBeadForSessionName: a closed bead carrying
-// NamedSessionIdentityMetadata under neither Type == BeadType nor
-// LabelSession is found by the per-identity metadata-only query (it has no
-// type/label filter to trip over) but missed by the index, whose two
-// batched legs are scoped to exactly those two selectors. This is the
-// deliberate cost of ga-0t7qjl's two-query fix (see the doc comment on
-// BuildClosedNamedSessionBeadIndex) — it exists to catch either direction of
-// regression: an index that widens to match this shape (defeating the
-// indexed-query performance goal) or one that also starts rejecting the
-// repairable/legacy-Type shapes the equivalence test above requires.
-func TestClosedNamedSessionBeadIndexMissesBeadWithNeitherTypeNorLabel(t *testing.T) {
+// TestClosedNamedSessionBeadIndexFindsBeadWithNeitherTypeNorLabel pins that
+// the index sees what FindClosedNamedSessionBeadForSessionName sees: a closed
+// bead carrying NamedSessionIdentityMetadata under neither Type == BeadType nor
+// LabelSession. The two type/label legs the index once read missed it; the
+// identity-key read finds it (vn-d5jn83b).
+func TestClosedNamedSessionBeadIndexFindsBeadWithNeitherTypeNorLabel(t *testing.T) {
 	store := beads.NewMemStore()
 
-	const identity = "idx-gap-no-type-no-label"
+	const identity = "idx-no-type-no-label"
 	b, err := store.Create(beads.Bead{
 		Metadata: map[string]string{
 			NamedSessionMetadataKey:      "true",
@@ -1326,18 +1319,79 @@ func TestClosedNamedSessionBeadIndexMissesBeadWithNeitherTypeNorLabel(t *testing
 		t.Fatalf("Close(%s): %v", b.ID, err)
 	}
 
-	if _, ok, err := FindClosedNamedSessionBeadForSessionName(store, identity, ""); err != nil {
-		t.Fatalf("FindClosedNamedSessionBeadForSessionName(%q): %v", identity, err)
-	} else if !ok {
-		t.Fatalf("reference lookup ok = false, want true (identity=%q) — this fixture must be reachable by the per-identity query for the gap it pins to be meaningful", identity)
+	ref, ok, err := FindClosedNamedSessionBeadForSessionName(store, identity, "")
+	if err != nil || !ok {
+		t.Fatalf("FindClosedNamedSessionBeadForSessionName(%q) = ok %v, err %v; want a match", identity, ok, err)
 	}
-
 	idx, err := BuildClosedNamedSessionBeadIndex(store)
 	if err != nil {
 		t.Fatalf("BuildClosedNamedSessionBeadIndex: %v", err)
 	}
-	if _, ok := idx.Find(identity); ok {
-		t.Fatalf("index lookup ok = true, want false (identity=%q) — a bead with neither Type nor Label should stay outside both batched legs", identity)
+	got, ok := idx.Find(identity)
+	if !ok || got.ID != ref.ID {
+		t.Fatalf("index Find(%q) = %q ok %v, want %q", identity, got.ID, ok, ref.ID)
+	}
+}
+
+// listSpyStore records every List query and how many rows it returned.
+type listSpyStore struct {
+	beads.Store
+	queries []beads.ListQuery
+	rows    int
+}
+
+func (s *listSpyStore) List(q beads.ListQuery) ([]beads.Bead, error) {
+	out, err := s.Store.List(q)
+	s.queries = append(s.queries, q)
+	s.rows += len(out)
+	return out, err
+}
+
+// TestClosedNamedSessionBeadIndexReadsOnlyIdentityRows pins the read's size.
+// Closed pool sessions carry gc:session and Type=session but no configured
+// named identity, and they pile up forever: hq held 12,497 of them against 10
+// identity rows, and the old type+label legs read every one twice per demand
+// pass (25 to 46 s each under pool load, vn-d5jn83b). The index must make one
+// identity-keyed read whose rows do not grow with that history.
+func TestClosedNamedSessionBeadIndexReadsOnlyIdentityRows(t *testing.T) {
+	mem := beads.NewMemStore()
+	for i := 0; i < 50; i++ {
+		b, err := mem.Create(beads.Bead{Type: BeadType, Labels: []string{LabelSession}, Metadata: map[string]string{"session_name": "pool-worker"}})
+		if err != nil {
+			t.Fatalf("Create pool session: %v", err)
+		}
+		if err := mem.Close(b.ID); err != nil {
+			t.Fatalf("Close(%s): %v", b.ID, err)
+		}
+	}
+	named, err := mem.Create(beads.Bead{Type: BeadType, Labels: []string{LabelSession}, Metadata: map[string]string{
+		NamedSessionMetadataKey:      "true",
+		NamedSessionIdentityMetadata: "rig/refinery",
+		"session_name":               "rig--refinery",
+	}})
+	if err != nil {
+		t.Fatalf("Create named session: %v", err)
+	}
+	if err := mem.Close(named.ID); err != nil {
+		t.Fatalf("Close(%s): %v", named.ID, err)
+	}
+
+	spy := &listSpyStore{Store: mem}
+	idx, err := BuildClosedNamedSessionBeadIndex(spy)
+	if err != nil {
+		t.Fatalf("BuildClosedNamedSessionBeadIndex: %v", err)
+	}
+	if got, ok := idx.Find("rig/refinery"); !ok || got.ID != named.ID {
+		t.Fatalf("Find(rig/refinery) = %q ok %v, want %q", got.ID, ok, named.ID)
+	}
+	if len(spy.queries) != 1 {
+		t.Fatalf("store.List calls = %d, want 1: %+v", len(spy.queries), spy.queries)
+	}
+	if q := spy.queries[0]; q.HasMetadataKey != NamedSessionIdentityMetadata || q.Type != "" || q.Label != "" || !q.IncludeClosed {
+		t.Fatalf("index query = %+v, want HasMetadataKey=%q, IncludeClosed, no type or label", q, NamedSessionIdentityMetadata)
+	}
+	if spy.rows != 1 {
+		t.Fatalf("index read %d rows, want 1 (the 50 closed pool sessions carry no identity)", spy.rows)
 	}
 }
 

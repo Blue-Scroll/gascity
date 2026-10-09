@@ -411,8 +411,8 @@ func (longErrorStore) List(beads.ListQuery) ([]beads.Bead, error) {
 	return nil, errors.New("list down: " + strings.Repeat("x", 4096))
 }
 
-// closedIndexStore answers the closed named-session index's by-type read with
-// rows and a partial error, or with a hard error.
+// closedIndexStore answers the closed named-session index's identity-key read
+// with rows and a partial error, or with a hard error.
 type closedIndexStore struct {
 	*beads.MemStore
 	hard bool
@@ -420,7 +420,7 @@ type closedIndexStore struct {
 
 func (s *closedIndexStore) List(query beads.ListQuery) ([]beads.Bead, error) {
 	rows, err := s.MemStore.List(query)
-	if !query.IncludeClosed || query.Type != session.BeadType {
+	if !query.IncludeClosed || query.HasMetadataKey != session.NamedSessionIdentityMetadata {
 		return rows, err
 	}
 	if s.hard {

@@ -1047,68 +1047,32 @@ func closedNamedSessionReopenEligible(b beads.Bead) bool {
 // ClosedNamedSessionBeadIndex is a batched, in-memory index of the closed
 // beads FindClosedNamedSessionBeadForSessionName would find, keyed by
 // configured named session identity. BuildClosedNamedSessionBeadIndex issues
-// two bounded store reads up front; Find then answers each identity in O(1)
-// instead of repeating a per-identity store.List — the fix for ga-0t7qjl,
-// where readyAssignedWorkAssignees called the per-identity lookup once per
-// configured named session (109 serial bd calls, +155s, on this city's
-// named-session count).
+// one store read up front; Find then answers each identity in O(1) instead of
+// repeating a per-identity store.List (ga-0t7qjl: 109 serial bd calls, +155s).
 //
-// The batched read is exactly ListAllSessionBeads's own shape — two indexed
-// store.List calls, {Type: BeadType, IncludeClosed: true, Sort:
-// SortCreatedDesc} and {Label: LabelSession, IncludeClosed: true, Sort:
-// SortCreatedDesc} — unioned by bead ID and re-sorted globally with
-// beads.SortBeads. Reusing that shape (rather than a single unfiltered scan)
-// is deliberate and load-bearing for the fix's own performance goal: both
-// legs are indexed, bounded reads (measured on this city at ~0.5s, 53 rows,
-// 77KB total — see ga-0t7qjl's exit contract), whereas a single
-// AllowScan-unfiltered store.List would return every bead of every type in
-// the whole store, not just session-shaped ones, and on a production store
-// with thousands of task/mail/molecule beads that scan could cost as much as
-// — or more than — the 109 serial per-identity calls this fix replaces. The
-// first cut of this fix used exactly that single unfiltered AllowScan query;
-// it passed every test here but would have regressed the very performance
-// property ga-0t7qjl exists to fix, so it was replaced with the two-query
-// union below before being considered done.
+// The read is {HasMetadataKey: NamedSessionIdentityMetadata, IncludeClosed,
+// SortCreatedDesc}: every bead, open or closed, that records a configured
+// named identity. Find skips a bead with no identity, so no other row can
+// change its answer, and the read does not grow with closed history.
+// Measured on a copy of hq 2026-10-09 (vn-d5jn83b): 12,497 gc:session beads,
+// 10 carrying the key. The two type/label legs this replaced read all 12,497
+// rows twice, about 39 s and 115 MB a pass under pool load; this read takes 3
+// to 5 s and returns 10 rows. Do not widen it back to a type or label read.
 //
-// Unlike ListAllSessionBeads, the union here is deliberately NOT filtered
-// through IsSessionBeadOrRepairable afterward. That filter accepts only
-// Type == BeadType or (Type == "" AND carrying LabelSession); it rejects a
-// bead whose Type is some other non-empty value even when the bead carries
-// LabelSession — exactly the shape
-// TestNamedSessionDemand_OpenReadyWorkUnderRuntimeName_SurvivesPhantomClose's
-// phantom fixture has (Type: "gc:session", Labels: ["gc:session"]) and
-// exactly the shape ga-uvwxp8 needs recovered. FindClosedNamedSessionBeadForSessionName
-// has no type/label filter at all — only a per-identity Metadata match — so
-// it finds that bead; an IsSessionBeadOrRepairable-filtered union would not,
-// which is why ListAllSessionBeads itself was tried here first and rejected:
-// its filter is narrower than the reference function it would have been
-// batching. The plain Type-OR-Label union (no further filter) still finds
-// it, via the label leg, regardless of Type.
-//
-// One deliberate, documented gap remains versus the true per-identity
-// function: a closed bead carrying NamedSessionIdentityMetadata under
-// NEITHER Type == BeadType NOR LabelSession is invisible to this index even
-// though the per-identity Metadata-only query would find it. This is
-// accepted rather than fixed with a wider (unbounded) query because every
-// real closed session bead — canonical or crash/migration-damaged — carries
-// LabelSession; that invariant is exactly what IsSessionBeadOrRepairable's
-// own "Type == "" AND carrying LabelSession" branch already assumes
-// elsewhere in this package, and ga-0t7qjl's own fix spec prescribes exactly
-// two queries (Type, Label) for the same reason. It is not a case the
-// exit contract's table test asks for.
-// TestClosedNamedSessionBeadIndexMatchesPerIdentityLookup is the equivalence
-// oracle pinning the two lookups together across eligible/ineligible,
-// with/without session_name, and the repairable/mismatched-Type scenarios
-// the contract does specify.
+// Because it has no type or label filter, the index sees exactly the rows
+// FindClosedNamedSessionBeadForSessionName sees (that function filters on the
+// identity metadata alone), including a damaged bead whose Type is some other
+// value or that lost LabelSession.
+// TestClosedNamedSessionBeadIndexMatchesPerIdentityLookup pins the two
+// lookups together.
 //
 // Find replicates FindClosedNamedSessionBeadForSessionName(store, identity,
 // "")'s selection rule exactly: among identity's closedNamedSessionReopenEligible
 // closed beads, the newest one with a non-empty session_name wins; if none
 // has a non-empty session_name, the newest eligible bead wins as a fallback.
-// The merged rows are sorted newest-first (SortCreatedDesc) before the scan,
-// so a single forward pass recording the first (newest) winner and first
-// (newest) fallback per identity reproduces that rule without a per-identity
-// rescan.
+// The rows are sorted newest-first (SortCreatedDesc) before the scan, so a
+// single forward pass recording the first (newest) winner and first (newest)
+// fallback per identity reproduces that rule without a per-identity rescan.
 //
 // Index keys are read via NamedSessionIdentity (trimmed, not normalized) to
 // match the raw metadata value FindClosedNamedSessionBeadForSessionName's
@@ -1121,55 +1085,32 @@ type ClosedNamedSessionBeadIndex struct {
 	byIdentity map[string]beads.Bead
 }
 
-// BuildClosedNamedSessionBeadIndex performs the two batched store reads
-// described on ClosedNamedSessionBeadIndex and builds the identity -> bead
-// index from their union.
+// BuildClosedNamedSessionBeadIndex performs the one store read described on
+// ClosedNamedSessionBeadIndex and builds the identity -> bead index from it.
 //
-// Error contract mirrors ListAllSessionBeads: a hard failure on either leg
-// short-circuits and returns a zero-value index (Find then reports no match
+// A hard read failure returns a zero-value index (Find then reports no match
 // for every identity, the same fail-open result the discarded error at
-// existing per-identity call sites — e.g. cmd/gc's findClosedNamedSessionBead
-// wrapper — already produces) along with the wrapped error naming which leg
-// failed. A PartialResultError on either leg still folds that leg's partial
-// rows into the union and returns an index built from them, paired with the
-// first such error encountered, so a caller that checks it can surface a
-// degraded read instead of silently under-matching — a strictly more
-// graceful fallback than the per-identity function's own all-or-nothing
-// error handling, which the batched caller doesn't need to match since it
-// has many identities' worth of rows to salvage from a single partial read.
+// existing per-identity call sites, e.g. cmd/gc's findClosedNamedSessionBead
+// wrapper, already produces) along with the wrapped error. A
+// PartialResultError still builds the index from the rows it did return and
+// returns that error with it, so a caller that checks it can surface a
+// degraded read instead of silently under-matching.
 func BuildClosedNamedSessionBeadIndex(store beads.Store) (ClosedNamedSessionBeadIndex, error) {
 	if store == nil {
 		return ClosedNamedSessionBeadIndex{}, nil
 	}
 
-	byTypeQuery := beads.ListQuery{Type: BeadType, IncludeClosed: true, Sort: beads.SortCreatedDesc}
-	byType, typeErr := store.List(byTypeQuery)
-	if typeErr != nil && !beads.IsPartialResult(typeErr) {
-		return ClosedNamedSessionBeadIndex{}, fmt.Errorf("listing closed named session beads by type: %w", typeErr)
+	candidates, err := store.List(beads.ListQuery{
+		HasMetadataKey: NamedSessionIdentityMetadata,
+		IncludeClosed:  true,
+		Sort:           beads.SortCreatedDesc,
+	})
+	if err != nil && !beads.IsPartialResult(err) {
+		return ClosedNamedSessionBeadIndex{}, fmt.Errorf("listing closed named session beads: %w", err)
 	}
-
-	byLabelQuery := beads.ListQuery{Label: LabelSession, IncludeClosed: true, Sort: beads.SortCreatedDesc}
-	byLabel, labelErr := store.List(byLabelQuery)
-	if labelErr != nil && !beads.IsPartialResult(labelErr) {
-		return ClosedNamedSessionBeadIndex{}, fmt.Errorf("listing closed named session beads by label: %w", labelErr)
-	}
-
-	seen := make(map[string]struct{}, len(byType)+len(byLabel))
-	candidates := make([]beads.Bead, 0, len(byType)+len(byLabel))
-	for _, group := range [][]beads.Bead{byType, byLabel} {
-		for _, b := range group {
-			if _, dup := seen[b.ID]; dup {
-				continue
-			}
-			seen[b.ID] = struct{}{}
-			candidates = append(candidates, b)
-		}
-	}
-
-	// Each leg honored SortCreatedDesc within itself, but the union
-	// concatenates them — sort globally so the newest-first scan below sees
-	// a correct total order across both legs, mirroring ListAllSessionBeads's
-	// own re-sort for the identical reason.
+	// Every store honors SortCreatedDesc, but a partial or superset read is
+	// cut and ordered Go-side; sort once more so the newest-first scan below
+	// never depends on a backend's tie-break.
 	beads.SortBeads(candidates, beads.SortCreatedDesc)
 
 	winners := make(map[string]beads.Bead)
@@ -1199,16 +1140,6 @@ func BuildClosedNamedSessionBeadIndex(store beads.Store) (ClosedNamedSessionBead
 		if _, ok := winners[identity]; !ok {
 			winners[identity] = b
 		}
-	}
-
-	// Surface the first partial-result error encountered, same precedence as
-	// ListAllSessionBeads: either leg being partial means the merged set may
-	// be missing rows.
-	var err error
-	if typeErr != nil {
-		err = typeErr
-	} else if labelErr != nil {
-		err = labelErr
 	}
 	return ClosedNamedSessionBeadIndex{byIdentity: winners}, err
 }

@@ -2879,6 +2879,9 @@ func (s *BdStore) listViaBDList(query ListQuery) ([]Bead, error) {
 	if serverQuery.ParentID != "" {
 		args = append(args, "--parent", serverQuery.ParentID)
 	}
+	if serverQuery.HasMetadataKey != "" {
+		args = append(args, "--has-metadata-key", serverQuery.HasMetadataKey)
+	}
 	if len(serverQuery.Metadata) > 0 {
 		keys := make([]string, 0, len(serverQuery.Metadata))
 		for k := range serverQuery.Metadata {
@@ -2934,7 +2937,7 @@ func bdListRequiresClientLimit(query, serverQuery ListQuery, clientFilteredAssig
 	if serverQuery.Sort == SortCreatedAsc || clientFilteredAssignees {
 		return true
 	}
-	if len(serverQuery.Metadata) > 0 || !serverQuery.CreatedBefore.IsZero() || !serverQuery.UpdatedBefore.IsZero() {
+	if len(serverQuery.Metadata) > 0 || serverQuery.HasMetadataKey != "" || !serverQuery.CreatedBefore.IsZero() || !serverQuery.UpdatedBefore.IsZero() {
 		return true
 	}
 	// bd list exposes no compound (created_at, id) seek flag; the boundary is
@@ -3103,6 +3106,7 @@ func canApplyWispsServerLimit(query ListQuery) bool {
 		query.CreatedBefore.IsZero() &&
 		query.UpdatedBefore.IsZero() &&
 		len(query.Metadata) == 0 &&
+		query.HasMetadataKey == "" &&
 		query.SeekAfter == nil
 }
 

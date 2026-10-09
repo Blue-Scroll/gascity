@@ -117,9 +117,19 @@ type ListQuery struct {
 	// into its backend returns a superset, which ApplyListQuery/Matches then cut
 	// exactly — so the RESULT is always exact and only the pushdown is
 	// best-effort. It counts as a filter, so an IDs query needs no AllowScan.
-	IDs           []string
-	Metadata      map[string]string
-	CreatedBefore time.Time
+	IDs      []string
+	Metadata map[string]string
+	// HasMetadataKey matches beads whose metadata carries this key, whatever
+	// its value. Use it to read the few rows that carry a marker instead of
+	// every row of a type: hq holds 12,497 gc:session beads and 10 of them
+	// carry configured_named_identity, so the closed named-session index read
+	// 57.8 MB per pass to keep 10 rows (vn-d5jn83b).
+	//
+	// Same backend contract as IDs: a store that cannot push it down returns
+	// a superset, which ApplyListQuery/Matches then cut exactly. It counts as
+	// a filter, so a HasMetadataKey query needs no AllowScan.
+	HasMetadataKey string
+	CreatedBefore  time.Time
 	// UpdatedBefore matches beads whose UpdatedAt is before this timestamp.
 	// Legacy beads with zero UpdatedAt fall back to CreatedAt. Purge callers
 	// using CachingStore must also set Live: true to avoid stale cached timestamps.
@@ -222,6 +232,7 @@ func (q ListQuery) HasFilter() bool {
 		q.ParentID != "" ||
 		len(q.IDs) > 0 ||
 		len(q.Metadata) > 0 ||
+		q.HasMetadataKey != "" ||
 		!q.CreatedBefore.IsZero() ||
 		!q.UpdatedBefore.IsZero() ||
 		q.SeekAfter != nil
@@ -296,6 +307,11 @@ func (q ListQuery) Matches(b Bead) bool {
 	}
 	if len(q.Metadata) > 0 && !matchesMetadata(b, q.Metadata) {
 		return false
+	}
+	if q.HasMetadataKey != "" {
+		if _, ok := b.Metadata[q.HasMetadataKey]; !ok {
+			return false
+		}
 	}
 	if !q.CreatedBefore.IsZero() && !b.CreatedAt.Before(q.CreatedBefore) {
 		return false

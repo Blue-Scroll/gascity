@@ -962,6 +962,11 @@ func (s *DoltliteReadStore) queryIssuesOrderedInTables(query ListQuery, sets []d
 		if !query.CreatedBefore.IsZero() || !query.UpdatedBefore.IsZero() {
 			tableLimit = 0
 		}
+		// HasMetadataKey is cut Go-side below, so a SQL LIMIT taken first
+		// could fill the page with rows that lack the key.
+		if query.HasMetadataKey != "" {
+			tableLimit = 0
+		}
 		rows, err := s.queryIssueTable(query, tables, extraWhere, extraArgs, tableLimit, orderBy)
 		if err != nil {
 			return nil, err
@@ -976,6 +981,15 @@ func (s *DoltliteReadStore) queryIssuesOrderedInTables(query ListQuery, sets []d
 	}
 	if len(query.Metadata) > 0 {
 		merged = filterDoltliteMetadata(merged, query.Metadata)
+	}
+	if query.HasMetadataKey != "" {
+		kept := merged[:0]
+		for _, b := range merged {
+			if _, ok := b.Metadata[query.HasMetadataKey]; ok {
+				kept = append(kept, b)
+			}
+		}
+		merged = kept
 	}
 	merged = filterDoltliteBeforeTimes(merged, query)
 	if orderBy == "" {
@@ -1002,6 +1016,7 @@ func doltliteCanSelectBoundedTopN(query ListQuery, sets []doltliteTableSet, extr
 		extraWhere == "" &&
 		query.ParentID == "" &&
 		len(query.Metadata) == 0 &&
+		query.HasMetadataKey == "" &&
 		query.CreatedBefore.IsZero() &&
 		query.UpdatedBefore.IsZero() &&
 		query.SeekAfter == nil

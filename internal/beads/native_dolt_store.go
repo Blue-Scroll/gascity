@@ -3202,6 +3202,7 @@ func nativeIssueFilterFromListQuery(query ListQuery) beadslib.IssueFilter {
 		SortBy:              sortBy,
 		SortDesc:            sortDesc,
 		MetadataFields:      query.Metadata,
+		HasMetadataKey:      query.HasMetadataKey,
 		CreatedBefore:       zeroTimePtr(query.CreatedBefore),
 		IncludeDependencies: true,
 	}

@@ -1417,7 +1417,7 @@ func sqliteListSQL(q ListQuery, projection string) (string, []any) {
 	// the index. It is a value no-op on these TEXT columns compared to TEXT
 	// values. parent_id and id lists stay indexable: they are selective too.
 	residual := func(column string) string {
-		if len(q.Metadata) > 0 {
+		if len(q.Metadata) > 0 || q.HasMetadataKey != "" {
 			return "+" + column
 		}
 		return column
@@ -1486,6 +1486,12 @@ func sqliteListSQL(q ListQuery, projection string) (string, []any) {
 		// cost as the store grew.
 		where = append(where, "b.id IN (SELECT m.bead_id FROM metadata m WHERE m.meta_key=? AND m.meta_value=?)")
 		args = append(args, k, v)
+	}
+	if q.HasMetadataKey != "" {
+		// Same shape as the equality above, keyed on the leading column of
+		// idx_metadata_key_value, so it is O(rows carrying the key).
+		where = append(where, "b.id IN (SELECT m.bead_id FROM metadata m WHERE m.meta_key=?)")
+		args = append(args, q.HasMetadataKey)
 	}
 	sqlText := "SELECT " + projection + " FROM beads b"
 	if len(where) > 0 {

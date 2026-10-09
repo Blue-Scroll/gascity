@@ -379,8 +379,9 @@ func (s *Store) List(query beads.ListQuery) ([]beads.Bead, error) {
 		}
 		// SeekAfter (like CreatedBefore) is applied Go-side after the script
 		// returns, so a script-side limit would cut rows before the boundary
-		// filter runs and silently skip page rows.
-		if query.Limit > 0 && query.CreatedBefore.IsZero() && query.SeekAfter == nil {
+		// filter runs and silently skip page rows. HasMetadataKey is Go-side
+		// too: the exec protocol has no flag for it.
+		if query.Limit > 0 && query.CreatedBefore.IsZero() && query.SeekAfter == nil && query.HasMetadataKey == "" {
 			args = append(args, "--limit="+strconv.Itoa(query.Limit))
 		}
 		out, err = s.run(nil, args...)
