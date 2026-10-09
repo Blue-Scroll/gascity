@@ -464,9 +464,14 @@ func isStoreScopeSentinel(ref string) bool {
 	return !strings.ContainsAny(ref[:i], `/\`)
 }
 
-// ListWorkflowBeads returns the root and all descendant beads tagged with
-// gc.root_bead_id=rootID (closed included). Used by CloseWorkflowSubtree
-// and force-replacement snapshot/restore.
+// ListWorkflowBeads returns the root (whatever its status) and the OPEN
+// descendant beads tagged with gc.root_bead_id=rootID. Closed members are left
+// out on purpose: both callers, orderedOpenWorkflowSubtree (CloseWorkflowSubtree,
+// run by every drain and sling) and SnapshotOpenWorkflowBeads, only act on open
+// members. A metadata lookup with no status filter cannot use the status index
+// and turns into a full JSON scan of the issues table (10 to 46 s on a busy
+// rig, vn-m8tb7iz), so do not add IncludeClosed back here. A caller that truly
+// needs closed members reads beads.DirectMembers instead.
 func ListWorkflowBeads(store beads.Store, rootID string) ([]beads.Bead, error) {
 	rootID = strings.TrimSpace(rootID)
 	if store == nil || rootID == "" {
@@ -478,7 +483,6 @@ func ListWorkflowBeads(store beads.Store, rootID string) ([]beads.Bead, error) {
 		return nil, err
 	}
 	descendants, err := reader.List(beads.ListQuery{
-		IncludeClosed: true,
 		Metadata: map[string]string{
 			beadmeta.RootBeadIDMetadataKey: rootID,
 		},
@@ -636,6 +640,33 @@ func orderedOpenWorkflowSubtree(store beads.Store, rootID string, exclude func(b
 	for _, bead := range matched {
 		byID[bead.ID] = bead
 	}
+	// ListWorkflowBeads returns open members only, so a closed member in the
+	// middle of a parent chain is missing from byID. Without it an open
+	// grandchild under a closed child reads as depth 0 and can sort after the
+	// root, which a strict store refuses. Fetch such a parent by id (a primary
+	// key read, not the JSON scan) when it belongs to this workflow.
+	reader := beads.HandlesFor(store).Live
+	var lookupErr error
+	parentOf := func(id string) (beads.Bead, bool) {
+		if bead, ok := byID[id]; ok {
+			return bead, true
+		}
+		if lookupErr != nil {
+			return beads.Bead{}, false
+		}
+		bead, err := reader.Get(id)
+		if err != nil {
+			if !errors.Is(err, beads.ErrNotFound) {
+				lookupErr = fmt.Errorf("loading workflow parent %s of %s: %w", id, rootID, err)
+			}
+			return beads.Bead{}, false
+		}
+		if strings.TrimSpace(bead.Metadata[beadmeta.RootBeadIDMetadataKey]) != rootID {
+			return beads.Bead{}, false
+		}
+		byID[id] = bead
+		return bead, true
+	}
 	depthMemo := make(map[string]int, len(matched))
 	const visitingDepth = -1
 	var depth func(string) int
@@ -655,7 +686,7 @@ func orderedOpenWorkflowSubtree(store beads.Store, rootID string, exclude func(b
 			depthMemo[id] = 0
 			return 0
 		}
-		parent, ok := byID[parentID]
+		parent, ok := parentOf(parentID)
 		if !ok || parent.ID == "" {
 			depthMemo[id] = 0
 			return 0
@@ -664,6 +695,12 @@ func orderedOpenWorkflowSubtree(store beads.Store, rootID string, exclude func(b
 		d := depth(parentID) + 1
 		depthMemo[id] = d
 		return d
+	}
+	for _, bead := range matched {
+		depth(bead.ID)
+	}
+	if lookupErr != nil {
+		return nil, lookupErr
 	}
 	slices.SortFunc(matched, func(a, b beads.Bead) int {
 		if da, db := depth(a.ID), depth(b.ID); da != db {
@@ -702,8 +739,10 @@ func CloseSpecSidecarsForRoot(store beads.Store, rootID, reason string) (int, er
 		reason = WorkflowSpecSidecarClosedReason
 	}
 
+	// Open members only: a gc.root_bead_id lookup with no status filter is a
+	// full JSON scan of the issues table, and closed sidecars are skipped below
+	// anyway (vn-m8tb7iz).
 	matched, err := beads.HandlesFor(store).Live.List(beads.ListQuery{
-		IncludeClosed: true,
 		Metadata: map[string]string{
 			beadmeta.RootBeadIDMetadataKey: rootID,
 		},
