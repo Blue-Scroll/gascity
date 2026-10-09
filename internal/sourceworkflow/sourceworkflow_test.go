@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -1197,5 +1199,175 @@ func TestGraphStoreRefIsAStoreSentinelNotAScopeKind(t *testing.T) {
 	}
 	if NormalizeSourceStoreRef(ref) == NormalizeSourceStoreRef("city:bright-lights") {
 		t.Error("the graph leg's ref compares equal to the city store's; the two legs would be conflated")
+	}
+}
+
+// rootQueryRecordingStore records every List query that filters on
+// gc.root_bead_id, so a test can prove which ones ask for closed rows.
+type rootQueryRecordingStore struct {
+	*beads.MemStore
+	rootQueries []beads.ListQuery
+}
+
+func (s *rootQueryRecordingStore) List(query beads.ListQuery) ([]beads.Bead, error) {
+	if _, ok := query.Metadata["gc.root_bead_id"]; ok {
+		s.rootQueries = append(s.rootQueries, query)
+	}
+	return s.MemStore.List(query)
+}
+
+func (s *rootQueryRecordingStore) assertNoClosedRootScan(t *testing.T, caller string) {
+	t.Helper()
+	if len(s.rootQueries) == 0 {
+		t.Fatalf("%s issued no gc.root_bead_id query", caller)
+	}
+	for _, q := range s.rootQueries {
+		if q.IncludeClosed {
+			t.Fatalf("%s listed gc.root_bead_id members with IncludeClosed: true; "+
+				"with no status filter that is a full JSON scan (vn-m8tb7iz): %#v", caller, q)
+		}
+	}
+}
+
+// TestListWorkflowBeadsListsOpenMembersOnly pins vn-m8tb7iz: both callers drop
+// closed members, so the gc.root_bead_id lookup must carry a status filter.
+func TestListWorkflowBeadsListsOpenMembersOnly(t *testing.T) {
+	store := &rootQueryRecordingStore{MemStore: beads.NewMemStore()}
+	root, err := store.Create(beads.Bead{Title: "root", Type: "task"})
+	if err != nil {
+		t.Fatalf("Create(root): %v", err)
+	}
+	open, err := store.Create(beads.Bead{
+		Title:    "open step",
+		Type:     "task",
+		Metadata: map[string]string{"gc.root_bead_id": root.ID},
+	})
+	if err != nil {
+		t.Fatalf("Create(open): %v", err)
+	}
+	done, err := store.Create(beads.Bead{
+		Title:    "closed step",
+		Type:     "task",
+		Metadata: map[string]string{"gc.root_bead_id": root.ID},
+	})
+	if err != nil {
+		t.Fatalf("Create(done): %v", err)
+	}
+	if _, err := store.MemStore.CloseAll([]string{done.ID}, nil); err != nil {
+		t.Fatalf("CloseAll(done): %v", err)
+	}
+
+	matched, err := ListWorkflowBeads(store, root.ID)
+	if err != nil {
+		t.Fatalf("ListWorkflowBeads: %v", err)
+	}
+	store.assertNoClosedRootScan(t, "ListWorkflowBeads")
+	got := workflowIDsOf(matched)
+	want := []string{root.ID, open.ID}
+	slices.Sort(want)
+	if !slices.Equal(got, want) {
+		t.Fatalf("ListWorkflowBeads = %v, want root plus the open step %v", got, want)
+	}
+}
+
+func TestCloseSpecSidecarsForRootListsOpenMembersOnly(t *testing.T) {
+	store := &rootQueryRecordingStore{MemStore: beads.NewMemStore()}
+	root, err := store.Create(beads.Bead{Title: "root", Type: "task"})
+	if err != nil {
+		t.Fatalf("Create(root): %v", err)
+	}
+	if _, err := store.Create(beads.Bead{
+		Title:    "Step spec for review",
+		Type:     "spec",
+		Metadata: map[string]string{"gc.kind": "spec", "gc.root_bead_id": root.ID},
+	}); err != nil {
+		t.Fatalf("Create(spec): %v", err)
+	}
+
+	closed, err := CloseSpecSidecarsForRoot(store, root.ID, "")
+	if err != nil {
+		t.Fatalf("CloseSpecSidecarsForRoot: %v", err)
+	}
+	if closed != 1 {
+		t.Fatalf("CloseSpecSidecarsForRoot closed %d beads, want 1", closed)
+	}
+	store.assertNoClosedRootScan(t, "CloseSpecSidecarsForRoot")
+}
+
+// ancestorLastCloseStore refuses a batch that closes any ancestor before one
+// of its descendants, walking ParentID through beads that are not in the batch
+// (an already-closed middle parent included). parentLastCloseStore only sees a
+// direct parent, so it cannot catch the closed-middle case.
+type ancestorLastCloseStore struct {
+	*beads.MemStore
+}
+
+func (s *ancestorLastCloseStore) CloseAll(ids []string, metadata map[string]string) (int, error) {
+	positions := make(map[string]int, len(ids))
+	for i, id := range ids {
+		positions[id] = i
+	}
+	for i, id := range ids {
+		seen := map[string]bool{id: true}
+		bead, err := s.Get(id)
+		if err != nil {
+			return 0, err
+		}
+		for parentID := bead.ParentID; parentID != "" && !seen[parentID]; {
+			seen[parentID] = true
+			if pos, ok := positions[parentID]; ok && pos < i {
+				return 0, fmt.Errorf("ancestor %s closed before descendant %s", parentID, id)
+			}
+			parent, err := s.Get(parentID)
+			if err != nil {
+				break
+			}
+			parentID = parent.ParentID
+		}
+	}
+	return s.MemStore.CloseAll(ids, metadata)
+}
+
+// TestCloseWorkflowSubtreeClosesOpenGrandchildUnderClosedChildBeforeRoot pins
+// the depth walk once closed members stop coming back from the list
+// (vn-m8tb7iz): an open grandchild whose parent already closed must still
+// close before the root.
+func TestCloseWorkflowSubtreeClosesOpenGrandchildUnderClosedChildBeforeRoot(t *testing.T) {
+	store := &ancestorLastCloseStore{MemStore: beads.NewMemStore()}
+	root, err := store.Create(beads.Bead{Title: "root", Type: "task"})
+	if err != nil {
+		t.Fatalf("Create(root): %v", err)
+	}
+	child, err := store.Create(beads.Bead{
+		Title:    "child",
+		Type:     "task",
+		ParentID: root.ID,
+		Metadata: map[string]string{"gc.root_bead_id": root.ID},
+	})
+	if err != nil {
+		t.Fatalf("Create(child): %v", err)
+	}
+	grandchild, err := store.Create(beads.Bead{
+		Title:    "grandchild",
+		Type:     "task",
+		ParentID: child.ID,
+		Metadata: map[string]string{"gc.root_bead_id": root.ID},
+	})
+	if err != nil {
+		t.Fatalf("Create(grandchild): %v", err)
+	}
+	if strings.Compare(root.ID, grandchild.ID) >= 0 {
+		t.Fatalf("fixture needs root %s to sort before grandchild %s by id, or a depth tie hides the bug", root.ID, grandchild.ID)
+	}
+	if _, err := store.MemStore.CloseAll([]string{child.ID}, nil); err != nil {
+		t.Fatalf("CloseAll(child): %v", err)
+	}
+
+	closed, err := CloseWorkflowSubtree(store, root.ID)
+	if err != nil {
+		t.Fatalf("CloseWorkflowSubtree: %v", err)
+	}
+	if closed != 2 {
+		t.Fatalf("CloseWorkflowSubtree closed %d beads, want root and grandchild", closed)
 	}
 }
