@@ -18,19 +18,28 @@ func (s *Server) resolveAgentSessionSubjects(name string, cfg *config.City) (str
 		return "", ""
 	}
 
-	sessionName := strings.TrimSpace(agentSessionName(s.state.CityName(), name, cfg.Workspace.SessionTemplate))
+	sessionName := strings.TrimSpace(s.liveAgentSessionName(name, cfg))
 	if sessionName == "" {
 		return "", ""
 	}
+	return sessionName, s.sessionIDForSessionName(sessionName)
+}
 
-	sessionID := ""
-	if store := s.state.SessionsBeadStore().Store; store != nil {
-		if id, err := s.resolveSessionIDWithConfig(store, sessionName); err == nil {
-			sessionID = strings.TrimSpace(id)
-		}
+// sessionIDForSessionName is the session bead id behind a runtime session
+// name, or "" when the session store cannot say.
+func (s *Server) sessionIDForSessionName(sessionName string) string {
+	if sessionName == "" {
+		return ""
 	}
-
-	return sessionName, sessionID
+	store := s.state.SessionsBeadStore().Store
+	if store == nil {
+		return ""
+	}
+	id, err := s.resolveSessionIDWithConfig(store, sessionName)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(id)
 }
 
 func (s *Server) watchAgentWorkerOperationSignals(ctx context.Context, name string, cfg *config.City) <-chan struct{} {

@@ -126,9 +126,14 @@ func (s *Server) agentListBody(input *AgentListInput, reads *agentStoreReads) Li
 	}
 	envBatch, _ := sp.(runtime.EnvironmentBatchProvider)
 
+	// Pool workers run under bead-scoped names that cannot be derived from
+	// the member name; see agent_live_session.go. Find them once, from the
+	// same listing the pool expansion reads.
+	poolSessions := buildPoolSessionIndex(cfg.Agents, runningSessions, sp, envBatch)
+
 	// Pass 1, in order and cheap: expand pools and apply the filters.
 	// IsRunning reads the provider's cached session list, and every pool
-	// shares runningSessions, so this pass makes at most one runtime call.
+	// shares runningSessions, so this pass makes no runtime call of its own.
 	var rows []agentListRow
 	var partialErrors []string
 	for _, a := range cfg.Agents {
@@ -140,6 +145,9 @@ func (s *Server) agentListBody(input *AgentListInput, reads *agentStoreReads) Li
 		// session) has no sessions; that is a complete answer, not a failure.
 		if runtime.IsRuntimeServerAbsent(expandErr) {
 			expandErr = nil
+		}
+		if isMultiSessionAgent(a) {
+			expanded = appendUnlistedPoolMembers(expanded, a, poolSessions)
 		}
 		switch {
 		case expandErr != nil:
@@ -167,6 +175,12 @@ func (s *Server) agentListBody(input *AgentListInput, reads *agentStoreReads) Li
 			// lists a session whose pane exited under remain-on-exit.
 			// The roster is an attributes source only.
 			running := sp.IsRunning(sessionName)
+			var env map[string]string
+			if !running && ea.pool != "" {
+				if ps, ok := poolSessions.lookup(ea.pool, ea.qualifiedName); ok {
+					sessionName, running, env = ps.name, sp.IsRunning(ps.name), ps.env
+				}
+			}
 			var roster *runtime.SessionRosterEntry
 			if entry, ok := rosterMap[sessionName]; ok {
 				roster = &entry
@@ -186,7 +200,7 @@ func (s *Server) agentListBody(input *AgentListInput, reads *agentStoreReads) Li
 			}
 			rows = append(rows, agentListRow{
 				agent: a, ea: ea, sessionName: sessionName,
-				running: running, roster: roster, limits: limits,
+				running: running, env: env, roster: roster, limits: limits,
 				graphWork: gw, hasGraphWork: hasGraphWork,
 				pack: pack, packDerived: packDerived,
 			})
@@ -230,6 +244,9 @@ type agentListRow struct {
 	ea          expandedAgent
 	sessionName string
 	running     bool
+	// env is the session's environment when pass 1 already read it to
+	// resolve a pool worker, nil otherwise.
+	env map[string]string
 	// roster is the session's entry in the provider's batched roster, nil
 	// when the provider has none or the session is not in it.
 	roster       *runtime.SessionRosterEntry
@@ -253,8 +270,8 @@ func (s *Server) agentListResponse(row agentListRow, cfg *config.City, sp runtim
 	// running one has any to read: asking a stopped tmux session still costs
 	// an exec that can only fail, and for every one of the town's 234 to 419
 	// slots that was 3 to 6 seconds per list (hq-xujh6g).
-	var env map[string]string
-	if running && envBatch != nil {
+	env := row.env
+	if running && env == nil && envBatch != nil {
 		env, _ = envBatch.GetAllEnvironment(sessionName)
 	}
 	suspended := ea.suspended
@@ -394,14 +411,13 @@ func (s *Server) agentByName(name string) (*IndexOutput[agentResponse], error) {
 
 	cfg := s.state.Config()
 	sp := s.state.SessionProvider()
-	cityName := s.state.CityName()
 
 	agentCfg, ok := findAgent(cfg, name)
 	if !ok {
 		return nil, apierr.AgentNotFound.Msg("agent " + name + " not found")
 	}
 
-	sessionName := agentSessionName(cityName, name, cfg.Workspace.SessionTemplate)
+	sessionName := s.liveAgentSessionName(name, cfg)
 	running := sp.IsRunning(sessionName)
 	// Fold active graph-resident (wisp) work into the running signal so a
 	// graph-working agent reports running even when its named provider session
@@ -693,7 +709,7 @@ func (s *Server) agentOutputByName(name string, tail int, provided bool, before 
 
 	// No session file found — fall back to Peek() (raw terminal text).
 	sp := s.state.SessionProvider()
-	sessionName := agentSessionName(s.state.CityName(), name, cfg.Workspace.SessionTemplate)
+	sessionName := s.liveAgentSessionName(name, cfg)
 	if !sp.IsRunning(sessionName) {
 		return nil, apierr.AgentNotFound.Msg("agent " + name + " not running")
 	}

@@ -51,7 +51,7 @@ func (s *Server) resolveAgentTranscript(name string, agentCfg config.Agent) (*ag
 		return state, nil
 	}
 
-	state.sessionName = agentSessionName(s.state.CityName(), name, cfg.Workspace.SessionTemplate)
+	state.sessionName = s.liveAgentSessionName(name, cfg)
 	providerName := strings.TrimSpace(agentCfg.Provider)
 	if providerName == "" {
 		providerName = strings.TrimSpace(cfg.Workspace.Provider)
@@ -65,10 +65,7 @@ func (s *Server) resolveAgentTranscript(name string, agentCfg config.Agent) (*ag
 		state.workDir = abs
 	}
 
-	state.sessionName, state.sessionID = s.resolveAgentSessionSubjects(name, cfg)
-	if state.sessionID == "" {
-		state.sessionName = agentSessionName(s.state.CityName(), name, cfg.Workspace.SessionTemplate)
-	}
+	state.sessionID = s.sessionIDForSessionName(state.sessionName)
 	if state.sessionID == "" {
 		if sp := s.state.SessionProvider(); sp != nil && state.sessionName != "" {
 			if sessionID, err := sp.GetMeta(state.sessionName, "GC_SESSION_ID"); err == nil {
@@ -225,7 +222,7 @@ func (s *Server) agentWorkerHandle(name string, cfg *config.City) agentPeekHandl
 	if cfg == nil {
 		return nil
 	}
-	sessionName := agentSessionName(s.state.CityName(), name, cfg.Workspace.SessionTemplate)
+	sessionName := s.liveAgentSessionName(name, cfg)
 	handle, _ := s.workerHandleForSessionTarget(s.state.SessionsBeadStore().Store, sessionName)
 	return handle
 }
