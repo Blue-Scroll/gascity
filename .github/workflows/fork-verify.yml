@@ -85,6 +85,23 @@ jobs:
           # than letting every row fail for a reason the log does not name.
           jq --version
           go test ./examples/gastown/ -run 'TestSpawnStorm' -count=1 -v
+      - name: gc's schema pins match the beads town links (vn-cuad16u)
+        # gc pins bd's two schema cursors as constants
+        # (internal/beads/schema_cursor.go). The town builds gc against
+        # Blue-Scroll/beads `town` through a go.mod replace that is NOT in the
+        # branch (gas-city docs/tool-forks.md), and town carries migrations
+        # upstream does not. Without the replace these tests read upstream's
+        # numbers, which no town binary links: that is how the pin sat at 66/26
+        # while every ledger moved to 67/27 and the native store was refused.
+        # So they run here under the replace, against town's tip. When beads
+        # town gains a migration this goes red on the next gc branch until the
+        # pin is bumped, which is the point.
+        # LAST step on purpose: the replace edits go.mod, and every step above
+        # builds the branch exactly as it is.
+        run: |
+          git clone --depth 1 --branch town https://github.com/Blue-Scroll/beads.git "$RUNNER_TEMP/beads"
+          go mod edit -replace "github.com/steveyegge/beads=$RUNNER_TEMP/beads"
+          go test ./internal/beads/ ./internal/beads/beadstest/ -run 'TestSchemaCursorsMatchPinnedBeads|TestIgnoredSentinelsMatchPinnedBeads|TestForwardDriftSeesOnlyTheMainLane|TestNativeGetFilterShapeMatchesTheH1Claim|TestPinnedBeadsModuleDir|TestBeadsGoModDirectives|TestReplacedBeadsModuleDir' -count=1 -v
 
   dashboard:
     # The dashboard gc embeds (internal/api/dashboardspa). Since phone dashboard

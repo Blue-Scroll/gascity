@@ -81,7 +81,7 @@ import (
 //   - The third path above is one of them when the cursor table missing its
 //     content_hash column is the IGNORED one: ensureContentHashColumn (:1272)
 //     then ALTERs ignored_schema_migrations, a dolt_ignore pattern, and HEAD
-//     does not move. (A database at ignored=26 lacks that column only after
+//     does not move. (A database at the ignored pin lacks that column only after
 //     out-of-band surgery — bootstrapSQL and the heal both carry it — but the
 //     claim was "every one of those paths".)
 //   - The ignored lane's REPLAY — 0012-0025 after the library clamps the
@@ -97,12 +97,32 @@ import (
 // sounds. Closing the hole rather than detecting some of it still needs a
 // read-only open FROM BEADS: that is the standing ask, alongside
 // SchemaVersions().
+//
+// # Which library "pinned" means
+//
+// The library gc LINKS, which is not always the one go.mod requires. The town
+// builds gc against Blue-Scroll/beads `town` through a go.mod replace, and that
+// library carries migrations upstream v1.3.1 does not (main 0067, ignored 0027,
+// vn-s54d6fy). So these are town's numbers, and the drift test reads them out
+// of the replacement (beadstest.PinnedBeadsModuleDir). Without the replace the
+// drift test fails, and that is the true answer: a gc built that way links
+// upstream's 66/26 and would refuse every town ledger (vn-cuad16u).
+//
+// When beads `town` gains a migration, bump these in the same landing, and run
+// the drift test under the replace before installing a rebuilt gc (gas-city
+// docs/tool-forks.md, "Building the binaries"):
+//
+//	go mod edit -replace github.com/steveyegge/beads=../beads
+//	CGO_ENABLED=0 go test -tags gms_pure_go ./internal/beads/ -run TestSchemaCursorsMatchPinnedBeads -count=1
+//
+// fork-verify runs the same test against the beads `town` tip on every fix/
+// and feat/ branch, so a pin left behind goes red on the next gc branch too.
 const (
-	// SchemaCursorMain is schema.LatestVersion() for the pinned library.
-	SchemaCursorMain = 66
-	// SchemaCursorIgnored is schema.LatestIgnoredVersion() for the pinned
+	// SchemaCursorMain is schema.LatestVersion() for the linked library.
+	SchemaCursorMain = 67
+	// SchemaCursorIgnored is schema.LatestIgnoredVersion() for the linked
 	// library.
-	SchemaCursorIgnored = 26
+	SchemaCursorIgnored = 27
 )
 
 // PinnedSchemaCursors returns the pair a proxied database must already be at

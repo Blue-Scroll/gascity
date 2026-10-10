@@ -45,7 +45,7 @@ const (
 // embedded FS.
 func TestSchemaCursorsMatchPinnedBeads(t *testing.T) {
 	moduleDir := beadstest.PinnedBeadsModuleDir(t)
-	version := beadstest.PinnedBeadsVersion(t)
+	version := beadstest.PinnedBeadsSource(t)
 
 	cases := []struct {
 		lane string
@@ -60,11 +60,22 @@ func TestSchemaCursorsMatchPinnedBeads(t *testing.T) {
 		t.Run(tc.lane, func(t *testing.T) {
 			got := latestMigration(t, filepath.Join(moduleDir, filepath.FromSlash(tc.dir)))
 			if got != tc.want {
-				t.Fatalf("beads %s has %s lane at migration %d, but this build pins %d.\n"+
+				// Without a replace this read the required upstream release. On
+				// gascity `town` that is the wrong library: town links
+				// Blue-Scroll/beads `town` through a replace, and lowering the
+				// pin to upstream's number refuses every town ledger
+				// (vn-cuad16u). So say that before saying "update the constant".
+				townHint := ""
+				if !strings.Contains(version, "replaced by") {
+					townHint = "On gascity `town` this read the WRONG library: town links Blue-Scroll/beads `town` " +
+						"through a go.mod replace. Rerun under that replace (gas-city docs/tool-forks.md, " +
+						"\"Building the binaries\") before you touch the constant.\n"
+				}
+				t.Fatalf("beads %s has %s lane at migration %d, but this build pins %d.\n%s"+
 					"Update the constant in internal/beads/schema_cursor.go to %d and re-read the new "+
 					"migrations: gc refuses a native open unless a database is at exactly these cursors, "+
 					"so a stale pin either refuses every healthy scope or admits one the library would migrate.",
-					version, tc.lane, got, tc.want, got)
+					version, tc.lane, got, tc.want, townHint, got)
 			}
 		})
 	}

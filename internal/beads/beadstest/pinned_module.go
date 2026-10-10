@@ -36,6 +36,15 @@ const PinnedBeadsModulePath = "github.com/steveyegge/beads"
 // answer in one line, and a subprocess in a test grows the repo's source
 // resource census — a shrink-only ratchet — so the resolution is inlined
 // instead.
+//
+// A go.mod `replace` of beads with a local directory wins over the required
+// version, exactly as it does for cmd/go, because the replacement is the library
+// that gets linked. The town builds gc this way: Blue-Scroll/gascity `town` is
+// built with `go mod edit -replace github.com/steveyegge/beads=../beads` against
+// Blue-Scroll/beads `town`, which carries migrations upstream does not (main
+// 0067, ignored 0027, vn-s54d6fy). Reading the required v1.3.1 there compared
+// the pins against a library no town binary links, so the pins went stale and
+// the native store was refused on every ledger (vn-cuad16u).
 func PinnedBeadsModuleDir(t *testing.T) string {
 	t.Helper()
 	// Under bazel the module tree arrives as runfiles from the go_deps
@@ -44,7 +53,63 @@ func PinnedBeadsModuleDir(t *testing.T) string {
 	if dir := bazelRunfilesBeadsModule(); dir != "" {
 		return dir
 	}
-	return pinnedBeadsModuleDirOrFatal(t, goModuleCache(t), PinnedBeadsVersion(t))
+	root := RepositoryRoot(t)
+	gomod := readGoMod(t, root)
+	if target, targetVersion, ok := beadsReplacement(gomod); ok {
+		dir, err := replacedBeadsModuleDir(root, target, targetVersion)
+		if err != nil {
+			t.Fatalf("%v\n"+
+				"go.mod replaces %s, so the replacement is the library this build links. The drift check "+
+				"must read that one, and must not fall back to the required version, which is not linked.",
+				err, PinnedBeadsModulePath)
+		}
+		return dir
+	}
+	return pinnedBeadsModuleDirOrFatal(t, goModuleCache(t), pinnedBeadsRequire(t, gomod))
+}
+
+// PinnedBeadsSource names the beads library PinnedBeadsModuleDir reads, for a
+// failure message: the required version, plus the replacement when go.mod has
+// one. A message that printed only "v1.3.1" under a replace would send the
+// reader to the wrong library.
+func PinnedBeadsSource(t *testing.T) string {
+	t.Helper()
+	gomod := readGoMod(t, RepositoryRoot(t))
+	version := pinnedBeadsRequire(t, gomod)
+	if target, targetVersion, ok := beadsReplacement(gomod); ok {
+		return strings.TrimSpace(version + " replaced by " + target + " " + targetVersion)
+	}
+	return version
+}
+
+// replacedBeadsModuleDir resolves a beads replacement to a directory. Only a
+// local directory is resolved. A replacement by another module path is refused
+// rather than guessed at: the cache path for it needs cmd/go's case escaping,
+// and a wrong guess here is a drift check reading the wrong library.
+func replacedBeadsModuleDir(root, target, targetVersion string) (string, error) {
+	if targetVersion != "" {
+		return "", fmt.Errorf("go.mod replaces %s with the module %s %s; only a local directory replacement is resolved here",
+			PinnedBeadsModulePath, target, targetVersion)
+	}
+	// cmd/go's own rule: a replacement is a local path when it is absolute or
+	// starts with ./ or ../ (filepath.IsAbs covers a Windows drive letter too).
+	if !filepath.IsAbs(target) && !strings.HasPrefix(target, "./") && !strings.HasPrefix(target, "../") {
+		return "", fmt.Errorf("go.mod replaces %s with %q, which is neither a local path nor a module path with a version",
+			PinnedBeadsModulePath, target)
+	}
+	dir := target
+	if !filepath.IsAbs(dir) {
+		dir = filepath.Join(root, filepath.FromSlash(target))
+	}
+	info, err := os.Stat(dir)
+	switch {
+	case err != nil:
+		return "", fmt.Errorf("go.mod replaces %s with %s, which cannot be read: %w", PinnedBeadsModulePath, dir, err)
+	case !info.IsDir():
+		return "", fmt.Errorf("go.mod replaces %s with %s, which is not a directory", PinnedBeadsModulePath, dir)
+	default:
+		return dir, nil
+	}
 }
 
 // bazelRunfilesBeadsModule locates the pinned beads module inside the bazel
@@ -96,8 +161,8 @@ func pinnedBeadsModuleDirOrFatal(t moduleDirReporter, cache, version string) str
 	if err != nil {
 		t.Fatalf("%v\n"+
 			"The test binary links %s, so the go command resolved it; this resolution did not. "+
-			"Check GOMODCACHE, GOPATH and GOENV (resolved cache: %s), and whether go.mod gained a "+
-			"replace or the build moved to vendor mode — the pinned-cursor drift check cannot run "+
+			"Check GOMODCACHE, GOPATH and GOENV (resolved cache: %s), and whether the build moved "+
+			"to vendor mode — the pinned-cursor drift check cannot run "+
 			"without the module's own migration directories, and it must not pass without running.",
 			err, PinnedBeadsModulePath, cache)
 	}
@@ -120,23 +185,88 @@ func pinnedBeadsModuleDir(cache, version string) (string, error) {
 }
 
 // PinnedBeadsVersion reads the beads version this module requires from go.mod.
+// Under a replace it is NOT the linked library; PinnedBeadsSource says which is.
 func PinnedBeadsVersion(t *testing.T) string {
 	t.Helper()
-	data, err := os.ReadFile(filepath.Join(RepositoryRoot(t), "go.mod"))
+	return pinnedBeadsRequire(t, readGoMod(t, RepositoryRoot(t)))
+}
+
+func readGoMod(t *testing.T, root string) string {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join(root, "go.mod"))
 	if err != nil {
 		t.Fatalf("read go.mod: %v", err)
 	}
-	for _, line := range strings.Split(string(data), "\n") {
-		fields := strings.Fields(strings.TrimSpace(line))
-		if len(fields) >= 2 && fields[0] == PinnedBeadsModulePath {
-			return fields[1]
-		}
-		if len(fields) >= 3 && fields[0] == "require" && fields[1] == PinnedBeadsModulePath {
-			return fields[2]
+	return string(data)
+}
+
+func pinnedBeadsRequire(t *testing.T, gomod string) string {
+	t.Helper()
+	for _, d := range beadsGoModDirectives(gomod) {
+		if d.verb == "require" && len(d.args) >= 1 {
+			return d.args[0]
 		}
 	}
 	t.Fatalf("go.mod does not require %s", PinnedBeadsModulePath)
 	return ""
+}
+
+// beadsReplacement returns the right-hand side of go.mod's replace for beads:
+// the target, plus its version when the target is a module rather than a
+// directory. ok is false when go.mod replaces nothing.
+func beadsReplacement(gomod string) (target, targetVersion string, ok bool) {
+	for _, d := range beadsGoModDirectives(gomod) {
+		if d.verb != "replace" {
+			continue
+		}
+		for i, arg := range d.args {
+			if arg != "=>" || i+1 >= len(d.args) {
+				continue
+			}
+			target = d.args[i+1]
+			if i+2 < len(d.args) {
+				targetVersion = d.args[i+2]
+			}
+			return target, targetVersion, true
+		}
+	}
+	return "", "", false
+}
+
+// beadsGoModDirective is one go.mod line about the beads module: the verb it
+// sits under, inline or in a block, and the fields after the module path.
+type beadsGoModDirective struct {
+	verb string
+	args []string
+}
+
+// beadsGoModDirectives reads every require and replace of beads out of go.mod,
+// in both the one-line and the block form. Telling the verbs apart is the
+// point: the old reader took the first line naming beads, so a replace block
+// above the require would have handed back "=>" as the version.
+func beadsGoModDirectives(gomod string) []beadsGoModDirective {
+	var out []beadsGoModDirective
+	block := ""
+	for _, line := range strings.Split(gomod, "\n") {
+		if i := strings.Index(line, "//"); i >= 0 {
+			line = line[:i]
+		}
+		fields := strings.Fields(line)
+		switch {
+		case len(fields) == 0:
+		case block != "" && fields[0] == ")":
+			block = ""
+		case block != "":
+			if fields[0] == PinnedBeadsModulePath {
+				out = append(out, beadsGoModDirective{verb: block, args: fields[1:]})
+			}
+		case len(fields) == 2 && fields[1] == "(":
+			block = fields[0]
+		case len(fields) >= 2 && fields[1] == PinnedBeadsModulePath:
+			out = append(out, beadsGoModDirective{verb: fields[0], args: fields[2:]})
+		}
+	}
+	return out
 }
 
 // RepositoryRoot walks up from the working directory to the module root.
