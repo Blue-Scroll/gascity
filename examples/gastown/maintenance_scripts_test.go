@@ -6832,7 +6832,9 @@ const maintenanceBdAppliedIDsJSON = `    if [ -n "${BD_CLOSE_FAIL:-}" ]; then
 //     dolt_integration tests), which plays the scope's store, so the
 //     store-content fixtures read the exact queries the scripts send through bd;
 //   - serves `export --all -o FILE` from the same store, converting the
-//     stub's issues rows into bd export JSONL (one record per line);
+//     stub's issues rows into bd export JSONL (one record per line), and
+//     answers `export --help` with FAKE_BD_EXPORT_HELP (default: empty, a bd
+//     that knows no optional export flag);
 //   - refuses scopes listed in FAKE_NOT_BD_SCOPES the way gc refuses a
 //     non-bd beads provider;
 //   - fails for scopes listed in FAKE_UNREACHABLE_SCOPES or in the
@@ -6937,6 +6939,12 @@ if [ "${1:-}" = "bd" ]; then
       DOLT_CLI_PASSWORD="${GC_DOLT_PASSWORD:-}" exec dolt --host "${GC_DOLT_HOST:-127.0.0.1}" --port "${GC_DOLT_PORT:-3307}" --user "${GC_DOLT_USER:-root}" --no-tls sql -r "$fake_format" -q "${3:-}"
       ;;
     export)
+      for fake_arg in "$@"; do
+        if [ "$fake_arg" = "--help" ]; then
+          printf '%s\n' "${FAKE_BD_EXPORT_HELP:-}"
+          exit 0
+        fi
+      done
       fake_out=""
       while [ $# -gt 0 ]; do
         if [ "$1" = "-o" ]; then

@@ -586,6 +586,50 @@ func TestJsonlExportArchivesEveryScopeInBdExportFormat(t *testing.T) {
 	}
 }
 
+// TestJsonlExportLeavesWispPlaneRowsOutOnlyWhenBdKnowsHow pins the half of
+// vn-79smm01 that lives in the script: the archive asks bd to leave the
+// wisps-plane rows out in SQL when bd knows --exclude-wisp-plane, and keeps the
+// plain `export --all` when it does not, so an older bd still archives.
+func TestJsonlExportLeavesWispPlaneRowsOutOnlyWhenBdKnowsHow(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		help     string
+		wantFlag bool
+	}{
+		{"bd knows the flag", "      --exclude-wisp-plane   Leave out wisps-plane rows", true},
+		{"bd predates the flag", "      --all   Include all records", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newScopeFixture(t, `
+  *"SELECT * FROM "*"hq"*".issues"*)
+    printf '{"rows":[{"id":"hq-1","title":"city work","issue_type":"task"}]}\n'
+    ;;`)
+			f.env["FAKE_SCOPE_DBS"] = "city=hq"
+			f.env["FAKE_BD_EXPORT_HELP"] = tc.help
+			archive := filepath.Join(f.cityDir, "archive")
+			jsonlScopeEnv(t, f, archive)
+			runScript(t, coreScriptPath("jsonl-export.sh"), f.env)
+
+			var exportCalls []string
+			for _, line := range strings.Split(f.read(t, f.gcLog), "\n") {
+				if strings.Contains(line, " export --all -o ") {
+					exportCalls = append(exportCalls, line)
+				}
+			}
+			if len(exportCalls) != 1 {
+				t.Fatalf("want one export call, got %d:\n%s", len(exportCalls), f.read(t, f.gcLog))
+			}
+			if got := strings.HasSuffix(exportCalls[0], " --exclude-wisp-plane"); got != tc.wantFlag {
+				t.Fatalf("export call %q: carries --exclude-wisp-plane = %v, want %v", exportCalls[0], got, tc.wantFlag)
+			}
+			data, err := exec.Command("git", "-C", archive, "show", "HEAD:hq/issues.jsonl").CombinedOutput()
+			if err != nil || !strings.Contains(string(data), `"hq-1"`) {
+				t.Fatalf("hq snapshot was not archived: %v\n%s", err, data)
+			}
+		})
+	}
+}
+
 func TestJsonlExportMovesLegacySnapshotToLegacyDirWithoutDeletingIt(t *testing.T) {
 	f := newScopeFixture(t, `
   *"SELECT * FROM "*"beads"*".issues"*)

@@ -904,6 +904,26 @@ should_halt_for_jsonl_spike() {
     return 0
 }
 
+# scope_export_wisp_plane_flag prints --exclude-wisp-plane when the bd behind
+# the current scope knows that flag, and nothing otherwise. With it, bd leaves
+# out in SQL the rows select_archived_records drops anyway (ephemeral rows, and
+# no-history rows in the wisps table). Without it, `export --all` reads the
+# whole wisps table in full: on the hq store that is 43,053 rows read to keep
+# 13,762, and it was the unfiltered full-row wisps query a live sample caught
+# (vn-79smm01). select_archived_records still runs either way, so an older bd
+# gives the same archive, only slower.
+#
+# The help text is captured before it is matched. Piping it into `grep -q`
+# would let grep exit on the first match, and the SIGPIPE bd then takes makes
+# the pipeline read as "no flag" under pipefail.
+scope_export_wisp_plane_flag() {
+    local help
+    help=$(scope_bd export --help 2>/dev/null) || return 0
+    case "$help" in
+        *--exclude-wisp-plane*) printf '%s\n' --exclude-wisp-plane ;;
+    esac
+}
+
 # export_scope exports the current scope into <archive>/<db>/issues.jsonl
 # (plus the flat <db>.jsonl mirror). Returns 1 when the scope failed; its
 # outputs are then restored to HEAD.
@@ -913,6 +933,7 @@ export_scope() {
     local raw_tmp
     local out
     local filtered_tmp
+    local wisp_plane_flag
 
     if ! move_legacy_snapshot_files "$DB"; then
         echo "jsonl-export: moving the legacy snapshot of $DB to $DB/legacy/ failed" >&2
@@ -923,7 +944,8 @@ export_scope() {
 
     # Step 1: gc bd export of the whole scope (read-only; one consistent snapshot).
     raw_tmp=$(mktemp "$db_dir/export.jsonl.tmp.XXXXXX")
-    if ! out=$(scope_bd export --all -o "$raw_tmp" 2>&1); then
+    wisp_plane_flag=$(scope_export_wisp_plane_flag)
+    if ! out=$(scope_bd export --all -o "$raw_tmp" ${wisp_plane_flag:+"$wisp_plane_flag"} 2>&1); then
         echo "jsonl-export: gc bd export failed for $SCOPE_LABEL ($DB): $out" >&2
         rm -f "$raw_tmp"
         discard_failed_db_outputs "$DB"
