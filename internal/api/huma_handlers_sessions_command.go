@@ -719,7 +719,8 @@ func (s *Server) acceptSessionSubmit(ctx context.Context, input *SessionSubmitIn
 	if store.Store == nil {
 		return asyncAcceptedBody{}, apierr.ServiceUnavailable.Msg("no bead store configured")
 	}
-	if err := s.sessionTargetDeliverable(ctx, store.Store, input.ID); err != nil {
+	gateID, err := s.sessionTargetDeliverable(ctx, store.Store, input.ID)
+	if err != nil {
 		if errors.Is(err, session.ErrSessionNotFound) {
 			return asyncAcceptedBody{}, apierr.SessionNotFound.Msg(fmt.Sprintf("session %q not found and not a configured named session", input.ID))
 		}
@@ -745,14 +746,23 @@ func (s *Server) acceptSessionSubmit(ctx context.Context, input *SessionSubmitIn
 	}
 	message := input.Body.Message
 	sessionTarget := input.ID
+	acceptedAt := time.Now()
 	go func() {
 		defer s.recoverAsRequestFailed(reqID, RequestOperationSessionSubmit)
-		id, err := s.resolveSessionIDMaterializingNamedWithContext(context.Background(), store.Store, sessionTarget)
+		startedAt := time.Now()
+		id, err := s.resolveDeliverableSessionID(context.Background(), store.Store, sessionTarget, gateID)
 		if err != nil {
 			s.emitSessionSubmitFailed(reqID, "resolve_failed", err.Error())
 			return
 		}
-		outcome, submitErr := s.submitMessageToSession(context.Background(), store.Store, id, message, intent)
+		resolvedAt := time.Now()
+		handle, handleErr := s.workerHandleForSession(store.Store, id)
+		logSessionDeliveryPrep(RequestOperationSessionSubmit, reqID, id, acceptedAt, startedAt, resolvedAt, time.Now())
+		if handleErr != nil {
+			s.emitSessionSubmitFailed(reqID, "submit_failed", handleErr.Error())
+			return
+		}
+		outcome, submitErr := submitMessageToHandle(context.Background(), handle, message, intent)
 		if submitErr != nil {
 			s.emitSessionSubmitFailed(reqID, "submit_failed", submitErr.Error())
 		} else {
@@ -787,7 +797,8 @@ func (s *Server) acceptSessionMessage(ctx context.Context, input *SessionMessage
 	if store.Store == nil {
 		return asyncAcceptedBody{}, apierr.ServiceUnavailable.Msg("no bead store configured")
 	}
-	if err := s.sessionTargetDeliverable(ctx, store.Store, input.ID); err != nil {
+	gateID, err := s.sessionTargetDeliverable(ctx, store.Store, input.ID)
+	if err != nil {
 		if errors.Is(err, session.ErrSessionNotFound) {
 			return asyncAcceptedBody{}, apierr.SessionNotFound.Msg(fmt.Sprintf("session %q not found and not a configured named session", input.ID))
 		}
@@ -808,8 +819,10 @@ func (s *Server) acceptSessionMessage(ctx context.Context, input *SessionMessage
 	}
 	message := input.Body.Message
 	sessionTarget := input.ID
+	acceptedAt := time.Now()
 	go func() {
 		defer s.recoverAsRequestFailed(reqID, RequestOperationSessionMessage)
+		startedAt := time.Now()
 
 		type messageResult struct {
 			sessionID string
@@ -838,12 +851,18 @@ func (s *Server) acceptSessionMessage(ctx context.Context, input *SessionMessage
 					sendResult(messageResult{errorCode: "internal_error", err: fmt.Errorf("panic: %v", r)})
 				}
 			}()
-			id, err := s.resolveSessionIDMaterializingNamedWithContext(ctx, store.Store, sessionTarget)
+			id, err := s.resolveDeliverableSessionID(ctx, store.Store, sessionTarget, gateID)
 			if err != nil {
 				sendResult(messageResult{errorCode: "resolve_failed", err: err})
 				return
 			}
-			if err := s.sendUserMessageToSession(ctx, store.Store, id, message); err != nil {
+			resolvedAt := time.Now()
+			handle, err := s.workerHandleForSession(store.Store, id)
+			logSessionDeliveryPrep(RequestOperationSessionMessage, reqID, id, acceptedAt, startedAt, resolvedAt, time.Now())
+			if err == nil {
+				_, err = submitMessageToHandle(ctx, handle, message, session.SubmitIntentDefault)
+			}
+			if err != nil {
 				code := "message_failed"
 				if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
 					code = "timeout"

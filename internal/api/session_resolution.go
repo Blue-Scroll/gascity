@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"path/filepath"
 	"strings"
 	"time"
@@ -629,16 +630,47 @@ func (s *Server) resolveSessionIDAllowClosedWithConfig(store beads.Store, identi
 // wakes for days). This gate restores the declared-404 contract for targets
 // that can never deliver, while keeping the accept-then-work model for slow
 // paths (cold named-session wakes).
-func (s *Server) sessionTargetDeliverable(ctx context.Context, store beads.Store, identifier string) error {
-	if _, err := s.resolveSessionTargetIDWithContext(ctx, store, identifier, apiSessionResolveOptions{}); err == nil {
-		return nil
+//
+// It returns the session id when the target already resolves, or "" when only
+// a configured named session matched. Hand that result to
+// resolveDeliverableSessionID in the async path; never resolve the target a
+// second time.
+func (s *Server) sessionTargetDeliverable(ctx context.Context, store beads.Store, identifier string) (string, error) {
+	if id, err := s.resolveSessionTargetIDWithContext(ctx, store, identifier, apiSessionResolveOptions{}); err == nil {
+		return id, nil
 	} else if !errors.Is(err, session.ErrSessionNotFound) {
-		return err
+		return "", err
 	}
 	if _, ok, specErr := s.findNamedSessionSpecForTarget(store, identifier); specErr == nil && ok {
-		return nil
+		return "", nil
 	}
-	return apiSessionTargetNotFound(identifier)
+	return "", apiSessionTargetNotFound(identifier)
+}
+
+// resolveDeliverableSessionID is the async half of sessionTargetDeliverable.
+// It reuses the id the gate resolved, and runs the resolve ladder again
+// (materializing) only when the gate matched a configured named session that
+// has no bead yet. Resolving a found id again repeated every store read before
+// delivery, and under load one read can wait seconds on the bead cache: 2.4s
+// passed between the 202 and the worker starting (vn-lwg9dmi).
+func (s *Server) resolveDeliverableSessionID(ctx context.Context, store beads.Store, identifier, gateID string) (string, error) {
+	if gateID != "" {
+		return gateID, nil
+	}
+	return s.resolveSessionIDMaterializingNamedWithContext(ctx, store, identifier)
+}
+
+// logSessionDeliveryPrep writes how long the async path took between the 202
+// and the worker starting: waiting for the goroutine, resolving the target,
+// and building the worker handle. The target is under 300ms in total
+// (vn-lwg9dmi), so a slow phase shows up here by name.
+func logSessionDeliveryPrep(op, reqID, sessionID string, acceptedAt, startedAt, resolvedAt, builtAt time.Time) {
+	log.Printf("api: %s prep request_id=%s session_id=%s total=%s wait=%s resolve=%s handle=%s",
+		op, reqID, sessionID,
+		builtAt.Sub(acceptedAt).Round(time.Millisecond),
+		startedAt.Sub(acceptedAt).Round(time.Millisecond),
+		resolvedAt.Sub(startedAt).Round(time.Millisecond),
+		builtAt.Sub(resolvedAt).Round(time.Millisecond))
 }
 
 func (s *Server) resolveSessionIDMaterializingNamed(store beads.Store, identifier string) (string, error) {
@@ -654,6 +686,12 @@ func (s *Server) submitMessageToSession(ctx context.Context, store beads.Store, 
 	if err != nil {
 		return session.SubmitOutcome{}, err
 	}
+	return submitMessageToHandle(ctx, handle, message, intent)
+}
+
+// submitMessageToHandle delivers a message through a worker handle the caller
+// already built, so the async handlers can time the handle build on its own.
+func submitMessageToHandle(ctx context.Context, handle worker.Handle, message string, intent session.SubmitIntent) (session.SubmitOutcome, error) {
 	result, err := handle.Message(ctx, worker.MessageRequest{
 		Text:     message,
 		Delivery: workerDeliveryIntent(intent),
