@@ -3,6 +3,7 @@ load("@rules_go//go:def.bzl", "go_library", "go_test")
 go_library(
     name = "events",
     srcs = [
+        "archive_types.go",
         "backend_payloads.go",
         "control_payloads.go",
         "events.go",
@@ -11,6 +12,7 @@ go_library(
         "inode_unix.go",
         "inode_windows.go",
         "multiplexer.go",
+        "newest.go",
         "order_payloads.go",
         "payload.go",
         "payloads.go",
@@ -25,6 +27,7 @@ go_library(
         "rotation_archive.go",
         "rotation_payload.go",
         "supervisor_payloads.go",
+        "walk.go",
         "watch_backfill.go",
     ],
     importpath = "github.com/gastownhall/gascity/internal/events",
@@ -43,12 +46,15 @@ go_library(
 go_test(
     name = "events_test",
     srcs = [
+        "archive_types_test.go",
         "backend_payloads_test.go",
         "conformance_test.go",
         "control_payloads_test.go",
         "events_test.go",
         "latest_archived_match_test.go",
         "multiplexer_test.go",
+        "newest_test.go",
+        "newest_typed_test.go",
         "order_payloads_test.go",
         "payload_test.go",
         "query_test.go",
@@ -70,6 +76,8 @@ go_test(
         "rotation_watcher_test.go",
         "testenv_import_test.go",
         "type_naming_test.go",
+        "walk_test.go",
+        "watch_active_seek_test.go",
         "watch_backfill_test.go",
     ],
     embed = [":events"],

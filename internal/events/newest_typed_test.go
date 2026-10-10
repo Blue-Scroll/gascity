@@ -119,9 +119,24 @@ func seedTypedLog(t *testing.T) (path, middle string) {
 // TestReadNewestTypedMatchesTheFullRead pins the line-head skip to the read it
 // replaces: for every page size and filter, cold and warm, the newest-first read
 // returns the same events as decoding everything.
+//
+// It runs once with the sidecars the rotation wrote and once with none, so
+// both the sidecar and the archive read are held to the full read.
 func TestReadNewestTypedMatchesTheFullRead(t *testing.T) {
-	resetArchiveTypes(t)
-	path, _ := seedTypedLog(t)
+	for _, sidecars := range []bool{true, false} {
+		t.Run(fmt.Sprintf("sidecars=%v", sidecars), func(t *testing.T) {
+			resetArchiveTypes(t)
+			path, _ := seedTypedLog(t)
+			if !sidecars {
+				removeTypesSidecars(t, filepath.Dir(path))
+			}
+			assertTypedReadsMatchTheFullRead(t, path)
+		})
+	}
+}
+
+func assertTypedReadsMatchTheFullRead(t *testing.T, path string) {
+	t.Helper()
 	all, err := ReadFiltered(path, Filter{})
 	if err != nil {
 		t.Fatalf("ReadFiltered: %v", err)
@@ -176,9 +191,10 @@ func TestReadNewestSkipsAnArchiveThatLacksTheType(t *testing.T) {
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("warm read = %v, want %v", got, want)
 	}
-	// The fixture must prove something: cold, the same read opens the archive
-	// and fails.
+	// The fixture must prove something: cold, with no sidecar to answer for
+	// it, the same read opens the archive and fails.
 	resetArchiveTypes(t)
+	removeTypesSidecars(t, filepath.Dir(path))
 	if _, _, err := ReadNewestWithInFlight(t.Context(), path, Filter{Type: "want"}, 1000); err == nil {
 		t.Fatal("a cold read of an unreadable archive succeeded; the skip test proves nothing")
 	}

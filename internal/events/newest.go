@@ -7,9 +7,7 @@ import (
 	"fmt"
 	"io"
 	"math"
-	"os"
 	"path/filepath"
-	"sync"
 	"time"
 )
 
@@ -59,7 +57,18 @@ const newestCtxCheckLines = 1024
 //
 // It holds at most keep events plus one decoded line. It refuses Filter.Limit:
 // pass keep instead.
+//
+// It never writes. A writer's FileRecorder.ListNewest also gives an archive
+// with no type sidecar its sidecar once it read the archive through.
 func ReadNewestWithInFlight(ctx context.Context, path string, filter Filter, keep int) ([]Event, int, error) {
+	return readNewestWithInFlight(ctx, path, filter, keep, false)
+}
+
+// readNewestWithInFlight is ReadNewestWithInFlight, and with writeSidecars it
+// writes the type sidecar of each archive that lacks one and that it read
+// through. Only a recorder that may write passes true: a read-only provider
+// promises it creates no file.
+func readNewestWithInFlight(ctx context.Context, path string, filter Filter, keep int, writeSidecars bool) ([]Event, int, error) {
 	if filter.Limit > 0 {
 		return nil, 0, fmt.Errorf("events: ReadNewestWithInFlight does not take Filter.Limit; pass keep")
 	}
@@ -142,11 +151,18 @@ func ReadNewestWithInFlight(ctx context.Context, path string, filter Filter, kee
 			continue
 		}
 		key, keyed := archiveTypesKeyOf(src)
-		if keyed && filter.Type != "" && archiveTypesLacks(key, filter.Type) {
-			// A whole archive read before holds no event of this type, so it
-			// can hold no match. Its window counts as covered, as if read.
-			floor = min(floor, src.firstSeq)
-			continue
+		var types map[string]struct{}
+		known := false
+		if keyed {
+			types, known = archiveTypesLookup(key)
+		}
+		if known && filter.Type != "" {
+			if _, has := types[filter.Type]; !has {
+				// The archive holds no event of this type, so it can hold no
+				// match. Its window counts as covered, as if read.
+				floor = min(floor, src.firstSeq)
+				continue
+			}
 		}
 		r, err := openSegmentReader(src)
 		if err != nil {
@@ -161,8 +177,15 @@ func ReadNewestWithInFlight(ctx context.Context, path string, filter Filter, kee
 		if err != nil {
 			return nil, 0, fmt.Errorf("reading %q: %w", filepath.Base(src.path), err)
 		}
-		if keyed && seg.complete {
+		if keyed && !known && seg.complete {
 			archiveTypesRemember(key, seg.types)
+			if writeSidecars {
+				// An archive with no sidecar yet (written before sidecars, or
+				// its rotation could not write one) gets it now, so the next
+				// gc process skips it from its first read. Best effort: a
+				// failed write only means the next process reads it again.
+				_ = writeTypesSidecar(key, seg.types)
+			}
 		}
 	}
 
@@ -186,75 +209,6 @@ type newestSegment struct {
 	// and complete says the read reached its end, so types is all of them.
 	types    map[string]struct{}
 	complete bool
-}
-
-// archiveTypes remembers, for each archive a newest-first read went all the
-// way through, every event type it holds. An archive never changes once it is
-// written, so after one full read a typed read can skip every archive whose set
-// lacks its type without opening it.
-//
-// That skip is what keeps a typed list to seconds. A type that is rare in the
-// newest segments sends the read deep into history: request.failed and
-// request.result.session.submit each made GET /events?type=...&limit=50 gunzip
-// all 1.3 GB of the town Mac's archives, and before the line-head read below it
-// decoded every line too, so it sent no headers in 300 s (vn-0o1qyss). The
-// first such read still pays the full walk once per gc process; every later
-// typed read skips the archives it has seen.
-//
-// The key is the archive's path, size and modification time, so a file that
-// is replaced under the same name is read again rather than trusted. Only a
-// read that reached the end of the archive is remembered: a canceled read saw
-// part of it, and a partial set would skip an archive that holds a match.
-var archiveTypes = struct {
-	sync.Mutex
-	m map[archiveTypesKey]map[string]struct{}
-}{m: map[archiveTypesKey]map[string]struct{}{}}
-
-// archiveTypesMax bounds the memory: about one entry per archive retention
-// keeps (43 on the town Mac). Past it the memory starts over, which costs one
-// more full read, never a wrong answer.
-const archiveTypesMax = 1024
-
-type archiveTypesKey struct {
-	path    string
-	size    int64
-	modNano int64
-}
-
-// archiveTypesKeyOf keys a canonical .gz archive. A rotating-* file is not an
-// archive yet (it can still be promoted under another name), so it is never
-// keyed.
-func archiveTypesKeyOf(src backfillSource) (archiveTypesKey, bool) {
-	if src.kind != sourceArchive {
-		return archiveTypesKey{}, false
-	}
-	info, err := os.Stat(src.path)
-	if err != nil {
-		return archiveTypesKey{}, false
-	}
-	return archiveTypesKey{path: src.path, size: info.Size(), modNano: info.ModTime().UnixNano()}, true
-}
-
-// archiveTypesLacks reports whether the archive was read through before and
-// holds no event of type typ. An archive never read through answers false.
-func archiveTypesLacks(key archiveTypesKey, typ string) bool {
-	archiveTypes.Lock()
-	defer archiveTypes.Unlock()
-	types, ok := archiveTypes.m[key]
-	if !ok {
-		return false
-	}
-	_, has := types[typ]
-	return !has
-}
-
-func archiveTypesRemember(key archiveTypesKey, types map[string]struct{}) {
-	archiveTypes.Lock()
-	defer archiveTypes.Unlock()
-	if len(archiveTypes.m) >= archiveTypesMax {
-		archiveTypes.m = map[archiveTypesKey]map[string]struct{}{}
-	}
-	archiveTypes.m[key] = types
 }
 
 // lineHead reads the seq and the raw type of a line written the way
@@ -295,7 +249,10 @@ func lineHead(line []byte) (seq uint64, typ []byte, ok bool) {
 // A typed read with no Since decodes only the lines of its type: lineHead reads
 // a line's seq and type without decoding it, and a line of another type still
 // lowers *floor and counts as read. Every line's type also goes into seg.types,
-// which archiveTypes keeps once the read reaches the end.
+// which archiveTypes and the archive's sidecar keep once the read reaches the
+// end. The rotation finds each line's type with lineEventType, which must find
+// it the same way this loop does: a set that misses a type this loop can match
+// would skip an archive that holds a match.
 func scanSegmentNewest(ctx context.Context, r *segmentReader, filter Filter, floor *uint64, room int) (newestSegment, error) {
 	seg := newestSegment{types: map[string]struct{}{}}
 	// Since needs every line's ts, so only a read without it may skip decodes.

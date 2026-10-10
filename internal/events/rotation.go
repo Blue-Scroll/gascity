@@ -74,12 +74,33 @@ func gzipAndArchive(source, dest string, stderr io.Writer) error {
 		return fmt.Errorf("creating %q: %w", tmp, err)
 	}
 
+	// Copy line by line, not with io.Copy, to collect the archive's type set
+	// on the way: the sidecar written below lets a typed read skip this
+	// archive without opening it (archive_types.go).
 	gw := gzip.NewWriter(out)
-	if _, err := io.Copy(gw, in); err != nil {
-		_ = gw.Close()
-		_ = out.Close()
-		_ = os.Remove(tmp)
-		return fmt.Errorf("compressing %q: %w", source, err)
+	types := map[string]struct{}{}
+	br := bufio.NewReaderSize(in, 64*1024)
+	for {
+		line, readErr := br.ReadBytes('\n')
+		if len(line) > 0 {
+			if typ, ok := lineEventType(line); ok {
+				if _, seen := types[string(typ)]; !seen {
+					types[string(typ)] = struct{}{}
+				}
+			}
+			if _, err := gw.Write(line); err != nil {
+				readErr = err
+			}
+		}
+		if readErr == io.EOF {
+			break
+		}
+		if readErr != nil {
+			_ = gw.Close()
+			_ = out.Close()
+			_ = os.Remove(tmp)
+			return fmt.Errorf("compressing %q: %w", source, readErr)
+		}
 	}
 	if err := gw.Close(); err != nil {
 		_ = out.Close()
@@ -104,6 +125,14 @@ func gzipAndArchive(source, dest string, stderr io.Writer) error {
 		fmt.Fprintf(stderr, //nolint:errcheck // best-effort stderr
 			"events: rotation: archive succeeded but failed to remove source %q: %v\n",
 			source, err)
+	}
+	// The archive is whole without its sidecar: a typed read then reads the
+	// archive and writes the sidecar itself. So a failure here is only noted.
+	key, ok := archiveTypesKeyAt(dest)
+	if !ok {
+		fmt.Fprintf(stderr, "events: rotation: no type list for %q: cannot stat it\n", filepath.Base(dest)) //nolint:errcheck // best-effort stderr
+	} else if err := writeTypesSidecar(key, types); err != nil {
+		fmt.Fprintf(stderr, "events: rotation: writing the type list for %q: %v\n", filepath.Base(dest), err) //nolint:errcheck // best-effort stderr
 	}
 	return nil
 }
@@ -149,6 +178,7 @@ func reapOrphanedRotatingFiles(dir string, stderr io.Writer) error {
 
 	var legacyArchives []string
 	var rotatings []string
+	var sidecars []string
 	for _, e := range entries {
 		if e.IsDir() {
 			continue
@@ -164,6 +194,8 @@ func reapOrphanedRotatingFiles(dir string, stderr io.Writer) error {
 			if err := os.Remove(path); err != nil {
 				fmt.Fprintf(stderr, "events: rotation: removing stale %q: %v\n", name, err) //nolint:errcheck // best-effort stderr
 			}
+		case isTypesSidecarBasename(name), isTypesSidecarTmpBasename(name):
+			sidecars = append(sidecars, name)
 		}
 	}
 
@@ -181,6 +213,8 @@ func reapOrphanedRotatingFiles(dir string, stderr io.Writer) error {
 			fmt.Fprintf(stderr, "events: rotation: reaping %q: %v\n", base, err) //nolint:errcheck // best-effort stderr
 		}
 	}
+	// Last, so each sidecar is judged against the archives as they now stand.
+	reapTypesSidecars(dir, sidecars, stderr)
 	return nil
 }
 
@@ -331,6 +365,11 @@ func reapExpiredArchives(dir string, retainAge time.Duration, stderr io.Writer) 
 		path := filepath.Join(dir, info.Basename)
 		if err := os.Remove(path); err != nil {
 			fmt.Fprintf(stderr, "events: rotation: removing expired archive %q: %v\n", info.Basename, err) //nolint:errcheck // best-effort stderr
+			continue
+		}
+		// Its type sidecar goes with it (archive_types.go).
+		if err := os.Remove(typesSidecarPath(path)); err != nil && !os.IsNotExist(err) {
+			fmt.Fprintf(stderr, "events: rotation: removing the type list of expired archive %q: %v\n", info.Basename, err) //nolint:errcheck // best-effort stderr
 		}
 	}
 	return nil

@@ -849,8 +849,10 @@ func (r *FileRecorder) ListInFlight(filter Filter) ([]Event, error) {
 
 // ListNewest returns the newest keep matches from the same history
 // ListInFlight reads, newest segment first. It implements [NewestProvider].
+// A writer also leaves a type sidecar beside each archive it read through that
+// had none (archive_types.go); a read-only provider writes nothing.
 func (r *FileRecorder) ListNewest(ctx context.Context, filter Filter, keep int) ([]Event, int, error) {
-	return ReadNewestWithInFlight(ctx, r.path, filter, keep)
+	return readNewestWithInFlight(ctx, r.path, filter, keep, !r.readOnly)
 }
 
 // ListTail returns trailing matching events from the underlying file.
