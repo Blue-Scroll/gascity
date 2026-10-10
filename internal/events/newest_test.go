@@ -138,7 +138,7 @@ func TestReadNewestStopsMidSegmentWhenTheCallerIsGone(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	r, err := activeSegmentReader(f, info.Size())
+	r, err := activeSegmentReader(f, info.Size(), 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -151,6 +151,12 @@ func TestReadNewestStopsMidSegmentWhenTheCallerIsGone(t *testing.T) {
 	}
 	if seg.lines >= 3*newestCtxCheckLines {
 		t.Fatalf("read all %d lines after the caller left", seg.lines)
+	}
+	// A read that stopped early saw part of the segment, so its type set must
+	// never be taken for the whole archive's (archiveTypes would then skip an
+	// archive that holds a match).
+	if seg.complete {
+		t.Fatal("a canceled scan reported itself complete")
 	}
 }
 

@@ -136,6 +136,9 @@ type segmentReader struct {
 	f  *os.File
 	gz *gzip.Reader
 	br *bufio.Reader
+	// start is the byte offset the reader began at: 0 for an archive, and the
+	// first line above the cursor for the active leg (activeSegmentReader).
+	start int64
 }
 
 // openSegmentReader opens one backfill segment. A rotating file that vanished
@@ -174,12 +177,27 @@ func openSegmentReader(src backfillSource) (*segmentReader, error) {
 	return sr, nil
 }
 
-// activeSegmentReader wraps a captured active fd (0..size) as a segment reader.
-func activeSegmentReader(f *os.File, size int64) (*segmentReader, error) {
-	if _, err := f.Seek(0, io.SeekStart); err != nil {
+// activeSegmentReader wraps a captured active fd (0..size) as a segment reader
+// that starts at the first line above afterSeq (0 reads the whole leg).
+//
+// The cursor is a required argument, not a default, because the skip is the
+// whole cost of a near-head resume. The active log is append-only with strictly
+// increasing seq, so activeScanStart finds that line with a binary search of
+// short probes instead of decoding every line before it. Without it a stream
+// opened five events behind head JSON-decoded the whole active file (about 20k
+// lines, 23 MB on the town Mac) while holding one of the two global backfill
+// slots, and every dashboard tab reconnecting near head queued behind the
+// others: 5 events took 14 to 25 s to arrive (vn-0o1qyss). activeScanStart
+// falls back to 0 whenever it cannot prove the boundary, so a log that breaks
+// the ordering invariant is read slower, never with events missing.
+func activeSegmentReader(f *os.File, size int64, afterSeq uint64) (*segmentReader, error) {
+	start := activeScanStart(f, size, afterSeq)
+	// activeScanStart leaves the descriptor wherever its last probe ended, so
+	// seek explicitly even when the scan starts at 0.
+	if _, err := f.Seek(start, io.SeekStart); err != nil {
 		return nil, err
 	}
-	return &segmentReader{f: nil, br: bufio.NewReaderSize(&io.LimitedReader{R: f, N: size}, 64*1024)}, nil
+	return &segmentReader{f: nil, br: bufio.NewReaderSize(&io.LimitedReader{R: f, N: size - start}, 64*1024), start: start}, nil
 }
 
 // readInto reads up to batch filter-matching events with Seq > *maxSeq from the

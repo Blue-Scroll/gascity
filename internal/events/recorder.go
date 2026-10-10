@@ -1410,7 +1410,7 @@ func (w *fileWatcher) readActiveLegLocked(filter Filter) (eof bool, err error) {
 	w.bfMu.Lock()
 	defer w.bfMu.Unlock()
 	if w.bfReader == nil {
-		sr, serr := activeSegmentReader(w.activeFile, w.activeSize)
+		sr, serr := activeSegmentReader(w.activeFile, w.activeSize, w.maxSeq)
 		if serr != nil {
 			return false, serr
 		}

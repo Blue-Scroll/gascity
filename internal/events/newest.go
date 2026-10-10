@@ -1,12 +1,15 @@
 package events
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"math"
+	"os"
 	"path/filepath"
+	"sync"
 	"time"
 )
 
@@ -100,9 +103,9 @@ func ReadNewestWithInFlight(ctx context.Context, path string, filter Filter, kee
 	// pages holds each segment's kept matches, newest segment first.
 	var pages [][]Event
 	held, seen := 0, 0
-	read := func(r *segmentReader) (bool, error) {
+	read := func(r *segmentReader) (newestSegment, bool, error) {
 		if err := ctx.Err(); err != nil {
-			return false, err
+			return newestSegment{}, false, err
 		}
 		seg, err := scanSegmentNewest(ctx, r, filter, &floor, keep-held)
 		seen += seg.matched
@@ -111,24 +114,24 @@ func ReadNewestWithInFlight(ctx context.Context, path string, filter Filter, kee
 			held += len(seg.kept)
 		}
 		if err != nil {
-			return false, err
+			return seg, false, err
 		}
 		if held >= keep {
-			return false, nil
+			return seg, false, nil
 		}
 		if !filter.Since.IsZero() && seg.lines > 0 && seg.newestTs.Before(filter.Since) {
-			return false, nil
+			return seg, false, nil
 		}
-		return true, nil
+		return seg, true, nil
 	}
 
 	more := true
 	if active != nil {
-		r, err := activeSegmentReader(active, activeSize)
+		r, err := activeSegmentReader(active, activeSize, filter.AfterSeq)
 		if err != nil {
 			return nil, 0, fmt.Errorf("reading events: %w", err)
 		}
-		if more, err = read(r); err != nil {
+		if _, more, err = read(r); err != nil {
 			return nil, 0, fmt.Errorf("reading events: %w", err)
 		}
 	}
@@ -138,6 +141,13 @@ func ReadNewestWithInFlight(ctx context.Context, path string, filter Filter, kee
 		if src.firstSeq >= floor {
 			continue
 		}
+		key, keyed := archiveTypesKeyOf(src)
+		if keyed && filter.Type != "" && archiveTypesLacks(key, filter.Type) {
+			// A whole archive read before holds no event of this type, so it
+			// can hold no match. Its window counts as covered, as if read.
+			floor = min(floor, src.firstSeq)
+			continue
+		}
 		r, err := openSegmentReader(src)
 		if err != nil {
 			return nil, 0, fmt.Errorf("reading %q: %w", filepath.Base(src.path), err)
@@ -145,10 +155,14 @@ func ReadNewestWithInFlight(ctx context.Context, path string, filter Filter, kee
 		if r == nil {
 			continue
 		}
-		more, err = read(r)
+		var seg newestSegment
+		seg, more, err = read(r)
 		r.close()
 		if err != nil {
 			return nil, 0, fmt.Errorf("reading %q: %w", filepath.Base(src.path), err)
+		}
+		if keyed && seg.complete {
+			archiveTypesRemember(key, seg.types)
 		}
 	}
 
@@ -168,13 +182,124 @@ type newestSegment struct {
 	matched  int       // every match below the floor, kept or not
 	lines    int       // every decoded event below the floor, match or not
 	newestTs time.Time // the latest Ts among those lines
+	// types is every event type the segment holds, below the floor or not,
+	// and complete says the read reached its end, so types is all of them.
+	types    map[string]struct{}
+	complete bool
+}
+
+// archiveTypes remembers, for each archive a newest-first read went all the
+// way through, every event type it holds. An archive never changes once it is
+// written, so after one full read a typed read can skip every archive whose set
+// lacks its type without opening it.
+//
+// That skip is what keeps a typed list to seconds. A type that is rare in the
+// newest segments sends the read deep into history: request.failed and
+// request.result.session.submit each made GET /events?type=...&limit=50 gunzip
+// all 1.3 GB of the town Mac's archives, and before the line-head read below it
+// decoded every line too, so it sent no headers in 300 s (vn-0o1qyss). The
+// first such read still pays the full walk once per gc process; every later
+// typed read skips the archives it has seen.
+//
+// The key is the archive's path, size and modification time, so a file that
+// is replaced under the same name is read again rather than trusted. Only a
+// read that reached the end of the archive is remembered: a canceled read saw
+// part of it, and a partial set would skip an archive that holds a match.
+var archiveTypes = struct {
+	sync.Mutex
+	m map[archiveTypesKey]map[string]struct{}
+}{m: map[archiveTypesKey]map[string]struct{}{}}
+
+// archiveTypesMax bounds the memory: about one entry per archive retention
+// keeps (43 on the town Mac). Past it the memory starts over, which costs one
+// more full read, never a wrong answer.
+const archiveTypesMax = 1024
+
+type archiveTypesKey struct {
+	path    string
+	size    int64
+	modNano int64
+}
+
+// archiveTypesKeyOf keys a canonical .gz archive. A rotating-* file is not an
+// archive yet (it can still be promoted under another name), so it is never
+// keyed.
+func archiveTypesKeyOf(src backfillSource) (archiveTypesKey, bool) {
+	if src.kind != sourceArchive {
+		return archiveTypesKey{}, false
+	}
+	info, err := os.Stat(src.path)
+	if err != nil {
+		return archiveTypesKey{}, false
+	}
+	return archiveTypesKey{path: src.path, size: info.Size(), modNano: info.ModTime().UnixNano()}, true
+}
+
+// archiveTypesLacks reports whether the archive was read through before and
+// holds no event of type typ. An archive never read through answers false.
+func archiveTypesLacks(key archiveTypesKey, typ string) bool {
+	archiveTypes.Lock()
+	defer archiveTypes.Unlock()
+	types, ok := archiveTypes.m[key]
+	if !ok {
+		return false
+	}
+	_, has := types[typ]
+	return !has
+}
+
+func archiveTypesRemember(key archiveTypesKey, types map[string]struct{}) {
+	archiveTypes.Lock()
+	defer archiveTypes.Unlock()
+	if len(archiveTypes.m) >= archiveTypesMax {
+		archiveTypes.m = map[archiveTypesKey]map[string]struct{}{}
+	}
+	archiveTypes.m[key] = types
+}
+
+// lineHead reads the seq and the raw type of a line written the way
+// FileRecorder writes every line, {"seq":N,"type":"T",... (Event's first two
+// fields, which encoding/json writes in order with no spaces), without decoding
+// the rest. ok is false for any other shape, and for a type that holds an
+// escape, and the caller then decodes the line in full, so an unusual line
+// costs time, never correctness.
+func lineHead(line []byte) (seq uint64, typ []byte, ok bool) {
+	const seqKey, typeKey = `{"seq":`, `,"type":"`
+	if !bytes.HasPrefix(line, []byte(seqKey)) {
+		return 0, nil, false
+	}
+	i := len(seqKey)
+	start := i
+	for i < len(line) && line[i] >= '0' && line[i] <= '9' {
+		if i-start >= 19 { // past any seq a recorder can assign
+			return 0, nil, false
+		}
+		seq = seq*10 + uint64(line[i]-'0')
+		i++
+	}
+	if i == start || seq == 0 || !bytes.HasPrefix(line[i:], []byte(typeKey)) {
+		return 0, nil, false
+	}
+	rest := line[i+len(typeKey):]
+	end := bytes.IndexByte(rest, '"')
+	if end < 0 || bytes.IndexByte(rest[:end], '\\') >= 0 {
+		return 0, nil, false
+	}
+	return seq, rest[:end], true
 }
 
 // scanSegmentNewest reads one segment start to end. A .gz cannot be read
 // backward, so the newest matches are kept in a ring of size room as they go
 // by. Only events below *floor count, and *floor drops to the lowest seq read.
+//
+// A typed read with no Since decodes only the lines of its type: lineHead reads
+// a line's seq and type without decoding it, and a line of another type still
+// lowers *floor and counts as read. Every line's type also goes into seg.types,
+// which archiveTypes keeps once the read reaches the end.
 func scanSegmentNewest(ctx context.Context, r *segmentReader, filter Filter, floor *uint64, room int) (newestSegment, error) {
-	var seg newestSegment
+	seg := newestSegment{types: map[string]struct{}{}}
+	// Since needs every line's ts, so only a read without it may skip decodes.
+	skipOthers := filter.Type != "" && filter.Since.IsZero()
 	ring := make([]Event, room)
 	next := 0
 	// ceiling stays fixed for the whole segment: seqs inside one segment never
@@ -188,8 +313,26 @@ func scanSegmentNewest(ctx context.Context, r *segmentReader, filter Filter, flo
 		}
 		line, err := r.br.ReadBytes('\n')
 		if len(line) > 0 {
+			if seq, typ, ok := lineHead(line); ok {
+				if _, seenType := seg.types[string(typ)]; !seenType {
+					seg.types[string(typ)] = struct{}{}
+				}
+				if skipOthers && string(typ) != filter.Type {
+					if seq < ceiling {
+						*floor = min(*floor, seq)
+						seg.lines++
+					}
+					line = nil // counted, and it cannot match
+				}
+			}
+		}
+		if len(line) > 0 {
 			var e Event
-			if json.Unmarshal(trimLine(line), &e) == nil && e.Seq < ceiling {
+			decoded := json.Unmarshal(trimLine(line), &e) == nil
+			if decoded {
+				seg.types[e.Type] = struct{}{}
+			}
+			if decoded && e.Seq < ceiling {
 				*floor = min(*floor, e.Seq)
 				seg.lines++
 				if e.Ts.After(seg.newestTs) {
@@ -206,6 +349,7 @@ func scanSegmentNewest(ctx context.Context, r *segmentReader, filter Filter, flo
 			if err != io.EOF {
 				return seg, err
 			}
+			seg.complete = true
 			break
 		}
 	}

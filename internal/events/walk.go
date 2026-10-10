@@ -76,7 +76,7 @@ func WalkWithInFlight(path string, filter Filter, fn func(batch []Event) bool) e
 	if active == nil {
 		return nil
 	}
-	reader, err := activeSegmentReader(active, activeSize)
+	reader, err := activeSegmentReader(active, activeSize, maxSeq)
 	if err != nil {
 		return fmt.Errorf("reading events: %w", err)
 	}
