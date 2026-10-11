@@ -1476,7 +1476,7 @@ const runtimeInventoryFormat = "#{session_name}\t#{session_id}\t#{session_create
 // listRuntimeInventory reads every pane on the server with one untargeted
 // list-panes -a and folds the panes into one entry per session. A live server
 // holding no sessions answers "no current target", which is an empty
-// inventory, as in [tmuxFetcher.FetchState]; an unreachable server
+// inventory, as in [tmuxFetcher.FetchSessions]; an unreachable server
 // (ErrNoServer) is an error. A malformed line is an error rather than a
 // dropped pane: dropping the only live pane would report a live session as
 // all-dead.

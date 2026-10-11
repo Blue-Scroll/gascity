@@ -2,6 +2,7 @@ package tmux
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -16,8 +17,14 @@ type scriptedFetcher struct {
 	fn    func(ctx context.Context, call int64) (runtimeStateSnapshot, error)
 }
 
-func (f *scriptedFetcher) FetchState(ctx context.Context) (runtimeStateSnapshot, error) {
-	return f.fn(ctx, f.calls.Add(1))
+func (f *scriptedFetcher) FetchSessions(ctx context.Context) (map[string]sessionRuntimeState, error) {
+	state, err := f.fn(ctx, f.calls.Add(1))
+	return state.Sessions, err
+}
+
+// FetchProcesses fails: these tests script list-panes only.
+func (f *scriptedFetcher) FetchProcesses(context.Context) (processSnapshot, error) {
+	return processSnapshot{}, errors.New("scripted: no ps")
 }
 
 func runningSnapshot(names ...string) runtimeStateSnapshot {

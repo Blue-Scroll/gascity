@@ -539,7 +539,10 @@ func (p *Provider) snapshotLiveness(state runtimeStateSnapshot, name string, pro
 	if len(processNames) == 0 {
 		return runtime.Liveness{Running: true, Alive: true, ObjectID: session.ID, ObjectCreated: session.Created}
 	}
-	return runtime.Liveness{Running: true, Alive: state.processAlive(name, processNames), ObjectID: session.ID, ObjectCreated: session.Created}
+	// The published snapshot carries sessions only; join the last good ps
+	// scan on here, where a process answer is actually needed.
+	alive := p.cache.withProcesses(state, name).processAlive(name, processNames)
+	return runtime.Liveness{Running: true, Alive: alive, ObjectID: session.ID, ObjectCreated: session.Created}
 }
 
 // livenessOutcome is how one ObserveLivenessWithError call answered, for the

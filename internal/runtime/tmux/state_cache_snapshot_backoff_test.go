@@ -2,6 +2,7 @@ package tmux
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 )
@@ -75,38 +76,36 @@ func TestProcessSnapshotGate_SuccessClearsAndReportsRecoveryOnce(t *testing.T) {
 	}
 }
 
-// The integration this fix exists for: while the gate is closed, FetchState
-// must not run the full-OS scan at all — it reports process detail unavailable
-// without spending fetchTimeout to rediscover that.
-//
-// Real `ps` succeeds on the machine running this test, so ProcessesAvailable
-// being false is only explicable by the skip.
-func TestFetchState_SkipsProcessSnapshotWhileGated(t *testing.T) {
-	const panes = "agent-1\t0\tclaude\t4242\n"
-
-	primed := &tmuxFetcher{tm: &Tmux{cfg: DefaultConfig(), exec: &fakeExecutor{out: panes}}}
-	state, err := primed.FetchState(context.Background())
-	if err != nil {
-		t.Fatalf("FetchState (open gate): %v", err)
-	}
-	if !state.ProcessesAvailable {
-		t.Skip("process snapshot unavailable on this machine; the skip assertion below would not be meaningful")
+// The integration this fix exists for: while the gate is closed,
+// FetchProcesses must not run the full-OS scan at all. It refuses with
+// errProcessScanBackingOff, which only the gate returns, so the refusal proves
+// the scan was skipped rather than run and failed.
+func TestFetchProcesses_SkipsScanWhileGated(t *testing.T) {
+	primed := &tmuxFetcher{tm: &Tmux{cfg: DefaultConfig(), exec: &fakeExecutor{}}}
+	if _, err := primed.FetchProcesses(context.Background()); err != nil {
+		t.Skipf("process snapshot unavailable on this machine (%v); the skip assertion below would not be meaningful", err)
 	}
 
-	gated := &tmuxFetcher{tm: &Tmux{cfg: DefaultConfig(), exec: &fakeExecutor{out: panes}}}
+	gated := &tmuxFetcher{tm: &Tmux{cfg: DefaultConfig(), exec: &fakeExecutor{}}}
 	gated.snapshotGate.failed(time.Now())
 
-	state, err = gated.FetchState(context.Background())
+	if _, err := gated.FetchProcesses(context.Background()); !errors.Is(err, errProcessScanBackingOff) {
+		t.Fatalf("FetchProcesses (closed gate) err = %v, want errProcessScanBackingOff", err)
+	}
+}
+
+// Session liveness never depends on the gate: list-panes is a separate fetch,
+// so a closed gate leaves FetchSessions untouched.
+func TestFetchSessions_UnaffectedByClosedGate(t *testing.T) {
+	gated := &tmuxFetcher{tm: &Tmux{cfg: DefaultConfig(), exec: &fakeExecutor{out: "agent-1\t0\tclaude\t4242\n"}}}
+	gated.snapshotGate.failed(time.Now())
+
+	sessions, err := gated.FetchSessions(context.Background())
 	if err != nil {
-		t.Fatalf("FetchState (closed gate): %v", err)
+		t.Fatalf("FetchSessions (closed gate): %v", err)
 	}
-	if state.ProcessesAvailable {
-		t.Error("ProcessesAvailable = true while gated, want the scan skipped")
-	}
-	// Session liveness is authoritative and must survive the skip — the whole
-	// reason the snapshot degrades rather than failing.
-	if session, ok := state.Sessions["agent-1"]; !ok || !session.Running {
-		t.Errorf("Sessions[agent-1] = %+v, want it retained and running", session)
+	if session, ok := sessions["agent-1"]; !ok || !session.Running {
+		t.Errorf("sessions[agent-1] = %+v, want it listed and running", session)
 	}
 }
 

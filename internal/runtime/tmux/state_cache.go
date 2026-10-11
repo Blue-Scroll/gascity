@@ -27,15 +27,25 @@ const defaultCacheTTL = 2 * time.Second
 // sessions and logs a degraded warning.
 const defaultStaleTTL = 30 * time.Second
 
-// fetchTimeout is the hard timeout for a single runtime-state fetch.
+// fetchTimeout is the hard timeout for one tmux list-panes fetch. Every reader
+// can wait on that fetch, so it stays short. It is also the longest the first
+// ProcessAlive of a cache's life waits for the first ps scan.
 const fetchTimeout = 3 * time.Second
+
+// processFetchTimeout bounds one ps scan. No reader waits on a scan once the
+// cache holds one (see StateCache.currentProcesses), so it can be longer than
+// fetchTimeout. When the scan shared the list-panes fetch and its 3s timeout,
+// a loaded box (load 30-45, 16 cores) killed it about 50 times an hour, and
+// each kill held up the reconciler tick that triggered the refresh for the
+// full 3s.
+const processFetchTimeout = 10 * time.Second
 
 // Backoff bounds for the process-table snapshot after it fails.
 //
 // The snapshot is a full-OS `ps` scan, and it fails by losing a CPU race: the
-// box is saturated, the scan does not finish inside fetchTimeout, and the
-// context kills it. Re-attempting it on the very next refresh spends another
-// fetchTimeout and forks another full-OS scan into the contention that just
+// box is saturated, the scan does not finish inside processFetchTimeout, and
+// the context kills it. Re-attempting it on the very next rescan spends
+// another timeout and forks another full-OS scan into the contention that just
 // starved the last one, so a loaded box keeps paying for a probe that cannot
 // succeed while it stays loaded. That is a feedback loop, and it was observed
 // running for days: a supervisor logged the degrade 74 times an hour, one
@@ -51,20 +61,37 @@ const (
 	processSnapshotBackoffMax  = 2 * time.Minute
 )
 
-// StateFetcher abstracts tmux subprocess calls for testability.
+// StateFetcher abstracts the tmux and ps subprocess calls for testability.
+//
+// The two halves are separate on purpose. tmux list-panes is fast (about 20ms
+// under load) and alone decides whether a session runs, so readers wait on it.
+// A full-OS ps scan is slow under load (0.6s typical, past 3s when the box is
+// saturated) and only refines ProcessAlive, so the cache runs it in the
+// background and readers use the last good one. Keep them apart: IsRunning
+// must never wait on ps.
 type StateFetcher interface {
-	// FetchState returns a runtime-state snapshot for live sessions.
+	// FetchSessions returns the sessions tmux lists, with their panes.
 	// Corpse-only sessions (every pane pane_dead=1 under remain-on-exit) are
 	// kept with Running: false so their window activity is recorded; they
 	// still contribute no liveness.
-	// The returned snapshot is handed to StateCache, which publishes it to
-	// lock-free readers, so the fetcher must not retain or mutate its maps.
-	FetchState(ctx context.Context) (runtimeStateSnapshot, error)
+	// The returned map is handed to StateCache, which publishes it to
+	// lock-free readers, so the fetcher must not retain or mutate it.
+	FetchSessions(ctx context.Context) (map[string]sessionRuntimeState, error)
+	// FetchProcesses returns a snapshot of the OS process table. It may
+	// refuse without scanning (errProcessScanBackingOff); the cache then keeps
+	// its last good snapshot.
+	FetchProcesses(ctx context.Context) (processSnapshot, error)
 }
 
 type paneRuntimeState struct {
 	Command string
 	PID     string
+	// FirstSeen is when the cache first saw this pane PID in a list-panes
+	// fetch, on the cache clock. A process snapshot that began before
+	// FirstSeen may not hold the pane's processes at all, so it must not call
+	// the pane dead. Zero means "not stamped" (a snapshot built by hand) and
+	// is always trusted.
+	FirstSeen time.Time
 }
 
 type sessionRuntimeState struct {
@@ -100,16 +127,39 @@ type processRuntimeState struct {
 type processSnapshot struct {
 	byPID    map[string]processRuntimeState
 	children map[string][]string
+	// startedAt is when the ps scan behind this snapshot began, on the cache
+	// clock. The cache sets it; see paneRuntimeState.FirstSeen for why it
+	// matters. Zero means the cache holds no scan yet.
+	startedAt time.Time
 }
 
+// predates reports whether this snapshot began before the pane was first
+// seen, so it cannot speak for that pane's processes.
+func (s processSnapshot) predates(p paneRuntimeState) bool {
+	return !p.FirstSeen.IsZero() && s.startedAt.Before(p.FirstSeen)
+}
+
+func (s processSnapshot) predatesAnyPane(session sessionRuntimeState) bool {
+	for _, pane := range session.Panes {
+		if s.predates(pane) {
+			return true
+		}
+	}
+	return false
+}
+
+// runtimeStateSnapshot is what a reader answers from. The cache publishes the
+// session half alone (StateCache.state) and joins the last good process scan
+// on at read time, only for the readers that need it (ProcessAlive and
+// Provider.snapshotLiveness), so a session read never waits on ps.
 type runtimeStateSnapshot struct {
 	Sessions  map[string]sessionRuntimeState
 	Processes processSnapshot
-	// ProcessesAvailable reports whether the OS process-table snapshot was
-	// fetched successfully. tmux list-panes establishes session liveness on its
-	// own; the process snapshot is only a secondary refinement (matching pane
-	// PIDs to processNames). When the full-OS ps scan loses the CPU race to a
-	// busy fleet it is marked unavailable rather than discarding the
+	// ProcessesAvailable reports whether a usable OS process-table snapshot
+	// was joined on: one scan succeeded within staleTTL. tmux list-panes
+	// establishes session liveness on its own; the process snapshot is only a
+	// secondary refinement (matching pane PIDs to processNames). When no scan
+	// is usable it is marked unavailable rather than discarding the
 	// authoritative tmux liveness, and processAlive degrades optimistically.
 	ProcessesAvailable bool
 }
@@ -121,10 +171,12 @@ type runtimeStateSnapshot struct {
 // that arrives after one never joins the flight it superseded.
 type StateCache struct {
 	mu sync.RWMutex
-	// state is the published snapshot. It is copy-on-write: readers copy it
-	// under mu and then read its maps after releasing the lock (IsRunning,
-	// ProcessAlive), so once published its maps must never be mutated in
-	// place. Writers replace a map wholesale under mu instead.
+	// state is the published snapshot. It holds Sessions only: the process
+	// half lives in procs and is joined on at read time (withProcesses). It is
+	// copy-on-write: readers copy it under mu and then read its maps after
+	// releasing the lock (IsRunning, ProcessAlive), so once published its maps
+	// must never be mutated in place. Writers replace a map wholesale under mu
+	// instead.
 	state     runtimeStateSnapshot
 	fetchedAt time.Time
 	// startedAt is when the fetch that produced state began, on the cache
@@ -154,7 +206,24 @@ type StateCache struct {
 	fetcher          StateFetcher
 	// now is the cache clock. Nil selects time.Now; tests inject a fake.
 	now func() time.Time
+
+	// procs is the last good ps scan, replaced only by a scan that began
+	// later. procs.startedAt is zero until one succeeds. Like state, it is
+	// replaced wholesale, never mutated.
+	procs processSnapshot
+	// procsTried reports that a ps scan has been started at least once, so
+	// only the first ProcessAlive of the cache's life waits for one.
+	procsTried bool
+	// procsTTL is the snapshot age at which a read starts a background
+	// rescan. It equals ttl, so a dead agent is noticed at the pace it was
+	// when the scan rode along with every refresh; only the waiting moved.
+	procsTTL time.Duration
 }
+
+// processesRefreshKey is the singleflight key of the ps scan. It never equals
+// a "refresh:<generation>" key, so a slow scan never holds up a list-panes
+// refresh, and an invalidation never restarts a scan.
+const processesRefreshKey = "processes"
 
 // cacheObservation is one read of the cache after its refresh trigger ran:
 // the published snapshot plus what is known about how far to trust it.
@@ -179,18 +248,21 @@ func (o cacheObservation) primed() bool {
 }
 
 // NewStateCache creates a new cache with the given fetcher and TTL.
-// staleTTL defaults to 30s.
+// staleTTL defaults to 30s. The process snapshot is rescanned in the
+// background once it is older than ttl.
 func NewStateCache(fetcher StateFetcher, ttl time.Duration) *StateCache {
 	return &StateCache{
 		fetcher:  fetcher,
 		ttl:      ttl,
 		staleTTL: defaultStaleTTL,
+		procsTTL: ttl,
 	}
 }
 
 // IsRunning reports whether the named session exists in the cached set.
-// If the cache is stale, a refresh is triggered (coalesced via singleflight).
-// On refresh failure, the last-known-good cache is preserved up to staleTTL.
+// If the cache is stale, a list-panes refresh is triggered (coalesced via
+// singleflight). It never runs or waits on a ps scan. On refresh failure, the
+// last-known-good cache is preserved up to staleTTL.
 func (c *StateCache) IsRunning(name string) bool {
 	state := c.currentState()
 	session, ok := state.Sessions[name]
@@ -200,11 +272,94 @@ func (c *StateCache) IsRunning(name string) bool {
 // ProcessAlive reports whether the named session has a process matching one of
 // processNames according to the cached runtime snapshot. An empty processNames
 // slice preserves Provider.ProcessAlive's "no check possible" behavior.
+//
+// It answers from the last good ps scan and does not wait for a new one,
+// except on the first call of the cache's life (see currentProcesses).
 func (c *StateCache) ProcessAlive(name string, processNames []string) bool {
 	if len(processNames) == 0 {
 		return true
 	}
-	return c.currentState().processAlive(name, processNames)
+	return c.withProcesses(c.currentState(), name).processAlive(name, processNames)
+}
+
+// withProcesses returns state with the last good process snapshot joined on,
+// for answering about the session name. state is a copy, so setting its
+// fields never touches the published snapshot.
+func (c *StateCache) withProcesses(state runtimeStateSnapshot, name string) runtimeStateSnapshot {
+	if c == nil {
+		return state
+	}
+	state.Processes, state.ProcessesAvailable = c.currentProcesses(state.Sessions[name])
+	return state
+}
+
+// currentProcesses returns the last good process snapshot and whether it is
+// usable: a scan succeeded within staleTTL. It starts a background rescan when
+// the snapshot is older than procsTTL or began before one of session's panes
+// appeared, and returns without waiting for it.
+//
+// The one wait is the first call of the cache's life, which waits up to
+// fetchTimeout for the first scan, so a one-shot CLI gets a real answer
+// instead of the optimistic default. The scan keeps running past that wait
+// and lands for the next read.
+func (c *StateCache) currentProcesses(session sessionRuntimeState) (processSnapshot, bool) {
+	c.mu.RLock()
+	tried := c.procsTried
+	c.mu.RUnlock()
+	if !tried {
+		timer := time.NewTimer(fetchTimeout)
+		select {
+		case <-c.sf.DoChan(processesRefreshKey, c.fetchProcesses):
+		case <-timer.C:
+		}
+		timer.Stop()
+	}
+
+	c.mu.RLock()
+	procs := c.procs
+	c.mu.RUnlock()
+
+	now := c.clock()
+	if procs.startedAt.IsZero() || now.Sub(procs.startedAt) >= c.procsTTL || procs.predatesAnyPane(session) {
+		c.refreshProcessesInBackground()
+	}
+	// The same cliff as the session list: past staleTTL a scan is not trusted.
+	if procs.startedAt.IsZero() || now.Sub(procs.startedAt) > c.staleTTL {
+		return processSnapshot{}, false
+	}
+	return procs, true
+}
+
+// refreshProcessesInBackground starts one coalesced ps scan and returns at
+// once. DoChan's result channel is buffered, so nothing leaks when no one
+// reads it, and processFetchTimeout bounds the goroutine's life.
+func (c *StateCache) refreshProcessesInBackground() {
+	_ = c.sf.DoChan(processesRefreshKey, c.fetchProcesses)
+}
+
+// fetchProcesses runs one ps scan. On failure the last good snapshot is kept
+// and ages toward the staleTTL cliff, where ProcessAlive degrades
+// optimistically: a failed secondary probe must never report an agent dead.
+// The fetcher logs its own failures, since only it knows its backoff window.
+func (c *StateCache) fetchProcesses() (interface{}, error) {
+	c.mu.Lock()
+	c.procsTried = true
+	c.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), processFetchTimeout)
+	defer cancel()
+	start := c.clock()
+	procs, err := c.fetcher.FetchProcesses(ctx)
+	if err != nil {
+		return nil, err
+	}
+	procs.startedAt = start
+	// One key coalesces every scan, so scans never overlap and the one that
+	// just finished is always the newest.
+	c.mu.Lock()
+	c.procs = procs
+	c.mu.Unlock()
+	return nil, nil
 }
 
 // SessionAttached reports the cached attachment state for the named session.
@@ -417,8 +572,9 @@ func (c *StateCache) refresh(generation uint64) {
 		c.mu.RUnlock()
 
 		start := c.clock()
-		state, err := c.fetcher.FetchState(ctx)
-		elapsed := c.clock().Sub(start)
+		sessions, err := c.fetcher.FetchSessions(ctx)
+		seenAt := c.clock()
+		elapsed := seenAt.Sub(start)
 
 		if err != nil {
 			log.Printf("tmux state cache: refresh failed in %v: %v", elapsed, err)
@@ -476,15 +632,15 @@ func (c *StateCache) refresh(generation uint64) {
 		// superseded this one.
 		superseded := c.generation != startGeneration
 		if superseded {
-			state.Sessions = withoutEvictedSince(state.Sessions, c.evictedAt, startGeneration)
+			sessions = withoutEvictedSince(sessions, c.evictedAt, startGeneration)
 		}
 		// Successful refresh is noisy on the session loop; opt-in via env var
 		// keeps it available for diagnostics without polluting normal CLI use.
 		if verbose {
-			log.Printf("tmux state cache: refreshed %d sessions in %v (superseded=%t)", len(state.Sessions), elapsed, superseded)
+			log.Printf("tmux state cache: refreshed %d sessions in %v (superseded=%t)", len(sessions), elapsed, superseded)
 		}
 
-		c.state = state
+		c.state = runtimeStateSnapshot{Sessions: stampPaneFirstSeen(sessions, c.state.Sessions, seenAt)}
 		c.fetchedAt = c.clock()
 		c.startedAt = start
 		c.lastError = nil
@@ -523,6 +679,36 @@ func withoutEvictedSince(sessions map[string]sessionRuntimeState, evictedAt map[
 	return filtered
 }
 
+// stampPaneFirstSeen returns a copy of fetched with every pane's FirstSeen set:
+// kept from prev when the same session still has a pane with that PID, else
+// seenAt (a time after the fetch returned, so the pane surely existed by
+// then). It copies the maps and pane slices, so the published snapshot never
+// shares memory with the fetcher or with an older snapshot a reader holds.
+func stampPaneFirstSeen(fetched, prev map[string]sessionRuntimeState, seenAt time.Time) map[string]sessionRuntimeState {
+	if fetched == nil {
+		return nil
+	}
+	out := make(map[string]sessionRuntimeState, len(fetched))
+	for name, session := range fetched {
+		if len(session.Panes) > 0 {
+			panes := make([]paneRuntimeState, len(session.Panes))
+			for i, pane := range session.Panes {
+				pane.FirstSeen = seenAt
+				for _, old := range prev[name].Panes {
+					if pane.PID != "" && old.PID == pane.PID && !old.FirstSeen.IsZero() {
+						pane.FirstSeen = old.FirstSeen
+						break
+					}
+				}
+				panes[i] = pane
+			}
+			session.Panes = panes
+		}
+		out[name] = session
+	}
+	return out
+}
+
 // tmuxFetcher implements StateFetcher using a real Tmux instance.
 type tmuxFetcher struct {
 	tm *Tmux
@@ -535,11 +721,11 @@ type tmuxFetcher struct {
 // processSnapshotGate decides whether the full-OS process scan may be attempted
 // now, and records what happened when it was.
 //
-// It is a property of the fetcher rather than of the cache because the cache
-// cannot see this failure at all: FetchState degrades rather than erroring when
-// the scan fails, so refresh() books the result as a success — it stamps
-// fetchedAt, clears dirty, and has no idea the expensive half of the fetch just
-// died. Nothing above this point knows there is anything to back off from.
+// It lives in the fetcher because it is a policy about `ps` itself: the cost of
+// forking a full-OS scan into a saturated box. The cache treats a refusal like
+// any failed scan and keeps its last good snapshot, so it needs no backoff of
+// its own. Moving the scan off the reader's path did not retire the gate: a
+// background scan still burns the CPU the loaded box is short of.
 type processSnapshotGate struct {
 	mu          sync.Mutex
 	failures    int
@@ -582,12 +768,13 @@ func (g *processSnapshotGate) succeeded() bool {
 	return recovered
 }
 
-// FetchState runs one tmux pane snapshot and one process-table snapshot.
+// FetchSessions runs one tmux pane snapshot. It never runs ps: see
+// StateFetcher for why the two halves are separate.
 // Corpse-only sessions (remain-on-exit has kept only dead panes, pane_dead=1)
 // are kept with Running: false so their window activity is recorded; they
 // still contribute no liveness — they represent exited processes, not
 // running ones.
-func (f *tmuxFetcher) FetchState(ctx context.Context) (runtimeStateSnapshot, error) {
+func (f *tmuxFetcher) FetchSessions(ctx context.Context) (map[string]sessionRuntimeState, error) {
 	out, err := f.tm.runCtx(ctx, "list-panes", "-a", "-F", "#{session_name}\t#{pane_dead}\t#{pane_current_command}\t#{pane_pid}\t#{session_attached}\t#{window_activity}\t#{session_id}\t#{session_created}")
 	if err != nil {
 		if errors.Is(err, ErrNoCurrentTarget) {
@@ -602,7 +789,7 @@ func (f *tmuxFetcher) FetchState(ctx context.Context) (runtimeStateSnapshot, err
 			// permanently unprimed: a tmux subprocess and a "refresh failed"
 			// log line on EVERY IsRunning, plus a staleTTL cliff that reported
 			// the whole city not-running. See ga-jnavd.
-			return runtimeStateSnapshot{Sessions: make(map[string]sessionRuntimeState)}, nil
+			return make(map[string]sessionRuntimeState), nil
 		}
 		if isNoServerError(err) {
 			// An unreachable tmux server is an observation FAILURE, not the
@@ -620,15 +807,13 @@ func (f *tmuxFetcher) FetchState(ctx context.Context) (runtimeStateSnapshot, err
 			// isNoServerError still matches the wrapped error (it contains the
 			// original "no server running" cause), so downstream absorbers are
 			// unaffected.
-			return runtimeStateSnapshot{}, fmt.Errorf("%w: %w", runtime.ErrRuntimeUnavailable, err)
+			return nil, fmt.Errorf("%w: %w", runtime.ErrRuntimeUnavailable, err)
 		}
-		return runtimeStateSnapshot{}, err
+		return nil, err
 	}
-	state := runtimeStateSnapshot{
-		Sessions: make(map[string]sessionRuntimeState),
-	}
+	sessions := make(map[string]sessionRuntimeState)
 	if out == "" {
-		return state, nil
+		return sessions, nil
 	}
 
 	for _, line := range strings.Split(out, "\n") {
@@ -637,7 +822,7 @@ func (f *tmuxFetcher) FetchState(ctx context.Context) (runtimeStateSnapshot, err
 			continue
 		}
 		name := parts[0]
-		session := state.Sessions[name]
+		session := sessions[name]
 		// Attachment and activity are read from EVERY pane row, dead panes
 		// included. A remain-on-exit corpse window is still a window, and the
 		// per-session `list-windows -t <s> -F '#{window_activity}'` read this
@@ -668,7 +853,7 @@ func (f *tmuxFetcher) FetchState(ctx context.Context) (runtimeStateSnapshot, err
 		if parts[1] == "1" {
 			// A dead pane contributes no liveness: Running stays as-is so a
 			// session whose panes are all corpses is still reported not-running.
-			state.Sessions[name] = session
+			sessions[name] = session
 			continue
 		}
 		var pane paneRuntimeState
@@ -682,37 +867,37 @@ func (f *tmuxFetcher) FetchState(ctx context.Context) (runtimeStateSnapshot, err
 		if pane.Command != "" || pane.PID != "" {
 			session.Panes = append(session.Panes, pane)
 		}
-		state.Sessions[name] = session
+		sessions[name] = session
 	}
-	// Skipping is the same outcome as failing — process detail unavailable,
-	// sessions retained — reached without spending fetchTimeout and a full-OS
-	// scan to rediscover it. Silent by design: the whole point is to stop
-	// paying per refresh, and a line per skip would simply move the cost from
-	// CPU to the log.
+	return sessions, nil
+}
+
+// errProcessScanBackingOff is FetchProcesses refusing to scan inside its
+// backoff window. The cache keeps its last good snapshot, as for any failure.
+var errProcessScanBackingOff = errors.New("process snapshot backing off after a failed scan")
+
+// FetchProcesses runs one full-OS process-table snapshot, unless the backoff
+// gate holds it off.
+func (f *tmuxFetcher) FetchProcesses(ctx context.Context) (processSnapshot, error) {
+	// Skipping is silent by design: the whole point is to stop paying per
+	// rescan, and a line per skip would simply move the cost from CPU to the
+	// log.
 	if !f.snapshotGate.allow(time.Now()) {
-		state.ProcessesAvailable = false
-		return state, nil
+		return processSnapshot{}, errProcessScanBackingOff
 	}
 	processes, err := fetchProcessSnapshot(ctx)
 	if err != nil {
-		// Degrade, do NOT discard: tmux list-panes above already established
-		// session liveness. The process snapshot is a secondary refinement
-		// (matching pane PIDs to processNames). A full-OS ps scan that loses the
-		// CPU race to a busy/KO fleet must never throw away authoritative tmux
-		// liveness — that is what was starving the controller's reconcile and
-		// cold-pool-spawner. Keep the sessions; mark process detail unavailable
-		// so processAlive degrades optimistically instead of reporting dead.
+		// The cache keeps its last good snapshot (up to staleTTL), and tmux
+		// list-panes alone still decides session liveness. A failed secondary
+		// probe must never throw that away or report an agent dead.
 		window := f.snapshotGate.failed(time.Now())
-		log.Printf("tmux state cache: process snapshot degraded, retaining tmux session liveness (next attempt in %v): %v", window, err)
-		state.ProcessesAvailable = false
-		return state, nil
+		log.Printf("tmux state cache: process snapshot degraded, keeping the last good one (next attempt in %v): %v", window, err)
+		return processSnapshot{}, err
 	}
 	if f.snapshotGate.succeeded() {
 		log.Printf("tmux state cache: process snapshot recovered")
 	}
-	state.Processes = processes
-	state.ProcessesAvailable = true
-	return state, nil
+	return processes, nil
 }
 
 func (s runtimeStateSnapshot) processAlive(sessionName string, processNames []string) bool {
@@ -745,6 +930,13 @@ func (p paneRuntimeState) processAlive(names map[string]struct{}, processes proc
 	}
 	if p.PID == "" {
 		return false
+	}
+	if processes.predates(p) {
+		// The ps scan began before this pane appeared (a new session, or a
+		// respawned pane), so it cannot know the pane's processes. Degrade
+		// optimistically, like a failed scan. A newer scan is already on its
+		// way: currentProcesses started one when it saw this.
+		return true
 	}
 	if isSupportedShell(p.Command) {
 		return processes.hasDescendantWithNames(p.PID, names, 0)

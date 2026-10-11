@@ -11,7 +11,7 @@ import (
 	"github.com/gastownhall/gascity/internal/runtime"
 )
 
-// errFetchNoServer is the refresh error FetchState returns for an unreachable
+// errFetchNoServer is the refresh error FetchSessions returns for an unreachable
 // tmux server.
 var errFetchNoServer = fmt.Errorf("%w: %w", runtime.ErrRuntimeUnavailable, ErrNoServer)
 
