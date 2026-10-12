@@ -4,6 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -95,6 +98,9 @@ func TestLastRunUsesRowsFromPartialTierError(t *testing.T) {
 	}
 }
 
+// fallbackSince is a since bound older than every event these tests record.
+var fallbackSince = time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)
+
 func TestLastRunFuncWithEventFallback_UsesStoreResult(t *testing.T) {
 	want := time.Date(2026, 6, 9, 0, 23, 0, 0, time.UTC)
 	storeFn := func(string) (time.Time, error) { return want, nil }
@@ -106,7 +112,7 @@ func TestLastRunFuncWithEventFallback_UsesStoreResult(t *testing.T) {
 		Ts:      want.Add(time.Hour),
 	})
 
-	got, err := LastRunFuncWithEventFallback(storeFn, ep)("digest-generate")
+	got, err := LastRunFuncWithEventFallback(storeFn, ep, fallbackSince)("digest-generate")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -125,7 +131,7 @@ func TestLastRunFuncWithEventFallback_FallsBackToEvents(t *testing.T) {
 		Ts:      want,
 	})
 
-	got, err := LastRunFuncWithEventFallback(storeFn, ep)("digest-generate")
+	got, err := LastRunFuncWithEventFallback(storeFn, ep, fallbackSince)("digest-generate")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -142,7 +148,7 @@ func TestLastRunFuncWithEventFallback_FallsBackToLatestEvent(t *testing.T) {
 	ep.Record(events.Event{Type: events.OrderFired, Subject: "digest-generate", Ts: older})
 	ep.Record(events.Event{Type: events.OrderFired, Subject: "digest-generate", Ts: newer})
 
-	got, err := LastRunFuncWithEventFallback(storeFn, ep)("digest-generate")
+	got, err := LastRunFuncWithEventFallback(storeFn, ep, fallbackSince)("digest-generate")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -160,7 +166,7 @@ func TestLastRunFuncWithEventFallback_IgnoresOtherOrderEvents(t *testing.T) {
 		Ts:      time.Date(2026, 6, 9, 0, 23, 0, 0, time.UTC),
 	})
 
-	got, err := LastRunFuncWithEventFallback(storeFn, ep)("digest-generate")
+	got, err := LastRunFuncWithEventFallback(storeFn, ep, fallbackSince)("digest-generate")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -173,7 +179,7 @@ func TestLastRunFuncWithEventFallback_NilProviderReturnsStoreResult(t *testing.T
 	want := time.Date(2026, 6, 9, 0, 23, 0, 0, time.UTC)
 	storeFn := func(string) (time.Time, error) { return want, nil }
 
-	got, err := LastRunFuncWithEventFallback(storeFn, nil)("digest-generate")
+	got, err := LastRunFuncWithEventFallback(storeFn, nil, fallbackSince)("digest-generate")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -185,7 +191,7 @@ func TestLastRunFuncWithEventFallback_NilProviderReturnsStoreResult(t *testing.T
 func TestLastRunFuncWithEventFallback_NilProviderZeroStore(t *testing.T) {
 	storeFn := func(string) (time.Time, error) { return time.Time{}, nil }
 
-	got, err := LastRunFuncWithEventFallback(storeFn, nil)("digest-generate")
+	got, err := LastRunFuncWithEventFallback(storeFn, nil, fallbackSince)("digest-generate")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -199,7 +205,7 @@ func TestLastRunFuncWithEventFallback_StoreErrorPropagated(t *testing.T) {
 	storeFn := func(string) (time.Time, error) { return time.Time{}, wantErr }
 	ep := events.NewFake()
 
-	_, err := LastRunFuncWithEventFallback(storeFn, ep)("digest-generate")
+	_, err := LastRunFuncWithEventFallback(storeFn, ep, fallbackSince)("digest-generate")
 	if !errors.Is(err, wantErr) {
 		t.Fatalf("got err %v, want %v", err, wantErr)
 	}
@@ -209,7 +215,7 @@ func TestLastRunFuncWithEventFallback_EventErrorFailsOpen(t *testing.T) {
 	storeFn := func(string) (time.Time, error) { return time.Time{}, nil }
 	ep := events.NewFailFake()
 
-	got, err := LastRunFuncWithEventFallback(storeFn, ep)("digest-generate")
+	got, err := LastRunFuncWithEventFallback(storeFn, ep, fallbackSince)("digest-generate")
 	if err != nil {
 		t.Fatalf("expected nil error (fail-open), got: %v", err)
 	}
@@ -299,5 +305,94 @@ func TestLastRunAndCursorKeepAHardBackingErrorThroughACache(t *testing.T) {
 	}
 	if got := store.Cursor("digest"); got != 0 {
 		t.Fatalf("Cursor() = %d, want 0 (unread); a hard backing error was answered from the cache's open rows", got)
+	}
+}
+
+// An order.fired event older than since reads as never run: the window is the
+// whole point of the bound (vn-ngdqasv).
+func TestLastRunFuncWithEventFallback_IgnoresEventsBeforeSince(t *testing.T) {
+	storeFn := func(string) (time.Time, error) { return time.Time{}, nil }
+	ep := events.NewFake()
+	since := time.Date(2026, 6, 9, 0, 0, 0, 0, time.UTC)
+	ep.Record(events.Event{Type: events.OrderFired, Subject: "digest-generate", Ts: since.Add(-time.Minute)})
+
+	got, err := LastRunFuncWithEventFallback(storeFn, ep, since)("digest-generate")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !got.IsZero() {
+		t.Fatalf("got %s, want zero (the only event is older than since)", got)
+	}
+
+	inWindow := since.Add(time.Minute)
+	ep.Record(events.Event{Type: events.OrderFired, Subject: "digest-generate", Ts: inWindow})
+	got, err = LastRunFuncWithEventFallback(storeFn, ep, since)("digest-generate")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !got.Equal(inWindow) {
+		t.Fatalf("got %s, want the in-window event %s", got, inWindow)
+	}
+}
+
+// The bound must keep the real file reader out of archives rotated before
+// since. The old archive here is not gzip at all, so opening it fails the
+// whole List, and the fallback would fail open to zero instead of finding the
+// run in the active log. That is how the order with no run on record
+// gunzipped all 1.3 GB of the town's archives on 2026-10-12 (vn-ngdqasv).
+func TestLastRunFuncWithEventFallback_NeverOpensArchivesBeforeSince(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "events.jsonl")
+	now := time.Now().UTC()
+	lastRun := now.Add(-time.Hour).Truncate(time.Second)
+
+	oldArchive := filepath.Join(dir, "events.jsonl.archive-"+now.Add(-30*24*time.Hour).Format("20060102T150405Z")+"-seq-1-5.gz")
+	if err := os.WriteFile(oldArchive, []byte("not gzip"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	line := fmt.Sprintf(`{"seq":6,"type":%q,"ts":%q,"actor":"controller","subject":"digest-generate"}`+"\n",
+		events.OrderFired, lastRun.Format(time.RFC3339Nano))
+	if err := os.WriteFile(logPath, []byte(line), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ep := events.NewReadOnlyFileProvider(logPath, io.Discard)
+	storeFn := func(string) (time.Time, error) { return time.Time{}, nil }
+
+	order := Order{Name: "digest-generate", Trigger: "cooldown", Interval: "1h"}
+	got, err := LastRunFuncWithEventFallback(storeFn, ep, now.Add(-order.LastRunEventWindow()))("digest-generate")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !got.Equal(lastRun) {
+		t.Fatalf("got %s, want the active-log run %s (the 30-day-old archive must not be opened)", got, lastRun)
+	}
+
+	// The same read with no bound opens the bad archive and fails open. This
+	// proves the fixture really is unreadable, so the pass above is the bound.
+	got, err = LastRunFuncWithEventFallback(storeFn, ep, time.Time{})("digest-generate")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !got.IsZero() {
+		t.Fatalf("unbounded read got %s, want zero (the bad archive should have failed the list)", got)
+	}
+}
+
+func TestOrderLastRunEventWindow(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		order Order
+		want  time.Duration
+	}{
+		{"cron gets the floor", Order{Trigger: "cron", Schedule: "0 8 * * *"}, lastRunEventWindowFloor},
+		{"short cooldown gets the floor", Order{Trigger: "cooldown", Interval: "5m"}, lastRunEventWindowFloor},
+		{"cooldown longer than the floor gets its interval", Order{Trigger: "cooldown", Interval: "720h"}, 720 * time.Hour},
+		{"bad interval gets the floor", Order{Trigger: "cooldown", Interval: "soon"}, lastRunEventWindowFloor},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.order.LastRunEventWindow(); got != tc.want {
+				t.Fatalf("LastRunEventWindow() = %s, want %s", got, tc.want)
+			}
+		})
 	}
 }

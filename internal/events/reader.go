@@ -91,6 +91,31 @@ func limitReached(count int, filter Filter) bool {
 	return filter.Limit > 0 && count >= filter.Limit
 }
 
+// subjectNeedle returns bytes that every line whose Subject equals
+// filter.Subject must hold: the subject in its JSON quotes. A scan skips the
+// JSON decode of a line without it, which is most of the cost of a
+// subject-filtered read (the order.fired last-run fallback, vn-ngdqasv).
+//
+// It returns nil, meaning "decode every line", when there is no subject or the
+// subject has a byte some JSON writer might escape. Only letters, digits and
+// - _ . : @ are trusted to appear verbatim. Go escapes < > & and a foreign
+// writer may escape /, so those always decode.
+func subjectNeedle(filter Filter) []byte {
+	if filter.Subject == "" {
+		return nil
+	}
+	for i := 0; i < len(filter.Subject); i++ {
+		c := filter.Subject[i]
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
+		case c == '-', c == '_', c == '.', c == ':', c == '@':
+		default:
+			return nil
+		}
+	}
+	return []byte(`"` + filter.Subject + `"`)
+}
+
 // ReadAll reads all events from the JSONL file at path, transparently
 // walking sibling archives produced by rotation. Archives are read in
 // seq order before the active file, yielding a single chronological
@@ -275,9 +300,13 @@ func readFilteredTracked(path string, filter Filter) ([]Event, map[eventSeqWindo
 		return result, listed, fmt.Errorf("seeking events: %w", err)
 	}
 
+	needle := subjectNeedle(filter)
 	scanner := bufio.NewScanner(f)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024) // handle lines up to 1MB
 	for scanner.Scan() {
+		if needle != nil && !bytes.Contains(scanner.Bytes(), needle) {
+			continue // cannot match the subject; skip the decode
+		}
 		var e Event
 		if err := json.Unmarshal(scanner.Bytes(), &e); err != nil {
 			continue // skip malformed lines
@@ -467,7 +496,8 @@ func archiveSeq(line []byte) (uint64, bool) {
 // abort iteration early. Returns nil if iteration completed cleanly
 // or fn requested abort; errors from gzip / scanner are wrapped.
 //
-// Records outside filter's seq window are skipped before json.Unmarshal.
+// Records outside filter's seq window, and records that cannot hold
+// filter.Subject (subjectNeedle), are skipped before json.Unmarshal.
 // archiveOverlapsFilter only rules out an archive that ENDS at or below
 // AfterSeq, so an order whose cursor sits INSIDE the archive's window still
 // opens it — and without this skip every such read decoded the entire archive
@@ -489,10 +519,14 @@ func streamArchive(path string, filter Filter, fn func(Event) bool) error {
 	}
 	defer gr.Close() //nolint:errcheck // read-only stream
 
+	needle := subjectNeedle(filter)
 	scanner := bufio.NewScanner(gr)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	for scanner.Scan() {
 		line := scanner.Bytes()
+		if needle != nil && !bytes.Contains(line, needle) {
+			continue
+		}
 		if seq, ok := archiveSeq(line); ok {
 			if filter.AfterSeq > 0 && seq <= filter.AfterSeq {
 				continue

@@ -1385,7 +1385,8 @@ func (m *memoryOrderDispatcher) dueCandidate(ctx context.Context, cand *orderDis
 	scoped := cand.scoped
 
 	baseLastRunFn := trackingIndex.lastRunFunc(storesForGate, storeKeysForGate,
-		orders.LastRunFuncWithEventFallback(orders.LastRunAcross(orderFrontDoorsForStores(storesForGate)), m.ep))
+		orders.LastRunFuncWithEventFallback(orders.LastRunAcross(orderFrontDoorsForStores(storesForGate)), m.ep,
+			now.Add(-a.LastRunEventWindow())))
 	var lastRunErr error
 	var lastRunFromCache bool
 	lastRunFn := func(orderName string) (time.Time, error) {

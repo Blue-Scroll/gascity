@@ -33,15 +33,49 @@ func LastRunAcross(stores []*Store) LastRunFunc {
 	}
 }
 
+// lastRunEventWindowFloor is the shortest look-back LastRunEventWindow hands
+// the order.fired fallback. A week plus a day covers every daily and weekly
+// cron slot. On the town Mac it is the active log plus two or three archives,
+// out of the 43 (1.3 GB of gzip) retention keeps.
+const lastRunEventWindowFloor = 8 * 24 * time.Hour
+
+// LastRunEventWindow is how far back the order.fired fallback
+// (LastRunFuncWithEventFallback) looks for this order's last run. A run older
+// than the window reads as "never run", which gives the same verdict:
+//
+//   - cooldown: the window is at least the interval, and a run older than the
+//     interval is due exactly like a run that never happened.
+//   - cron: a never-run order catches up over the last 25h (checkCron), so a
+//     daily or weekly schedule fires the same either way. The one difference:
+//     a schedule slower than the window whose tracking bead was pruned AND
+//     that missed a slot older than 25h skips that one catch-up.
+//
+// Without a window, an order with no order.fired on record (one a hot reload
+// just added) gunzipped and decoded every retained archive. At load 90 that
+// stalled order dispatch for 1h50m on 2026-10-12 (vn-ngdqasv).
+func (a Order) LastRunEventWindow() time.Duration {
+	window := lastRunEventWindowFloor
+	if a.Trigger == "cooldown" {
+		if interval, err := time.ParseDuration(a.Interval); err == nil && interval > window {
+			window = interval
+		}
+	}
+	return window
+}
+
 // LastRunFuncWithEventFallback wraps fn with an events.Provider fallback.
 // When fn returns a zero time (no tracking beads found — e.g. after a
 // wisp-compact prune), it queries the event bus for the most recent
-// order.fired event whose Subject matches the order's scoped name and
-// returns its timestamp. A nil ep disables the fallback and the wrapped
-// fn's result is returned unchanged. Event bus errors are non-fatal:
-// when the provider fails the zero time is returned so the order appears
-// unrun rather than permanently blocked.
-func LastRunFuncWithEventFallback(fn LastRunFunc, ep events.Provider) LastRunFunc {
+// order.fired event at or after since whose Subject matches the order's
+// scoped name and returns its timestamp. A nil ep disables the fallback and
+// the wrapped fn's result is returned unchanged. Event bus errors are
+// non-fatal: when the provider fails the zero time is returned so the order
+// appears unrun rather than permanently blocked.
+//
+// since bounds the read: archives rotated before it are never opened. Pass
+// now minus the order's LastRunEventWindow. A zero since reads the whole
+// retained history, which is the 2026-10-12 stall (vn-ngdqasv).
+func LastRunFuncWithEventFallback(fn LastRunFunc, ep events.Provider, since time.Time) LastRunFunc {
 	if ep == nil {
 		return fn
 	}
@@ -56,6 +90,7 @@ func LastRunFuncWithEventFallback(fn LastRunFunc, ep events.Provider) LastRunFun
 		evts, listErr := ep.List(events.Filter{
 			Type:    events.OrderFired,
 			Subject: name,
+			Since:   since,
 		})
 		if listErr != nil {
 			return time.Time{}, nil
