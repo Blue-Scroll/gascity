@@ -1662,6 +1662,78 @@ func TestOrderDispatchCooldownDispatchesWhenEventFallbackIsStale(t *testing.T) {
 	}
 }
 
+// orderFiredSinceRecorder records the Since bound of every order.fired read,
+// by subject, so a test can prove the last-run fallback asked for a window.
+type orderFiredSinceRecorder struct {
+	*events.Fake
+
+	mu    sync.Mutex
+	since map[string]time.Time
+}
+
+func (p *orderFiredSinceRecorder) List(filter events.Filter) ([]events.Event, error) {
+	if filter.Type == events.OrderFired {
+		p.mu.Lock()
+		p.since[filter.Subject] = filter.Since
+		p.mu.Unlock()
+	}
+	return p.Fake.List(filter)
+}
+
+// TestOrderDispatchFiresANeverRunOrderAddedByAHotReload is the 2026-10-12
+// outage (vn-ngdqasv). A hot reload added two orders with no run on record.
+// Their last-run fallback read every event archive, oldest first, inside the
+// dispatch tick, and no order fired for 1h50m. The new order must fire on the
+// first tick after the reload, and its fallback read must carry a since bound
+// so the file reader never opens an archive older than the order's window.
+func TestOrderDispatchFiresANeverRunOrderAddedByAHotReload(t *testing.T) {
+	store := beads.NewMemStore()
+	ep := &orderFiredSinceRecorder{Fake: events.NewFake(), since: map[string]time.Time{}}
+	cr := &CityRuntime{}
+
+	existing := cooldownEventFallbackOrders()
+	before := buildOrderDispatcherFromList(existing, store, ep)
+	if before == nil {
+		t.Fatal("expected non-nil dispatcher")
+	}
+	cr.replaceOrderDispatcher(before)
+	now := time.Now()
+	cr.od.dispatch(context.Background(), t.TempDir(), now)
+	cr.od.drain(context.Background())
+	firedBefore := len(trackingBeads(t, store, "order-run:test-order"))
+	if firedBefore == 0 {
+		t.Fatal("existing order did not fire on the first tick; the rest of this test would prove nothing")
+	}
+
+	added := existing[0]
+	added.Name = "marketing-events"
+	added.Interval = "1h"
+	after := buildOrderDispatcherFromList(append(existing, added), store, ep)
+	if after == nil {
+		t.Fatal("expected non-nil dispatcher after reload")
+	}
+	cr.replaceOrderDispatcher(after)
+	tick := now.Add(time.Minute)
+	cr.od.dispatch(context.Background(), t.TempDir(), tick)
+	cr.od.drain(context.Background())
+
+	if got := trackingBeads(t, store, "order-run:marketing-events"); len(got) == 0 {
+		t.Fatal("order added by the reload did not fire on the next tick")
+	}
+	if got := trackingBeads(t, store, "order-run:test-order"); len(got) != firedBefore {
+		t.Fatalf("existing order: %d tracking bead(s), want %d (its 24h cooldown holds across the reload)", len(got), firedBefore)
+	}
+	ep.mu.Lock()
+	since, read := ep.since["marketing-events"]
+	ep.mu.Unlock()
+	if !read {
+		t.Fatal("the new order never reached the order.fired fallback; this test no longer covers the read")
+	}
+	if want := tick.Add(-added.LastRunEventWindow()); !since.Equal(want) {
+		t.Fatalf("fallback read since %v, want %v (now minus the order's window); a zero since reads every archive", since, want)
+	}
+}
+
 type strictOpenWorkListCountingStore struct {
 	beads.Store
 
