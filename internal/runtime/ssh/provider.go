@@ -94,11 +94,89 @@ func (p *Provider) Exec(ctx context.Context, name string, argv []string) ([]byte
 	return p.conn.Exec(ctx, name, argv)
 }
 
-// carrier drives the named session's tmux over the connection. The in-box tmux
-// target is the session, exactly (one host, many named sessions; see
-// [paneTarget]).
-func (p *Provider) carrier(name string) runtime.Carrier {
-	return runtime.NewTmuxCarrier(p.conn, paneTarget(name))
+// carrier drives the session's agent pane over the connection, resolved once
+// for the operation (see [Provider.agentPane]): one host runs many named
+// sessions, and a session's active pane may be a human's split or window.
+func (p *Provider) carrier(ctx context.Context, name string) (runtime.Carrier, error) {
+	target, err := p.agentPane(ctx, name, false)
+	if err != nil {
+		return nil, err
+	}
+	return runtime.NewTmuxCarrier(p.conn, target), nil
+}
+
+// agentPane resolves a (checked) session's agent pane in one remote list-panes
+// call over all its windows, classified as the local tmux provider does
+// ([runtime.PickTmuxAgentPaneRow]): the pane carrying the session-scoped
+// marker Start sets, else (a session created before the marker) the first
+// pane of the first window. A marked session whose agent pane is gone, or
+// with two, fails closed. The pane is returned fenced to its session and
+// window ("=name:@W.%P"), so a stale id cannot name another pane.
+//
+// With adopt, a session with exactly one pane, unmarked, is marked first
+// (Relaunch on a warm box from before the marker): that pane can only be the
+// agent's. The same call serves both.
+func (p *Provider) agentPane(ctx context.Context, name string, adopt bool) (string, error) {
+	out, code, err := p.tmux(ctx, name, "list-panes", "-s", "-t", paneTarget(name), "-F", agentPaneRowFormat)
+	if err != nil {
+		return "", err
+	}
+	if code != 0 {
+		return "", fmt.Errorf("%w: ssh session %q", runtime.ErrSessionNotFound, name)
+	}
+	out = tabSeparateRows(strings.TrimSpace(out))
+	if rows := strings.Split(out, "\n"); adopt && len(rows) == 1 {
+		if mark, fields, _ := strings.Cut(rows[0], "\t"); mark == "pane" {
+			if _, id, ok := strings.Cut(fields, "."); ok {
+				p.markAgentPane(ctx, name, id)
+			}
+		}
+	}
+	pane, err := runtime.PickTmuxAgentPaneRow(out)
+	if err != nil {
+		return "", fmt.Errorf("ssh session %q: %w", name, err)
+	}
+	pane = strings.TrimSpace(pane)
+	if !strings.HasPrefix(pane, "@") || !strings.Contains(pane, ".%") {
+		return "", fmt.Errorf("ssh session %q: no panes found (got %q)", name, out)
+	}
+	return paneTarget(name) + pane, nil
+}
+
+// agentPaneRowFormat is the agent-pane list-panes row: "<mark> @W.%P". The
+// separator is a space, not the tab the local provider uses: tmux run
+// without -u in a non-UTF-8 locale (an ssh session, a CI sandbox with no
+// LANG) prints control characters in format output as "_", so a tab would
+// arrive as "agent_@0.%0". Neither field can contain a space.
+const agentPaneRowFormat = runtime.TmuxAgentPaneMarkerFormat + " #{window_id}.#{pane_id}"
+
+// tabSeparateRows turns agentPaneRowFormat rows into the "<mark>\t<fields>"
+// rows [runtime.PickTmuxAgentPaneRow] classifies.
+func tabSeparateRows(out string) string {
+	rows := strings.Split(out, "\n")
+	for i, row := range rows {
+		rows[i] = strings.Replace(strings.TrimSpace(row), " ", "\t", 1)
+	}
+	return strings.Join(rows, "\n")
+}
+
+// markAgentPane marks pane (the id new-session printed) as the session's agent
+// pane, valued with the session's id, then flags the session as marked; the
+// flag follows a successful mark only, since a flagged session with no marked
+// pane fails closed. Best-effort and logged: an unmarked session falls back to
+// its first pane, and Relaunch adopts a lone unmarked pane (agentPane).
+func (p *Provider) markAgentPane(ctx context.Context, name, pane string) {
+	pane = strings.TrimSpace(pane)
+	if !strings.HasPrefix(pane, "%") {
+		pane = paneTarget(name)
+	}
+	if _, code, err := p.tmux(ctx, name, "set-option", "-p", "-F", "-t", pane, runtime.TmuxAgentPaneOption, "#{session_id}"); err != nil || code != 0 {
+		log.Printf("ssh session %q: marking agent pane %s failed (exit %d): %v", name, pane, code, err)
+		return
+	}
+	if _, code, err := p.tmux(ctx, name, "set-option", "-t", paneTarget(name), runtime.TmuxAgentSessionOption, "1"); err != nil || code != 0 {
+		log.Printf("ssh session %q: flagging marked session failed (exit %d): %v", name, code, err)
+	}
 }
 
 // tmux runs a tmux subcommand over the connection and returns trimmed stdout,
@@ -145,7 +223,7 @@ func (p *Provider) Start(ctx context.Context, name string, cfg runtime.Config) e
 		return fmt.Errorf("%w: ssh session %q", runtime.ErrSessionExists, name)
 	}
 
-	args := []string{"new-session", "-d", "-s", name}
+	args := []string{"new-session", "-d", "-P", "-F", "#{pane_id}", "-s", name}
 	if cfg.WorkDir != "" {
 		args = append(args, "-c", cfg.WorkDir)
 	}
@@ -211,7 +289,8 @@ func (p *Provider) Start(ctx context.Context, name string, cfg runtime.Config) e
 		}
 	}
 
-	if _, code, err := p.launchSession(ctx, name, args, staged); err != nil {
+	pane, code, err := p.launchSession(ctx, name, args, staged)
+	if err != nil {
 		return fmt.Errorf("ssh start %q: %w", name, err)
 	} else if code != 0 {
 		// Tighten the sentinel under the precheck TOCTOU: if the session now
@@ -221,6 +300,7 @@ func (p *Provider) Start(ctx context.Context, name string, cfg runtime.Config) e
 		}
 		return fmt.Errorf("ssh start %q: tmux new-session exited %d", name, code)
 	}
+	p.markAgentPane(ctx, name, pane)
 
 	// SessionSetup, SessionSetupScript, and SessionLive run on the box,
 	// best-effort, with the same cwd + env prelude.
@@ -282,7 +362,8 @@ func (p *Provider) runPostLaunchSetup(ctx context.Context, name string, cfg runt
 }
 
 // Relaunch re-launches the agent inside the existing remote tmux session without
-// re-provisioning: it respawns the session's pane (respawn-pane -k) with the
+// re-provisioning: it respawns the session's agent pane (respawn-pane -k on
+// [Provider.agentPane], never the active pane) with the
 // (possibly changed) command, then re-runs the post-launch setup tail and the
 // liveness recheck. The box (remote host) and its tmux session must already
 // exist — a missing session is a [runtime.ErrSessionNotFound], NOT a silent
@@ -318,7 +399,15 @@ func (p *Provider) Relaunch(ctx context.Context, name string, cfg runtime.Config
 
 	prelude := setupPrelude(cfg, name, staged.envPath)
 
-	args := []string{"respawn-pane", "-k", "-t", paneTarget(name)}
+	// Respawn the agent pane, never the active one: a human who split the
+	// session or opened a window would otherwise have that pane killed and the
+	// old agent left running. A warm box from before the marker is marked first
+	// while it still has only the agent's pane.
+	target, err := p.agentPane(ctx, name, true)
+	if err != nil {
+		return fmt.Errorf("ssh relaunch %q: %w", name, err)
+	}
+	args := []string{"respawn-pane", "-k", "-t", target}
 	if cfg.WorkDir != "" {
 		args = append(args, "-c", cfg.WorkDir)
 	}
@@ -410,8 +499,9 @@ func (p *Provider) Attach(name string) error {
 	return cmd.Run()
 }
 
-// ProcessAlive reports whether one of processNames runs in the session: in a
-// pane's process or anything beneath it, judged as the local tmux provider
+// ProcessAlive reports whether one of processNames runs in the session's agent
+// pane (every pane, in a session from before the marker): in the pane's
+// process or anything beneath it, judged as the local tmux provider
 // judges its panes (by command, argv[0], or an interpreter's script; see
 // [proctable.ProcessMatchesNameSet]). It is scoped to this session's panes: a
 // box-wide match would read a dead session alive whenever another session on
@@ -454,9 +544,9 @@ func (p *Provider) ProcessAlive(name string, processNames []string) bool {
 // (processTreeAwk), so only those rows cross the connection, not the whole
 // table of a busy box.
 func processAliveScript(name string) string {
-	return "panes=$(tmux list-panes -s -t " + shellQuote([]string{paneTarget(name)}) + " -F '#{pane_pid}') || exit 3\n" +
+	return "panes=$(tmux list-panes -s -t " + shellQuote([]string{paneTarget(name)}) + " -F " + shellQuote([]string{runtime.TmuxAgentPaneMarkerFormat + " #{pane_pid}"}) + ") || exit 3\n" +
 		"echo \"$panes\"\n" +
-		"roots=$(echo $panes)\n" +
+		"roots=$(echo \"$panes\" | awk '{print $2}')\n" +
 		"echo " + processSectionComm + "\n" +
 		"ps -A -o pid= -o ppid= -o comm= | awk -v roots=\"$roots\" " + shellQuote([]string{processTreeAwk}) + "\n" +
 		"echo " + processSectionArgs + "\n" +
@@ -490,7 +580,13 @@ const (
 // failed or printed nothing), which reads alive.
 func paneTreeRunsNames(out string, names map[string]struct{}) (alive, degraded bool) {
 	type proc struct{ ppid, comm, args string }
-	var roots []string
+	// Pane rows are "<agent|orphan|pane> <pid>". A marked session is judged
+	// by its agent pane only, so a human running the agent's CLI in a split
+	// cannot make a dead agent read alive; with its agent pane gone it reads
+	// dead. An unmarked session (from before the marker) is judged by every
+	// pane. Two agent panes (ambiguous) are both judged.
+	var agents, all []string
+	marked := false
 	procs := map[string]*proc{}
 	children := map[string][]string{}
 	section := ""
@@ -503,7 +599,18 @@ func paneTreeRunsNames(out string, names map[string]struct{}) (alive, degraded b
 			section = line
 			continue
 		case section == "":
-			roots = append(roots, line)
+			mark, pid, ok := strings.Cut(line, " ")
+			if !ok {
+				continue
+			}
+			all = append(all, pid)
+			switch mark {
+			case runtime.TmuxAgentPaneMarked:
+				agents = append(agents, pid)
+				marked = true
+			case runtime.TmuxAgentPaneOrphan:
+				marked = true
+			}
 			continue
 		}
 		fields := strings.Fields(line)
@@ -524,8 +631,15 @@ func paneTreeRunsNames(out string, names map[string]struct{}) (alive, degraded b
 			pr.args = rest
 		}
 	}
-	if len(roots) == 0 {
+	if len(all) == 0 {
 		return false, false // no panes: the session is gone
+	}
+	roots := all
+	if marked {
+		roots = agents
+	}
+	if len(roots) == 0 {
+		return false, false // a marked session whose agent pane is gone
 	}
 	if len(procs) == 0 {
 		return true, true // the panes exist but the process table is unreadable
@@ -560,7 +674,10 @@ func (p *Provider) Nudge(name string, content []runtime.ContentBlock) error {
 	if checkName(name) != nil {
 		return nil // best-effort; never reaches tmux
 	}
-	_ = p.carrier(name).Nudge(context.Background(), name, content)
+	ctx := context.Background()
+	if c, err := p.carrier(ctx, name); err == nil {
+		_ = c.Nudge(ctx, name, content)
+	}
 	return nil
 }
 
@@ -569,7 +686,10 @@ func (p *Provider) SendKeys(name string, keys ...string) error {
 	if checkName(name) != nil {
 		return nil // best-effort; never reaches tmux
 	}
-	_ = p.carrier(name).SendKeys(context.Background(), name, keys...)
+	ctx := context.Background()
+	if c, err := p.carrier(ctx, name); err == nil {
+		_ = c.SendKeys(ctx, name, keys...)
+	}
 	return nil
 }
 
@@ -578,7 +698,12 @@ func (p *Provider) Peek(name string, lines int) (string, error) {
 	if checkName(name) != nil {
 		return "", nil
 	}
-	out, _ := p.carrier(name).Peek(context.Background(), name, lines)
+	ctx := context.Background()
+	c, err := p.carrier(ctx, name)
+	if err != nil {
+		return "", nil
+	}
+	out, _ := c.Peek(ctx, name, lines)
 	return out, nil
 }
 
@@ -587,7 +712,10 @@ func (p *Provider) Interrupt(name string) error {
 	if checkName(name) != nil {
 		return nil // best-effort; never reaches tmux
 	}
-	_ = p.carrier(name).Interrupt(context.Background(), name)
+	ctx := context.Background()
+	if c, err := p.carrier(ctx, name); err == nil {
+		_ = c.Interrupt(ctx, name)
+	}
 	return nil
 }
 
@@ -596,7 +724,10 @@ func (p *Provider) ClearScrollback(name string) error {
 	if checkName(name) != nil {
 		return nil // best-effort; never reaches tmux
 	}
-	_ = p.carrier(name).ClearScrollback(context.Background(), name)
+	ctx := context.Background()
+	if c, err := p.carrier(ctx, name); err == nil {
+		_ = c.ClearScrollback(ctx, name)
+	}
 	return nil
 }
 
