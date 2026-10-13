@@ -140,21 +140,11 @@ func (m *Manager) submit(ctx context.Context, by Actor, id, message, resumeComma
 					return err
 				}
 			}
-			return m.interruptAndSubmitLocked(ctx, by, id, b, sessName, message, resumeCommand, hints)
+			outcome.Queued, err = m.interruptAndSubmitLocked(ctx, by, id, b, sessName, message, resumeCommand, hints)
+			outcome.Deferred = outcome.Queued
+			return err
 		default:
 			running := m.sp.IsRunning(sessName)
-			if running && State(b.Metadata["state"]) != StateSuspended && len(hints.ProcessNames) > 0 && !m.sp.ProcessAlive(sessName, hints.ProcessNames) {
-				// The pane is up but its agent is dead: a crash the controller
-				// has not healed yet. Text typed into that pane is lost with
-				// it, so queue it for the incarnation the heal brings up, and
-				// fenced by the session alone: the crash heal may reset the
-				// conversation and rotate its epoch (mc-48az4).
-				if err := m.enqueueDeferredSubmitEpochLocked(b, sessName, message, ""); err != nil {
-					return err
-				}
-				outcome.Queued, outcome.Deferred = true, true
-				return nil
-			}
 			if pendingConversationRestart(b) && !running {
 				// A reset or restart is recorded but the replacement runtime is
 				// not up yet. Delivering now would start the pane just to carry
@@ -200,76 +190,76 @@ func (m *Manager) supportsFollowUpLocked(b beads.Bead) bool {
 	).SupportsFollowUp
 }
 
-// interruptAndSubmitLocked runs after submit's actor check, so its sends
-// do not queue.
-func (m *Manager) interruptAndSubmitLocked(ctx context.Context, by Actor, id string, b beads.Bead, sessName, message, resumeCommand string, hints runtime.Config) error {
+// interruptAndSubmitLocked runs after submit's actor check. It reports
+// whether its send queued the message: a dead agent's (sendLocked, on
+// ensureDeliverable's fresh read) takes no interrupt keys and queues it for
+// the incarnation the controller's heal brings up.
+func (m *Manager) interruptAndSubmitLocked(ctx context.Context, by Actor, id string, b beads.Bead, sessName, message, resumeCommand string, hints runtime.Config) (bool, error) {
 	// A row whose drain-ack stop is pending belongs to the controller's stop:
 	// no interrupt keys, no hard-restart stop (as ensureRunning refuses it).
 	if drainAckStopPendingMetadata(b.Metadata) {
-		return fmt.Errorf("%w: %s", ErrSessionStopping, id)
+		return false, fmt.Errorf("%w: %s", ErrSessionStopping, id)
 	}
-	running := State(b.Metadata["state"]) != StateSuspended && m.sp.IsRunning(sessName)
+	running := State(b.Metadata["state"]) != StateSuspended && m.liveAgent(sessName, hints.ProcessNames)
 	if !running {
-		_, err := m.sendLocked(ctx, by, id, b, sessName, message, resumeCommand, hints, true)
-		return err
+		return m.sendLocked(ctx, by, id, b, sessName, message, resumeCommand, hints, true)
 	}
 	// Every interrupt may end in a stop and a restart: take the runtime lease
 	// before sending anything, and carry it to the restart (D8D-5).
 	by, release, err := m.leaseForRestartLocked(ctx, by, id, sessName)
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer release()
 	if requiresHardRestartInterrupt(b) {
 		piTranscriptPath, err := piPendingTurnPath(b, hints)
 		if err != nil {
-			return err
+			return false, err
 		}
 		// Replacement only needs the outgoing incarnation gone, so a session
 		// that is already gone — including one whose tmux server died — is
 		// cleared to restart rather than reported as a failed stop.
 		if err := runtime.StopForCleanup(m.sp, sessName); err != nil {
-			return fmt.Errorf("stopping session for interrupt replacement: %w", err)
+			return false, fmt.Errorf("stopping session for interrupt replacement: %w", err)
 		}
 		if err := discardPiPendingTurn(piTranscriptPath, hints); err != nil {
 			// Pi must be stopped before transcript truncation so it cannot race the
 			// write. If truncation fails, restart on the dirty transcript; the
 			// caller's retry will repeat this stop-and-discard sequence.
 			if restartErr := m.restoreAfterHardRestartFailureLocked(ctx, by, id, b, sessName, resumeCommand, hints); restartErr != nil {
-				return fmt.Errorf("%w; additionally failed to restore session: %w", err, restartErr)
+				return false, fmt.Errorf("%w; additionally failed to restore session: %w", err, restartErr)
 			}
-			return err
+			return false, err
 		}
-		return m.restartAndSendLocked(ctx, by, id, b, sessName, message, resumeCommand, hints)
+		return false, m.restartAndSendLocked(ctx, by, id, b, sessName, message, resumeCommand, hints)
 	}
 	interruptStartedAt := time.Now()
 	if err := m.stopTurnLocked(b, sessName); err != nil {
-		return err
+		return false, err
 	}
 	if err := m.waitForInterruptIdleLocked(ctx, b, sessName); err != nil {
 		// Idle wait failed (e.g. timeout). Fall back to hard
 		// restart so the session isn't left in limbo.
 		if stopErr := runtime.StopForCleanup(m.sp, sessName); stopErr != nil {
-			return fmt.Errorf("stopping session after idle timeout: %w", stopErr)
+			return false, fmt.Errorf("stopping session after idle timeout: %w", stopErr)
 		}
-		return m.restartAndSendLocked(ctx, by, id, b, sessName, message, resumeCommand, hints)
+		return false, m.restartAndSendLocked(ctx, by, id, b, sessName, message, resumeCommand, hints)
 	}
 	if err := m.waitForInterruptBoundaryLocked(ctx, b, sessName, interruptStartedAt); err != nil {
 		if stopErr := runtime.StopForCleanup(m.sp, sessName); stopErr != nil {
-			return fmt.Errorf("stopping session after interrupt boundary timeout: %w", stopErr)
+			return false, fmt.Errorf("stopping session after interrupt boundary timeout: %w", stopErr)
 		}
-		return m.restartAndSendLocked(ctx, by, id, b, sessName, message, resumeCommand, hints)
+		return false, m.restartAndSendLocked(ctx, by, id, b, sessName, message, resumeCommand, hints)
 	}
 	if err := m.resetInterruptedTurnLocked(ctx, b, sessName); err != nil {
-		return err
+		return false, err
 	}
 	if shouldClearInterruptedInputBeforeSubmit(b) {
 		if err := m.clearInterruptedInputLocked(ctx, b, sessName); err != nil {
-			return err
+			return false, err
 		}
 	}
-	_, err = m.sendLocked(ctx, by, id, b, sessName, message, resumeCommand, hints, true)
-	return err
+	return m.sendLocked(ctx, by, id, b, sessName, message, resumeCommand, hints, true)
 }
 
 // restartAndSendLocked replaces the runtime the interrupt just stopped. The
@@ -669,12 +659,6 @@ func needsDeferredStartupDialogVerification(b beads.Bead) bool {
 }
 
 func (m *Manager) enqueueDeferredSubmitLocked(b beads.Bead, sessName, message string) error {
-	return m.enqueueDeferredSubmitEpochLocked(b, sessName, message, deferredSubmitEpoch(b))
-}
-
-// enqueueDeferredSubmitEpochLocked is enqueueDeferredSubmitLocked fenced to
-// epoch ("" fences by the session alone).
-func (m *Manager) enqueueDeferredSubmitEpochLocked(b beads.Bead, sessName, message, epoch string) error {
 	if strings.TrimSpace(m.cityPath) == "" {
 		return errors.New("deferred submit is unavailable without a city path")
 	}
@@ -683,7 +667,7 @@ func (m *Manager) enqueueDeferredSubmitEpochLocked(b beads.Bead, sessName, messa
 		ID:                "nudge-" + NewInstanceToken()[:12],
 		Agent:             deferredSubmitAgentKey(b),
 		SessionID:         b.ID,
-		ContinuationEpoch: epoch,
+		ContinuationEpoch: deferredSubmitEpoch(b),
 		Source:            "session",
 		Message:           message,
 		CreatedAt:         now,
@@ -706,18 +690,14 @@ func (m *Manager) enqueueDeferredSubmitEpochLocked(b beads.Bead, sessName, messa
 // deferredSubmitEpoch returns the continuation epoch a deferred submit is
 // fenced against.
 //
-// A submit deferred while a conversation reset is pending must survive the
-// reset's epoch rotation: commitPendingContinuationReset advances
-// continuation_epoch N->N+1 when the replacement incarnation starts, which
-// happens after this item is queued. A fixed epoch-N stamp would then fail the
-// queued-nudge fence (queuedNudgeMatchesTargetFence) and be dead-lettered,
-// silently dropping the message. Returning an empty epoch leaves the item
-// fenced by SessionID alone, so the post-reset incarnation — same session
-// bead, epoch N+1 — still claims and delivers it.
-//
-// A plain restart (restart_requested without a reset) does not rotate the
-// epoch, so those defers keep the current-epoch stamp and stay fenced to the
-// resumed conversation.
+// A submit deferred while a conversation reset is pending is fenced by its
+// session alone (an empty epoch): commitPendingContinuationReset advances
+// continuation_epoch N->N+1 when the replacement incarnation starts, after
+// this item is queued. Any other defer keeps the current epoch's stamp. An
+// epoch rotated since (a reset, or a crash heal's) does not lose the item:
+// since #5775 delivery re-stamps an item for the same session with the live
+// epoch (splitQueuedNudgesForTarget) and delivers it, so the stamp records
+// the conversation the message was written for, not a gate on delivery.
 func deferredSubmitEpoch(b beads.Bead) string {
 	if strings.TrimSpace(b.Metadata["continuation_reset_pending"]) != "" {
 		return ""

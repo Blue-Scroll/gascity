@@ -608,7 +608,9 @@ func drainAckStopPendingMetadata(meta map[string]string) bool {
 // ensureRunning starts or resumes session id's runtime for by, as by.Kind may
 // (queueFor). replacing is an interrupt's restart of the runtime it just
 // stopped: the hold was decided before that stop, so it is not re-read.
-func (m *Manager) ensureRunning(ctx context.Context, by Actor, id string, b beads.Bead, sessName, resumeCommand string, hints runtime.Config, replacing bool) error {
+// startRefusal is ensureRunning's refusal of a row no actor may start or
+// deliver to now, read from b alone.
+func (m *Manager) startRefusal(by Actor, id string, b beads.Bead) error {
 	if err := by.CheckStarts(); err != nil {
 		return err
 	}
@@ -625,6 +627,13 @@ func (m *Manager) ensureRunning(ctx context.Context, by Actor, id string, b bead
 	// race that stop (CONTRACT v5.9a, as the kill fence). Every actor.
 	if drainAckStopPendingMetadata(b.Metadata) {
 		return fmt.Errorf("%w: %s", ErrSessionStopping, id)
+	}
+	return nil
+}
+
+func (m *Manager) ensureRunning(ctx context.Context, by Actor, id string, b beads.Bead, sessName, resumeCommand string, hints runtime.Config, replacing bool) error {
+	if err := m.startRefusal(by, id, b); err != nil {
+		return err
 	}
 	// Only an operator's own resume consumes an operator's hold (CONTRACT
 	// v5.9 D8 rule 1); any other caller queues instead.
@@ -829,6 +838,44 @@ func (m *Manager) ensureRunning(ctx context.Context, by Actor, id string, b bead
 		return err
 	}
 	return nil
+}
+
+// ensureDeliverable is ensureRunning for a delivery. Past ensureRunning's
+// refusals (a kill-fenced or stopping row still refuses), it decides on a
+// fresh read of an unsuspended row's runtime: a live pane whose agent is
+// dead, or a runtime the read cannot vouch for, is ErrAgentDead, so the
+// caller queues the text rather than type it into a pane it would be lost
+// with (mc-48az4, mc-wdjni). The read refreshes a caching provider, so
+// ensureRunning's reads after it see a corpse as not running. Start and
+// Attach keep ensureRunning's: an operator attaches to a crashed pane to read
+// it.
+func (m *Manager) ensureDeliverable(ctx context.Context, by Actor, id string, b beads.Bead, sessName, resumeCommand string, hints runtime.Config) error {
+	if err := m.startRefusal(by, id, b); err != nil {
+		return err
+	}
+	if State(b.Metadata["state"]) != StateSuspended {
+		if live, err := m.freshLiveness(sessName, hints.ProcessNames); err != nil {
+			return fmt.Errorf("%w: %s: %w", ErrAgentDead, id, err)
+		} else if live.Running && !live.Alive {
+			return fmt.Errorf("%w: %s", ErrAgentDead, id)
+		}
+	}
+	return m.ensureRunning(ctx, by, id, b, sessName, resumeCommand, hints, false)
+}
+
+// freshLiveness reads sessName's runtime as of now, not from a provider's
+// cache: the tmux state cache can show a crashed agent alive for seconds,
+// and a crash never invalidates it (mc-48az4). Alive is by processNames;
+// with none (and none the runtime published) a running pane reads alive.
+func (m *Manager) freshLiveness(sessName string, processNames []string) (runtime.Liveness, error) {
+	return runtime.ObserveLivenessSince(m.sp, sessName, processNames, time.Now())
+}
+
+// liveAgent reports a fresh read of sessName that finds its pane up and its
+// agent alive, which a live-only send needs.
+func (m *Manager) liveAgent(sessName string, processNames []string) bool {
+	live, err := m.freshLiveness(sessName, processNames)
+	return err == nil && live.Running && live.Alive
 }
 
 func (m *Manager) ensureRunningRuntimeOnly(ctx context.Context, by Actor, id string, b beads.Bead, sessName, resumeCommand string, hints runtime.Config) error {
@@ -1051,17 +1098,16 @@ func normalizeWaitIdleNudgeSource(source string) string {
 }
 
 func (m *Manager) tryWaitIdleNudgeLocked(ctx context.Context, by Actor, id string, b beads.Bead, source, sessName, message, resumeCommand string, hints runtime.Config) (bool, error) {
+	if err := m.ensureDeliverable(ctx, by, id, b, sessName, resumeCommand, hints); errors.Is(err, ErrAgentDead) {
+		return false, nil // not delivered: the caller queues it for the healed agent
+	} else if err != nil {
+		return false, err
+	}
 	if transportFromMetadata(b) == "acp" {
-		if err := m.ensureRunning(ctx, by, id, b, sessName, resumeCommand, hints, false); err != nil {
-			return false, err
-		}
 		if err := m.nudgeSession(ctx, sessName, message, false); err != nil {
 			return false, err
 		}
 		return true, nil
-	}
-	if err := m.ensureRunning(ctx, by, id, b, sessName, resumeCommand, hints, false); err != nil {
-		return false, err
 	}
 	if providerKind(b) != "claude" {
 		return false, nil
@@ -1079,8 +1125,8 @@ func (m *Manager) tryWaitIdleNudgeLocked(ctx context.Context, by Actor, id strin
 	return true, nil
 }
 
-func (m *Manager) tryWaitIdleNudgeLiveOnlyLocked(ctx context.Context, b beads.Bead, source, sessName, message string) (bool, error) {
-	if !m.sp.IsRunning(sessName) {
+func (m *Manager) tryWaitIdleNudgeLiveOnlyLocked(ctx context.Context, b beads.Bead, source, sessName, message string, processNames []string) (bool, error) {
+	if !m.liveAgent(sessName, processNames) { // a dead agent's pane takes nothing (mc-wdjni)
 		return false, nil
 	}
 	if transportFromMetadata(b) == "acp" {
@@ -1161,10 +1207,11 @@ func (m *Manager) markStartupDialogsVerifiedLocked(id string, b *beads.Bead) {
 }
 
 // sendLocked delivers message, starting or resuming the runtime as by
-// allows; a row it may not resume gets the message queued (reports true).
+// allows; a row it may not resume, or whose agent is dead in a pane still
+// up, gets the message queued (reports true).
 func (m *Manager) sendLocked(ctx context.Context, by Actor, id string, b beads.Bead, sessName, message, resumeCommand string, hints runtime.Config, immediate bool) (bool, error) {
-	if err := m.ensureRunning(ctx, by, id, b, sessName, resumeCommand, hints, false); err != nil {
-		if !errors.Is(err, ErrResumeHeld) {
+	if err := m.ensureDeliverable(ctx, by, id, b, sessName, resumeCommand, hints); err != nil {
+		if !errors.Is(err, ErrResumeHeld) && !errors.Is(err, ErrAgentDead) {
 			return false, err
 		}
 		return true, m.enqueueDeferredSubmitLocked(b, sessName, message)
@@ -1202,14 +1249,14 @@ func (m *Manager) send(ctx context.Context, by Actor, id, message, resumeCommand
 	return outcome, err
 }
 
-func (m *Manager) sendLiveOnly(ctx context.Context, id, message string, immediate bool) (bool, error) {
+func (m *Manager) sendLiveOnly(ctx context.Context, id, message string, immediate bool, processNames []string) (bool, error) {
 	var delivered bool
 	err := withSessionMutationLock(id, func() error {
 		_, sessName, err := m.sessionBead(id)
 		if err != nil {
 			return err
 		}
-		if !m.sp.IsRunning(sessName) {
+		if !m.liveAgent(sessName, processNames) { // a dead agent's pane takes nothing (mc-wdjni)
 			delivered = false
 			return nil
 		}
@@ -1270,15 +1317,16 @@ func (m *Manager) SendImmediate(ctx context.Context, by Actor, id, message, resu
 }
 
 // SendLiveOnly nudges the runtime only when the current session is already
-// running. It never resumes or restarts the session.
-func (m *Manager) SendLiveOnly(ctx context.Context, id, message string) (bool, error) {
-	return m.sendLiveOnly(ctx, id, message, false)
+// running with its agent alive (by processNames; none reads alive). It never
+// resumes or restarts the session.
+func (m *Manager) SendLiveOnly(ctx context.Context, id, message string, processNames []string) (bool, error) {
+	return m.sendLiveOnly(ctx, id, message, false, processNames)
 }
 
 // SendImmediateLiveOnly is like SendLiveOnly but uses the immediate nudge path
 // when the runtime supports it. It never resumes or restarts the session.
-func (m *Manager) SendImmediateLiveOnly(ctx context.Context, id, message string) (bool, error) {
-	return m.sendLiveOnly(ctx, id, message, true)
+func (m *Manager) SendImmediateLiveOnly(ctx context.Context, id, message string, processNames []string) (bool, error) {
+	return m.sendLiveOnly(ctx, id, message, true, processNames)
 }
 
 // TryWaitIdleNudge delivers a best-effort session nudge at a provider-defined
@@ -1304,16 +1352,16 @@ func (m *Manager) TryWaitIdleNudge(ctx context.Context, by Actor, id, source, me
 }
 
 // TryWaitIdleNudgeLiveOnly delivers a best-effort nudge at a safe boundary
-// only when the runtime is already live. It never resumes or restarts the
-// session.
-func (m *Manager) TryWaitIdleNudgeLiveOnly(ctx context.Context, id, source, message string) (bool, error) {
+// only when the runtime is already live with its agent alive (by
+// processNames; none reads alive). It never resumes or restarts the session.
+func (m *Manager) TryWaitIdleNudgeLiveOnly(ctx context.Context, id, source, message string, processNames []string) (bool, error) {
 	var delivered bool
 	err := withSessionMutationLock(id, func() error {
 		b, sessName, err := m.sessionBead(id)
 		if err != nil {
 			return err
 		}
-		delivered, err = m.tryWaitIdleNudgeLiveOnlyLocked(ctx, b, source, sessName, message)
+		delivered, err = m.tryWaitIdleNudgeLiveOnlyLocked(ctx, b, source, sessName, message, processNames)
 		return err
 	})
 	return delivered, err

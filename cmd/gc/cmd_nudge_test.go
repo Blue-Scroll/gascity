@@ -7116,3 +7116,133 @@ func TestTryDeliverQueuedNudgesByPollerSkipsADeadAgent(t *testing.T) {
 		t.Fatalf("pending %d (%v), want the message kept for the next incarnation", len(pending), err)
 	}
 }
+
+// TestCrashQueuedMessageSurvivesEpochRotation (mc-48az4, mc-wdjni): a
+// message submitted over a crashed agent is queued with the current epoch's
+// stamp, held off the dead pane, and delivered to the healed incarnation
+// even after the heal rotated the continuation epoch: delivery re-stamps the
+// live epoch (#5775), so no empty-epoch fence is needed.
+func TestCrashQueuedMessageSurvivesEpochRotation(t *testing.T) {
+	t.Setenv("GC_BEADS", "file")
+	dir := t.TempDir()
+	store := openNudgeBeadStore(dir)
+	fake := runtime.NewFake()
+	mgr := newSessionManagerWithConfig(dir, store, fake, nil)
+	info, err := mgr.CreateSession(context.Background(), session.CreateOptions{Template: "worker", Title: "Worker", Command: "codex", WorkDir: dir, Provider: "codex", Hints: runtime.Config{WorkDir: dir}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := mgr.Start(context.Background(), testOperatorIn(t, dir), info.ID, "", runtime.Config{WorkDir: dir}); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if err := store.SetMetadata(info.ID, "continuation_epoch", "3"); err != nil {
+		t.Fatal(err)
+	}
+	hints := runtime.Config{WorkDir: dir, ProcessNames: []string{"codex"}}
+	fake.Zombies[info.SessionName] = true
+	out, err := mgr.Submit(context.Background(), session.Actor{Kind: session.ActorBackground}, info.ID, "after the crash", "", hints, session.SubmitIntentDefault)
+	if err != nil || !out.Queued {
+		t.Fatalf("submit over the crash: %+v %v, want queued", out, err)
+	}
+	idleSince := time.Now().Add(-10 * time.Second)
+	fake.Activity = map[string]time.Time{info.SessionName: idleSince}
+	target := nudgeTarget{cityPath: dir, agent: config.Agent{Name: "worker"}, sessionID: info.ID, continuationEpoch: "3", resolved: &config.ResolvedProvider{Name: "codex"}, sessionName: info.SessionName, alias: info.Alias}
+	if ok, err := tryDeliverQueuedNudgesByPoller(target, store.Store, store.Store, fake, 3*time.Second, worker.LiveObservation{Running: true, Alive: false, LastActivity: &idleSince}); ok || err != nil {
+		t.Fatalf("delivered into the dead pane: %v %v", ok, err)
+	}
+	// The heal: a new incarnation with a rotated epoch (conversation reset).
+	delete(fake.Zombies, info.SessionName)
+	if err := store.SetMetadata(info.ID, "continuation_epoch", "4"); err != nil {
+		t.Fatal(err)
+	}
+	target.continuationEpoch = "4"
+	nudgesBefore := fake.CountCalls("Nudge", info.SessionName)
+	ok, err := tryDeliverQueuedNudgesByPoller(target, store.Store, store.Store, fake, 3*time.Second, worker.LiveObservation{Running: true, Alive: true, LastActivity: &idleSince})
+	if !ok || err != nil || fake.CountCalls("Nudge", info.SessionName) == nudgesBefore {
+		t.Fatalf("after the heal: delivered=%v err=%v, want the queued message delivered to the epoch-4 incarnation", ok, err)
+	}
+}
+
+// TestNudgeOverACrashedAgentQueues (mc-48az4, mc-wdjni): gc session nudge
+// (immediate or wait-idle), mail notify and sling's nudge to a running pane
+// whose agent crashed go through the runtime handle with the target's
+// process names: nothing is typed into the dead pane, the nudge is queued
+// for the healed agent, and the CLI says queued (agent down), not "Nudged".
+func TestNudgeOverACrashedAgentQueues(t *testing.T) {
+	crashed := func(t *testing.T) (string, beads.NudgesStore, *runtime.Fake, nudgeTarget, session.Info) {
+		t.Helper()
+		t.Setenv("GC_BEADS", "file")
+		dir := t.TempDir()
+		store := openNudgeBeadStore(dir)
+		fake := runtime.NewFake()
+		mgr := newSessionManagerWithConfig(dir, store, fake, nil)
+		info, err := mgr.CreateSession(context.Background(), session.CreateOptions{Template: "worker", Title: "Worker", Command: "claude", WorkDir: dir, Provider: "claude", Hints: runtime.Config{WorkDir: dir}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+		if err != nil {
+			t.Fatalf("Create: %v", err)
+		}
+		if err := mgr.Start(context.Background(), testOperatorIn(t, dir), info.ID, "", runtime.Config{WorkDir: dir}); err != nil {
+			t.Fatalf("Start: %v", err)
+		}
+		fake.Zombies[info.SessionName] = true
+		target := nudgeTarget{
+			cityPath:    dir,
+			cfg:         &config.City{Agents: []config.Agent{{Name: "worker", Provider: "claude"}}},
+			sessionID:   info.ID,
+			sessionName: info.SessionName,
+			identity:    "worker",
+			agent:       config.Agent{Name: "worker", Provider: "claude"},
+			resolved:    &config.ResolvedProvider{Name: "claude", ProcessNames: []string{"claude"}},
+		}
+		return dir, store, fake, target, info
+	}
+	typed := func(fake *runtime.Fake, name string, before int) int {
+		n := 0
+		for _, c := range fake.Calls[before:] {
+			if c.Name == name && (c.Method == "Nudge" || c.Method == "NudgeNow") {
+				n++
+			}
+		}
+		return n
+	}
+	queued := func(t *testing.T, dir string, target nudgeTarget) int {
+		t.Helper()
+		pending, _, _, err := listQueuedNudgesForTarget(dir, target, time.Now())
+		if err != nil {
+			t.Fatal(err)
+		}
+		return len(pending)
+	}
+	for _, mode := range []nudgeDeliveryMode{nudgeDeliveryImmediate, nudgeDeliveryWaitIdle} {
+		t.Run("gc session nudge "+string(mode), func(t *testing.T) {
+			dir, store, fake, target, info := crashed(t)
+			before := len(fake.Calls)
+			var stdout, stderr bytes.Buffer
+			code := deliverSessionNudgeWithWorker(target, store.Store, fake, "check deploy status", mode, false, &stdout, &stderr)
+			if code != 0 || typed(fake, info.SessionName, before) != 0 || queued(t, dir, target) != 1 {
+				t.Fatalf("code %d, typed %d, queued %d; want 0, none typed, one queued; stderr=%q", code, typed(fake, info.SessionName, before), queued(t, dir, target), stderr.String())
+			}
+			if out := stdout.String(); !strings.Contains(out, "Queued nudge") || !strings.Contains(out, "agent is down") || strings.Contains(out, "Nudged") {
+				t.Fatalf("stdout %q, want it queued because the agent is down", out)
+			}
+		})
+	}
+	t.Run("mail notify", func(t *testing.T) {
+		dir, store, fake, target, info := crashed(t)
+		before := len(fake.Calls)
+		if err := sendMailNotifyWithWorker(target, store.Store, fake, "human", ""); err != nil {
+			t.Fatal(err)
+		}
+		if typed(fake, info.SessionName, before) != 0 || queued(t, dir, target) != 1 {
+			t.Fatalf("typed %d, queued %d; want none typed, one queued", typed(fake, info.SessionName, before), queued(t, dir, target))
+		}
+	})
+	t.Run("sling", func(t *testing.T) {
+		dir, store, fake, target, info := crashed(t)
+		before := len(fake.Calls)
+		var stdout, stderr bytes.Buffer
+		deliverSlingNudge(target, fake, store.Store, dir, &stdout, &stderr)
+		if typed(fake, info.SessionName, before) != 0 || queued(t, dir, target) != 1 || strings.Contains(stdout.String(), "Nudged") {
+			t.Fatalf("typed %d, queued %d, stdout %q; want none typed, one queued", typed(fake, info.SessionName, before), queued(t, dir, target), stdout.String())
+		}
+	})
+}
