@@ -3348,6 +3348,9 @@ type RequestFailedPayload struct {
 
 	// RequestId Correlation ID from the 202 response.
 	RequestId string `json:"request_id"`
+
+	// SessionId Session a failed session.create had already written, when the server could identify it, so the client can inspect or clean it up instead of retrying into a duplicate. Absence does not prove that no session was written. The event subject does not carry this ID; match the event to its request by request_id.
+	SessionId *string `json:"session_id,omitempty"`
 }
 
 // RequestFailedPayloadOperation Which operation failed.

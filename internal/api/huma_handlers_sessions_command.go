@@ -213,10 +213,11 @@ func (s *Server) humaHandleSessionCreate(ctx context.Context, input *SessionCrea
 		if waitForCommandable {
 			s.state.Enqueue(reconcilekey.Session(info.ID))
 			waitCtx, cancel := context.WithTimeout(context.Background(), sessionCreateCommandableTimeout)
-			info, createErr = waiter.WaitForSessionCommandable(waitCtx, info.ID)
+			createdID := info.ID
+			info, createErr = waiter.WaitForSessionCommandable(waitCtx, createdID)
 			cancel()
 			if createErr != nil {
-				s.emitSessionCreateFailed(reqID, "create_failed", createErr.Error())
+				s.emitSessionCreateFailedFor(reqID, createdID, "create_failed", createErr.Error())
 				return
 			}
 		}
@@ -366,7 +367,7 @@ func (s *Server) humaCreateProviderSession(_ context.Context, store beads.Sessio
 		if msg := strings.TrimSpace(body.Message); msg != "" {
 			if _, sendErr := s.submitMessageToSession(context.Background(), store.Store, info.ID, msg, session.SubmitIntentDefault, false); sendErr != nil {
 				if rollbackErr := s.rollbackCreatedSession(store, info.ID); rollbackErr != nil {
-					s.emitSessionCreateFailed(reqID, "message_delivery_failed",
+					s.emitSessionCreateFailedFor(reqID, info.ID, "message_delivery_failed",
 						fmt.Sprintf("initial message delivery failed: %v (rollback failed: %v)", sendErr, rollbackErr))
 					return
 				}
