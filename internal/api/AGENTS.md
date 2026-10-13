@@ -41,6 +41,24 @@ Violating any fails the build; full rationale is in the architecture docs.
   capture the semantics. Enforced by
   `TestEveryKnownEventTypeHasRegisteredPayload`.
 
+## Configuration publication
+
+API config edits, validation, snapshot publication and city-config rollback
+share the controller's publication transaction with runtime reloads. A rejected
+edit must remain absent from both disk and the API's cached raw config. Preserve
+that boundary when changing `mutateAndPoke` or runtime config publication.
+
+The controller's config locks have one order: the config transaction fence
+(`configTransactionMu`), then the publication lock (`publishMu`), then the
+`configedit.Editor` lock, then `updateMu`, then `mu`. A multi-file config
+transaction (pack import, rig provisioning) takes the publication lock before
+the Editor lock and publishes through `mutateAndPokeLocked`; taking the Editor
+lock first deadlocks against a plain edit, which holds the publication lock
+when it takes the Editor lock. The publication lock stays held across a
+transaction's pack fetch or rig provisioning, and across an API city or rig
+suspend or resume while it waits on the suspension fence; reload publication
+and other API edits wait out those bounded stalls.
+
 ## Worker boundary exception
 
 `session_manager.go` constructs `session.Manager` values for API handlers —
