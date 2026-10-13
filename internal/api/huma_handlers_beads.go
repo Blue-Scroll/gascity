@@ -15,6 +15,7 @@ import (
 	"github.com/gastownhall/gascity/internal/beadmeta"
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/coordclass"
+	"github.com/gastownhall/gascity/internal/reconcilekey"
 	"github.com/gastownhall/gascity/internal/session"
 )
 
@@ -769,6 +770,7 @@ func (s *Server) humaHandleBeadCreate(ctx context.Context, input *BeadCreateInpu
 	if err != nil {
 		return nil, err
 	}
+	s.wakeAfterBeadWrite()
 
 	return &IndexOutput[beads.Bead]{
 		Index: res.Index,
@@ -832,6 +834,7 @@ func (s *Server) humaHandleBeadClose(ctx context.Context, input *BeadCloseInput)
 		}
 		return nil, apierr.Internal.Msg(err.Error())
 	}
+	s.wakeAfterBeadWrite()
 	resp := &OKResponse{}
 	resp.Body.Status = "closed"
 	return resp, nil
@@ -854,6 +857,7 @@ func (s *Server) humaHandleBeadReopen(_ context.Context, input *BeadReopenInput)
 	if err := store.Reopen(id); err != nil {
 		return nil, apierr.Internal.Msg(err.Error())
 	}
+	s.wakeAfterBeadWrite()
 	resp := &OKResponse{}
 	resp.Body.Status = "reopened"
 	return resp, nil
@@ -885,6 +889,7 @@ func (s *Server) humaHandleBeadAssign(ctx context.Context, input *BeadAssignInpu
 		}
 		return nil, apierr.Internal.Msg(err.Error())
 	}
+	s.wakeAfterBeadWrite()
 	return &IndexOutput[map[string]string]{
 		Index: index,
 		Body:  map[string]string{"status": "assigned", "assignee": assignee},
@@ -958,6 +963,10 @@ func (s *Server) humaHandleBeadUpdate(ctx context.Context, input *BeadUpdateInpu
 		}
 		return nil, apierr.Internal.Msg(err.Error())
 	}
+	// The write landed, so it wakes even if the parent projection wait fails;
+	// deferred so a woken pass's parent-keyed listings, which bypass the
+	// CachingStore, read bd only after the wait.
+	defer s.wakeAfterBeadWrite()
 	if opts.ParentID != nil && current.ParentID != *opts.ParentID && !closesStatus(opts.Status) {
 		if waiter, ok := store.(beads.ParentProjectionWaiter); ok {
 			if err := awaitBeadParentProjection(ctx, waiter, id, current.ParentID, *opts.ParentID); err != nil {
@@ -1141,7 +1150,20 @@ func (s *Server) humaHandleBeadDelete(_ context.Context, input *BeadDeleteInput)
 		}
 		return nil, apierr.Internal.Msg(err.Error())
 	}
+	s.wakeAfterBeadWrite()
 	resp := &OKResponse{}
 	resp.Body.Status = "closed"
 	return resp, nil
+}
+
+// wakeAfterBeadWrite asks the controller to reconcile after a successful
+// generic bead write. The write lands through the controller's CachingStore
+// as a cache-authored bead event, which never wakes the legacy reconciler,
+// so without this an API-written bead waits for the patrol interval. One
+// call: one legacy poke plus the control-dispatcher key, the pair sling
+// wakes. Under v2 this marks the planner on every write, including writes
+// OnBeadEvent's relevance filter skips (critic D7); v2 is trace-only in
+// builds, and gating this to the legacy reconciler is a tracked follow-up.
+func (s *Server) wakeAfterBeadWrite() {
+	s.state.Enqueue(reconcilekey.Allocator(), reconcilekey.ControlDispatch())
 }
