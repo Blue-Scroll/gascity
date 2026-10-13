@@ -1185,8 +1185,8 @@ func workQueryHasReadyWork(output string) bool {
 // filterUnreadyHookCandidates strips beads from work_query output that fail
 // bd ready semantics: future defer_until, any open blocking dep in the row's
 // blocked_by array, the row's own is_blocked / status=="blocked" marker, a
-// canonical dispatch hold label, or a graph.v2 workflow root (a latch, never
-// work). The work_query is expected to gate most of these, but
+// canonical dispatch hold label, a graph.v2 workflow root (a latch, never
+// work), or an unassigned workflow subject (its steps are the work). The work_query is expected to gate most of these, but
 // defensive filtering here prevents a single broken query from cascading into
 // agent action on a bead it cannot progress.
 // Pure function over JSON; takes time.Time so tests stay deterministic.
@@ -1225,6 +1225,9 @@ func filterUnreadyHookCandidates(output string, now time.Time) string {
 			continue
 		}
 		if isGraphWorkflowRootHookCandidate(obj) {
+			continue
+		}
+		if isWorkflowSubjectHookCandidate(obj) {
 			continue
 		}
 		filtered = append(filtered, obj)
@@ -1425,6 +1428,31 @@ func isGraphWorkflowRootHookCandidate(item map[string]any) bool {
 		return false
 	}
 	return isGraphWorkflowRootContract(contract)
+}
+
+// isWorkflowSubjectHookCandidate reports whether item is an UNASSIGNED graph
+// workflow subject (see isWorkflowSubject). The query cannot exclude it, for
+// the same reason as a root: bd has no flag to exclude a metadata key. So the
+// hook drops it here, and demandRowServable refuses the same row.
+//
+// Unlike a root, a subject someone already holds is still served to its holder.
+// That holder is doing real work on it, and dropping the row would only hide it
+// from that session's own crash recovery. What this stops is a second worker
+// being handed the subject as free pool work.
+func isWorkflowSubjectHookCandidate(item map[string]any) bool {
+	if assignee, _ := item["assignee"].(string); strings.TrimSpace(assignee) != "" {
+		return false
+	}
+	metadata, ok := item["metadata"].(map[string]any)
+	if !ok {
+		return false
+	}
+	str := func(key string) string {
+		value, _ := metadata[key].(string)
+		return value
+	}
+	return isWorkflowSubject(str(beadmeta.ExecutionRoutedToMetadataKey),
+		str(beadmeta.RootBeadIDMetadataKey), str(beadmeta.KindMetadataKey))
 }
 
 // isClosedHookCandidate reports whether item is a closed bead. Defense-in-depth

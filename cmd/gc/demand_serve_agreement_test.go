@@ -106,6 +106,42 @@ func agreementRows() []agreementRow {
 			wantServable: false,
 		},
 		{
+			// vn-dpowwra: the subject of a graph workflow carries
+			// gc.execution_routed_to, and its workflow's steps are the work. A
+			// route written onto it by hand put it on the pool as well, so one
+			// review leg was worked twice.
+			name: "workflow subject with a hand-written route",
+			bead: beads.Bead{ID: "a-15", Status: "open", Type: "task", Metadata: map[string]string{
+				beadmeta.ExecutionRoutedToMetadataKey: agreementTemplate,
+				beadmeta.RoutedToMetadataKey:          agreementTemplate,
+			}},
+			wantServable: false,
+		},
+		{
+			// The negative control for the subject rule: a step of a workflow can
+			// carry gc.execution_routed_to too. It has a root, so it is a
+			// member of the workflow, not its subject, and its route is real.
+			name: "workflow step carrying an execution route",
+			bead: beads.Bead{ID: "a-16", Status: "open", Type: "task", Metadata: map[string]string{
+				beadmeta.ExecutionRoutedToMetadataKey: agreementTemplate,
+				beadmeta.RootBeadIDMetadataKey:        "a-root",
+				beadmeta.RoutedToMetadataKey:          agreementTemplate,
+			}},
+			wantServable: true,
+		},
+		{
+			// The other negative control: a control step routed to this
+			// template carries its pool's execution route beside it. Even with
+			// no root recorded, its control kind says it is the dispatcher's work.
+			name: "control step carrying an execution route, no root",
+			bead: beads.Bead{ID: "a-17", Status: "open", Type: "task", Metadata: map[string]string{
+				beadmeta.KindMetadataKey:              beadmeta.KindWorkflowFinalize,
+				beadmeta.ExecutionRoutedToMetadataKey: "rig/other-pool",
+				beadmeta.RoutedToMetadataKey:          agreementTemplate,
+			}},
+			wantServable: true,
+		},
+		{
 			name: "routed epic",
 			bead: beads.Bead{
 				ID: "a-7", Status: "open", Type: "epic",

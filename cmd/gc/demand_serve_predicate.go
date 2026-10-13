@@ -28,6 +28,11 @@ package main
 // a latch bead with no work behind it. Both sides now refuse it; see
 // isGraphWorkflowRootContract.
 //
+// A fifth is the bead a graph workflow was slung ON, its subject. The
+// workflow's steps are its work, so a route written onto the subject by hand
+// made the pool work it a second time. Both sides refuse that too; see
+// isWorkflowSubject.
+//
 // This file is the one predicate both sides now answer with. The serving rules
 // come from internal/config — the same value the shell flags are rendered from —
 // so a flag the query gains cannot silently fail to reach the controller. The
@@ -129,6 +134,31 @@ func isGraphWorkflowRootContract(contract string) bool {
 	return strings.EqualFold(strings.TrimSpace(contract), beadmeta.FormulaContractGraphV2)
 }
 
+// isWorkflowSubject reports whether a bead is the SUBJECT of a graph workflow:
+// the bead `gc sling <pool> <bead> --on <graph formula>` started a workflow
+// for. gc marks the subject with gc.execution_routed_to and never gives it
+// gc.routed_to (restampWorkBeadRouting, internal/sling), because the workflow's
+// steps are the work. A subject the pool also serves is one job done by two
+// workers.
+//
+// The route can still arrive by hand. On 2026-09-29 three review legs carried a
+// hand-written gc.routed_to beside gc.execution_routed_to. One polecat claimed
+// each leg directly while its workflow's step went to another, so each leg was
+// worked twice (vn-dpowwra). So neither side serves a subject, whatever route
+// it carries: the controller does not count it (demandRowServable) and the hook
+// never hands it out unassigned (isWorkflowSubjectHookCandidate).
+//
+// gc.execution_routed_to alone is not the mark. A control step
+// (workflow-finalize, retry, ...) carries it too, with gc.routed_to naming its
+// control dispatcher, and that row IS the dispatcher's work. Every such step
+// has a control gc.kind and a gc.root_bead_id. A subject has neither, because
+// it is not a member of the workflow it carries.
+func isWorkflowSubject(executionRoutedTo, rootBeadID, kind string) bool {
+	return strings.TrimSpace(executionRoutedTo) != "" &&
+		strings.TrimSpace(rootBeadID) == "" &&
+		!beadmeta.IsControlKind(strings.TrimSpace(kind))
+}
+
 // demandRowServable applies the route-independent half of the Tier-3 serving
 // rules to one row: the exclusions a worker's query enforces regardless of which
 // template it is asking for.
@@ -137,6 +167,12 @@ func demandRowServable(b beads.Bead) bool {
 	// (isGraphWorkflowRootHookCandidate), so counting one would spawn a seat
 	// that reads empty and drains.
 	if isGraphWorkflowRootContract(b.Metadata[beadmeta.FormulaContractMetadataKey]) {
+		return false
+	}
+	// SUBJECT: the hook drops an unassigned workflow subject too
+	// (isWorkflowSubjectHookCandidate). Its steps are the demand.
+	if isWorkflowSubject(b.Metadata[beadmeta.ExecutionRoutedToMetadataKey],
+		b.Metadata[beadmeta.RootBeadIDMetadataKey], b.Metadata[beadmeta.KindMetadataKey]) {
 		return false
 	}
 	rules := config.PoolDemandServeRulesForQuery()

@@ -116,7 +116,8 @@ func readyReaderFailurePropagation(federated bool) string {
 // retired the short-lived gc.run_target wire field). The query therefore
 // returns a routed graph.v2 root too; bd has no flag to exclude it, so the hook
 // drops it in Go and the controller never counts it (cmd/gc
-// isGraphWorkflowRootContract). This predicate is the main
+// isGraphWorkflowRootContract). The same holds for a workflow's subject that
+// carries a hand-written gc.routed_to (cmd/gc isWorkflowSubject). This predicate is the main
 // source of truth for "is there work on this routed queue?" that both the
 // worker (via EffectiveWorkQuery Tier 3) and the reconciler (via
 // EffectivePoolDemandQuery, count-form) ask; diverging the two re-introduces
