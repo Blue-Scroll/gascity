@@ -76,3 +76,9 @@ start's conversation has no key yet. Families without `SupportsIDLookup`
 (Codex, Gemini, OpenCode, MiMo, ZCode) still fall back to work-directory
 discovery after a keyed miss, as does `SessionLogAdapter.DiscoverTranscript`;
 see `SESSION-HISTORY-EXACT-KEY`.
+
+## Manual Close During Reconciliation
+
+A desired manual entry retains a previously discovered conversation; it is not
+a create request. If a close wins before synchronization refreshes the store,
+leave that conversation terminal instead of recreating its alias and runtime.
