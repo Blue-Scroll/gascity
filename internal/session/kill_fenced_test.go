@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/runtime"
@@ -45,24 +46,83 @@ func TestKillFencedStopErrorWithRuntimeGoneSucceeds(t *testing.T) {
 	}
 }
 
-// A runtime already gone has no window to fence: kill runs alone, writes
-// nothing, and its result is returned as it is.
-func TestKillFencedRuntimeAlreadyGoneRunsKillAlone(t *testing.T) {
+// A runtime already gone has no window to fence: kill runs alone and its
+// result is returned as it is. An unconfigured session's row is left as it
+// was; a configured named session's row is synced asleep/killed, as `gc
+// session kill` does, so the kill supersedes its pending wake.
+func TestKillFencedRuntimeAlreadyGone(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		named bool
+	}{
+		{"unconfigured session", false},
+		{"configured named session", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := runtime.NewFake()
+			mgr, store, info := newKillFencedSession(t, fake, fake)
+			meta := map[string]string{"state": string(StateAsleep), "wake_request": "explicit", "wake_requested_at": time.Now().UTC().Format(time.RFC3339)}
+			if tc.named {
+				meta["configured_named_session"], meta["configured_named_identity"] = "true", "chat"
+			}
+			if err := store.SetMetadataBatch(info.ID, meta); err != nil {
+				t.Fatal(err)
+			}
+			_ = fake.Stop(info.SessionName)
+			calls := len(fake.SnapshotCalls())
+			want := errors.New("not active")
+			got := mgr.KillFenced(context.Background(), testActor(mgr, ActorOperator), info.ID, func(context.Context, Actor) error { return want })
+			if !errors.Is(got, want) {
+				t.Fatalf("KillFenced = %v, want kill's own error", got)
+			}
+			for _, c := range fake.SnapshotCalls()[calls:] {
+				if c.Method == "Stop" {
+					t.Errorf("a runtime already gone was stopped again")
+				}
+			}
+			after, _ := store.Get(info.ID)
+			if after.Metadata["state_reason"] == KillPendingReason {
+				t.Errorf("a fence was written for a runtime already gone: %v", after.Metadata)
+			}
+			if !tc.named {
+				if after.Metadata["wake_request"] != "explicit" || after.Metadata["sleep_reason"] != "" {
+					t.Errorf("unconfigured row rewritten: %v", after.Metadata)
+				}
+				return
+			}
+			if after.Metadata["sleep_reason"] != string(SleepReasonKilled) || after.Metadata["wake_request"] != "" {
+				t.Errorf("named row = %v, want asleep/killed with the pending wake cleared", after.Metadata)
+			}
+		})
+	}
+}
+
+// The flock fallback after a lease failure other than busy is retryable when
+// the flock itself is busy: ErrSessionStarting, as every operator lease wait,
+// and the kill does not run. The lease failure here is a lent lease already
+// released; the flock is held by another stopper.
+func TestKillFencedBusyFlockFallbackIsRetryable(t *testing.T) {
 	fake := runtime.NewFake()
-	mgr, store, info := newKillFencedSession(t, fake, fake)
-	if err := store.SetMetadataBatch(info.ID, map[string]string{"state": string(StateAsleep)}); err != nil {
+	mgr, _, info := newKillFencedSession(t, fake, fake)
+	by := testActor(mgr, ActorOperator)
+	stale, err := TryRuntimeLease(nil, RuntimeLeaseRequest{City: by.City.Path(), Name: info.SessionName})
+	if err != nil {
 		t.Fatal(err)
 	}
-	_ = fake.Stop(info.SessionName)
-	before, _ := store.Get(info.ID)
-	want := errors.New("not active")
-	got := mgr.KillFenced(context.Background(), testActor(mgr, ActorOperator), info.ID, func(context.Context, Actor) error { return want })
-	if !errors.Is(got, want) {
-		t.Fatalf("KillFenced = %v, want kill's own error", got)
+	stale.Release()
+	held, err := TryRuntimeLease(nil, RuntimeLeaseRequest{City: by.City.Path(), Name: info.SessionName})
+	if err != nil {
+		t.Fatalf("holding the flock: %v", err)
 	}
-	after, _ := store.Get(info.ID)
-	if after.Revision != before.Revision {
-		t.Errorf("row rewritten for a runtime already gone: %v", after.Metadata)
+	defer held.Release()
+	by.Lease = stale
+	killed := false
+	err = mgr.KillFenced(context.Background(), by, info.ID, func(context.Context, Actor) error { killed = true; return nil })
+	if !errors.Is(err, ErrSessionStarting) {
+		t.Fatalf("KillFenced = %v, want ErrSessionStarting (retryable)", err)
+	}
+	if killed || !fake.IsRunning(info.SessionName) {
+		t.Error("the kill ran without the flock")
 	}
 }
 
@@ -111,5 +171,84 @@ func TestKillFencedWithoutAFenceStillSyncsAsleep(t *testing.T) {
 	b, _ := store.Get(info.ID)
 	if b.Metadata["state"] != string(StateAsleep) || b.Metadata["sleep_reason"] != string(SleepReasonKilled) {
 		t.Errorf("row = %v, want the post-kill asleep/killed sync", b.Metadata)
+	}
+}
+
+// startWhileLeasedStore models a controller start that finishes while the
+// kill waits for the runtime lease. The row starts asleep with no runtime
+// and another holder's unexpired lease record. The kill's first lease
+// attempt reads the row (the second read of it, after the kill's own); at
+// that read the start lands (the runtime runs, the row reads active) and the
+// holder's record goes, so the attempt takes the lease.
+type startWhileLeasedStore struct {
+	beads.Store
+	id    string
+	reads int
+	start func()
+}
+
+func (s *startWhileLeasedStore) Get(id string) (beads.Bead, error) {
+	if id == s.id {
+		if s.reads++; s.reads == 2 && s.start != nil {
+			s.start()
+		}
+	}
+	return s.Store.Get(id)
+}
+
+// Kills deciding the dead path before the lease (#7709 review): a start that
+// finished while the kill waited for the lease must be killed under the
+// fence, not on the unfenced dead path (which a pass reads as a crash).
+func TestKillFencedDecidesUnderTheLease(t *testing.T) {
+	fake := runtime.NewFake()
+	_, store, info := newKillFencedSession(t, fake, fake)
+	remote := MetadataPatch{
+		RuntimeLeaseHolderKey: "host-b/7/n", RuntimeLeaseEpochKey: "4", RuntimeLeaseTTLKey: "240",
+		RuntimeLeaseExpiresKey: time.Now().Add(time.Minute).UTC().Format(time.RFC3339), RuntimeLeaseFlockKey: "another-boot/1/2/0123",
+	}
+	meta := map[string]string{"state": string(StateAsleep), "configured_named_session": "true", "configured_named_identity": "chat"}
+	for k, v := range remote {
+		meta[k] = v
+	}
+	if err := store.SetMetadataBatch(info.ID, meta); err != nil {
+		t.Fatal(err)
+	}
+	_ = fake.Stop(info.SessionName)
+
+	racing := &startWhileLeasedStore{Store: store, id: info.ID}
+	racing.start = func() {
+		if err := fake.Start(context.Background(), info.SessionName, runtime.Config{Command: "claude"}); err != nil {
+			t.Fatal(err)
+		}
+		started := map[string]string{"state": string(StateActive)}
+		for k := range remote {
+			started[k] = ""
+		}
+		if err := store.SetMetadataBatch(info.ID, started); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mgr := newTestManager(t, racing, fake)
+	var atStop map[string]string
+	kill := func(ctx context.Context, by Actor) error {
+		b, _ := store.Get(info.ID)
+		atStop = b.Metadata
+		return mgr.Kill(ctx, by, info.ID)
+	}
+	if err := mgr.KillFenced(context.Background(), testActor(mgr, ActorOperator), info.ID, kill); err != nil {
+		t.Fatalf("KillFenced: %v", err)
+	}
+	if racing.reads < 2 {
+		t.Fatalf("premise: the start never landed while the kill waited for the lease (%d reads)", racing.reads)
+	}
+	if atStop["state_reason"] != KillPendingReason {
+		t.Errorf("row at the stop = %v, want the kill fence: the started runtime was killed on the unfenced dead path", atStop)
+	}
+	if fake.IsRunning(info.SessionName) {
+		t.Error("the started runtime survived the kill")
+	}
+	b, _ := store.Get(info.ID)
+	if b.Metadata["state"] != string(StateAsleep) || b.Metadata["sleep_reason"] != string(SleepReasonKilled) || b.Metadata["state_reason"] != "" {
+		t.Errorf("row after the kill = %v, want asleep/killed with the fence lifted", b.Metadata)
 	}
 }
