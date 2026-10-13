@@ -173,7 +173,7 @@ func TestHealStatePatchWithRollbackInfo(t *testing.T) {
 			if tc.created != 0 {
 				b.CreatedAt = clk.Now().Add(tc.created)
 			}
-			got := healStatePatchWithRollbackInfo(seedSessionInfo(b), tc.alive, !tc.unobserved, clk, tc.timeout, tc.rollback)
+			got := healStatePatchWithRollbackInfo(seedSessionInfo(b), tc.alive, !tc.unobserved, clk, nil, tc.timeout, tc.rollback)
 			if !reflect.DeepEqual(got, tc.want) {
 				t.Fatalf("healStatePatchWithRollbackInfo = %#v, want %#v", got, tc.want)
 			}
@@ -196,7 +196,7 @@ func TestHealStateWithRollbackInfoClosedGuardAndWrite(t *testing.T) {
 		t.Fatal(err)
 	}
 	closed, _ = store.Get(closed.ID)
-	batch, err := healStateWithRollbackInfo(sessiontest.SeedBead(t, closed), false, true, sessionFrontDoor(store), clk, 0, true)
+	batch, err := healStateWithRollbackInfo(sessiontest.SeedBead(t, closed), false, true, sessionFrontDoor(store), clk, nil, 0, true)
 	if err != nil {
 		t.Fatalf("heal closed bead: %v", err)
 	}
@@ -208,7 +208,7 @@ func TestHealStateWithRollbackInfoClosedGuardAndWrite(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	batch, err = healStateWithRollbackInfo(sessiontest.SeedBead(t, live), false, true, sessionFrontDoor(store), clk, 0, true)
+	batch, err = healStateWithRollbackInfo(sessiontest.SeedBead(t, live), false, true, sessionFrontDoor(store), clk, nil, 0, true)
 	if err != nil {
 		t.Fatalf("heal live bead: %v", err)
 	}

@@ -95,7 +95,7 @@ func TestPhantomReplacementSessionKeyRepro(t *testing.T) {
 
 	// --- The next reconciler tick observes the runtime is gone. ---
 	info := seedSessionInfo(got)
-	healed := healStatePatchWithRollbackInfo(info, false /*alive*/, true /*observed*/, env.clk, 5*time.Minute, true)
+	healed := healStatePatchWithRollbackInfo(info, false /*alive*/, true /*observed*/, env.clk, nil, 5*time.Minute, true)
 
 	// FINDING 3 (inverted) — the decisive one. Before the fix, the heal
 	// cleared the just-minted key because an active session always trips

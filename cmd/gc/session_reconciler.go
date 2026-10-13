@@ -1407,6 +1407,11 @@ func pendingCreateLeaseActiveInfo(i sessionpkg.Info, clk clock.Clock, startupTim
 // window still handles corrupt/unparseable last_woke_at metadata and generic
 // creating-state cleanup, while never-started creates need enough time to sit
 // behind a busy pool start queue.
+//
+// The reconcile pass reads this lease at the tick's start, not at the live
+// clock (withLeaseDecisionTime): a tick that runs longer than this window
+// must not expire the creates it allocated itself before its start phase has
+// run. Measured 2026-10-12, vn-m0i7sn9.
 const pendingCreateNeverStartedTimeout = 10 * time.Minute
 
 // wakeUndesiredGrace is how long a live session woken recently is spared the
@@ -1836,6 +1841,10 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 		}
 	}
 	capacityGuard := reconcileOpts.capacityGuard
+	// Every pending-create lease in this pass is judged at one instant, the
+	// tick's start (withLeaseDecisionTime), never at the live clock a slow
+	// pass keeps reading later and later (vn-m0i7sn9).
+	leaseClk := reconcileOpts.leaseClock(clk)
 	effectiveStartOptions := startOptions
 	if !storeQueryPartial && reconcileOpts.workDirResolver == nil && len(assignedWorkBeads) > 0 {
 		effectiveStartOptions = append(append([]startExecutionOption(nil), startOptions...), withTaskWorkDirResolver(newAssignedTaskWorkDirResolver(cityPath, assignedWorkBeads)))
@@ -2140,7 +2149,7 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 				if cfg != nil {
 					startupTimeout = cfg.Session.StartupTimeoutDuration()
 				}
-				if pendingCreateLeaseExpiredForRollbackInfo(info, clk, startupTimeout) {
+				if pendingCreateLeaseExpiredForRollbackInfo(info, leaseClk, startupTimeout) {
 					template := normalizedSessionTemplateInfo(info, cfg)
 					if template == "" {
 						template = info.Template
@@ -2258,7 +2267,7 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 				if template == "" {
 					template = info.Template
 				}
-				if pendingCreateSessionStillLeasedInfo(info, cfg, clk) {
+				if pendingCreateSessionStillLeasedInfo(info, cfg, leaseClk) {
 					if trace != nil {
 						trace.RecordDecision(TraceSiteReconcilerPendingCreatePreserved, TraceReasonPendingCreate, TraceOutcomeKeptOpen, template, name, traceRecordPayload{
 							"pending_create_claim": strings.TrimSpace(infoByID[id].PendingCreateClaimMetadata),
@@ -2327,7 +2336,7 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 			stateBeforeHeal := strings.TrimSpace(infoByID[id].MetadataState)
 			pendingCreateStartedAtBeforeHeal := strings.TrimSpace(infoByID[id].PendingCreateStartedAt)
 			lastWokeAtBeforeHeal := strings.TrimSpace(infoByID[id].LastWokeAt)
-			healBatch, healErr := healStateWithRollbackInfo(infoByID[id], providerAlive, livenessErr == nil, sessFront, clk, startupTimeout, !storeQueryPartial)
+			healBatch, healErr := healStateWithRollbackInfo(infoByID[id], providerAlive, livenessErr == nil, sessFront, clk, leaseClk, startupTimeout, !storeQueryPartial)
 			if healErr != nil {
 				fmt.Fprintf(stderr, "healState: SetMetadataBatch %s: %v\n", id, healErr) //nolint:errcheck
 				continue
@@ -2390,7 +2399,7 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 						"degraded":       preserveErr != nil,
 					})
 				}
-			case pendingCreateSessionStillLeasedInfo(infoPostHeal, cfg, clk):
+			case pendingCreateSessionStillLeasedInfo(infoPostHeal, cfg, leaseClk):
 				template := normalizedSessionTemplateInfo(infoPostHeal, cfg)
 				if template == "" {
 					template = infoPostHeal.Template
@@ -2923,7 +2932,7 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 			if cfg != nil {
 				startupTimeout = cfg.Session.StartupTimeoutDuration()
 			}
-			expired := pendingCreateLeaseExpiredForRollbackInfo(infoPostZombie, clk, startupTimeout)
+			expired := pendingCreateLeaseExpiredForRollbackInfo(infoPostZombie, leaseClk, startupTimeout)
 			// A never-started (or capacity-refused) row waits in the queue
 			// while its endpoint refuses starts, and for a fresh window after
 			// it recovers, instead of rolling back and being recreated.
@@ -3430,7 +3439,7 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 		stateBeforeHeal := sessionpkg.State(strings.TrimSpace(infoByID[id].MetadataState))
 		pendingCreateStartedAtBeforeHeal := strings.TrimSpace(infoByID[id].PendingCreateStartedAt)
 		lastWokeAtBeforeHeal := strings.TrimSpace(infoByID[id].LastWokeAt)
-		healBatch, healErr := healStateWithRollbackInfo(infoByID[id], alive, true, sessFront, clk, startupTimeout, !capacityHeld)
+		healBatch, healErr := healStateWithRollbackInfo(infoByID[id], alive, true, sessFront, clk, leaseClk, startupTimeout, !capacityHeld)
 		if healErr != nil {
 			fmt.Fprintf(stderr, "healState: SetMetadataBatch %s: %v\n", id, healErr) //nolint:errcheck
 			continue
@@ -3883,7 +3892,7 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 		// this tick's snapshot exactly as the old raw refresh kept it off; #2345.)
 		infoAsleepDrift := infoByID[id]
 		skipAsleepDriftRepair := driftRestartedInPlace ||
-			pendingResumePreservingNamedRestartInfo(infoAsleepDrift, clk, startupTimeout)
+			pendingResumePreservingNamedRestartInfo(infoAsleepDrift, leaseClk, startupTimeout)
 		if !alive && isNamedSessionInfo(infoByID[id]) && !skipAsleepDriftRepair {
 			template := tp.TemplateName
 			if template == "" {

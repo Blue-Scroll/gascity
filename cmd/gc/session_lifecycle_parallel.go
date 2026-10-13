@@ -381,7 +381,11 @@ type startExecutionOptions struct {
 	// performs the closes. Safe to defer: the closes already fail closed and are
 	// deferred under storeQueryPartial today.
 	deferSessionClosesOnBoot bool
-	readyAssignedFlags       []bool
+	// leaseDecisionTime is the instant the reconcile pass judges every
+	// pending-create lease at. Zero means the live clock. See
+	// withLeaseDecisionTime.
+	leaseDecisionTime  time.Time
+	readyAssignedFlags []bool
 	// assignedWorkStores is index-aligned with the assignedWorkBeads passed to
 	// the same reconcile pass: the store each row was read through. The
 	// orphan-close tie-break releases through it instead of re-deriving an owner
@@ -521,6 +525,38 @@ func withDeferSessionClosesOnBoot() startExecutionOption {
 	return func(opts *startExecutionOptions) {
 		opts.deferSessionClosesOnBoot = true
 	}
+}
+
+// withLeaseDecisionTime pins the instant a reconcile pass judges every
+// pending-create lease at: the tick's start. Without it the pass reads the
+// live clock per bead, and a slow pass expires leases it has not yet had a
+// chance to serve.
+//
+// Measured 2026-10-12 on vessel-network (vn-m0i7sn9): one tick ran 41 minutes.
+// It allocated 7 polecat-opus-high beads at minute 28, reached them in the
+// forward pass at minute 40, read their never-started lease
+// (pendingCreateNeverStartedTimeout, 10m) as expired on the live clock and
+// rolled them back, and only then ran start_execution at minute 41. The next
+// tick allocated 10 more and did the same. 49 opus-high creates died that day
+// without one provider Start, and the pool read as dead for an hour.
+//
+// A bead this tick allocated can never be older than the tick, so judged at
+// the tick's start its lease is always fresh. A bead that already waited a
+// full lease before this tick began still expires, which is the queue-wait
+// the 10 minutes were written for.
+func withLeaseDecisionTime(at time.Time) startExecutionOption {
+	return func(opts *startExecutionOptions) {
+		opts.leaseDecisionTime = at
+	}
+}
+
+// leaseClock is the clock the pass hands to every pending-create lease
+// read: fixed at leaseDecisionTime when one was given, else the live clk.
+func (opts startExecutionOptions) leaseClock(clk clock.Clock) clock.Clock {
+	if opts.leaseDecisionTime.IsZero() {
+		return clk
+	}
+	return clock.Fixed{Time: opts.leaseDecisionTime}
 }
 
 // withReadyAssignedFlags installs the per-bead wake-demand readiness slice,

@@ -152,7 +152,7 @@ func healStateInfo(session *beads.Bead, alive bool, sessFront *sessionpkg.Store,
 	if ts, ok := sessFront.Store().Store.(*testStore); ok {
 		ts.persistRow(*session)
 	}
-	batch, err := healStateWithRollbackInfo(seedSessionInfo(*session), alive, true, sessFront, clk, 0, true)
+	batch, err := healStateWithRollbackInfo(seedSessionInfo(*session), alive, true, sessFront, clk, nil, 0, true)
 	if err != nil {
 		panic("healStateInfo: " + err.Error())
 	}
@@ -167,7 +167,7 @@ func healStateInfo(session *beads.Bead, alive bool, sessFront *sessionpkg.Store,
 // healStatePatchFromBead is the test shim for the retired raw healStatePatch /
 // healStatePatchWithRollback: it projects the bead to Info and calls the Info form.
 func healStatePatchFromBead(session beads.Bead, alive bool, clk clock.Clock, startupTimeout time.Duration) map[string]string {
-	return healStatePatchWithRollbackInfo(seedSessionInfo(session), alive, true, clk, startupTimeout, true)
+	return healStatePatchWithRollbackInfo(seedSessionInfo(session), alive, true, clk, nil, startupTimeout, true)
 }
 
 // syncBeadFromStore mirrors the persisted metadata writes for session.ID back
@@ -3444,7 +3444,7 @@ func TestHealStateWithRollbackInfoDoesNotRevertAConcurrentSuspend(t *testing.T) 
 	if err != nil {
 		t.Fatalf("Get: %v", err)
 	}
-	if want := healStatePatchWithRollbackInfo(snapshot, true, true, clk, 0, true); want["state"] != "awake" {
+	if want := healStatePatchWithRollbackInfo(snapshot, true, true, clk, nil, 0, true); want["state"] != "awake" {
 		t.Fatalf("test premise: heal from the snapshot = %v, want state=awake", want)
 	}
 
@@ -3452,7 +3452,7 @@ func TestHealStateWithRollbackInfoDoesNotRevertAConcurrentSuspend(t *testing.T) 
 		t.Fatalf("suspend write: %v", err)
 	}
 
-	batch, err := healStateWithRollbackInfo(snapshot, true, true, sessFront, clk, 0, true)
+	batch, err := healStateWithRollbackInfo(snapshot, true, true, sessFront, clk, nil, 0, true)
 	if err != nil {
 		t.Fatalf("healStateWithRollbackInfo: %v", err)
 	}
@@ -3478,7 +3478,7 @@ func TestHealStateWithRollbackInfoDoesNotRevertAConcurrentSuspend(t *testing.T) 
 		t.Fatalf("reset state: %v", err)
 	}
 	fresh = fresh.ApplyPatch(map[string]string{"state": "active"})
-	batch, err = healStateWithRollbackInfo(fresh, true, true, sessFront, clk, 0, true)
+	batch, err = healStateWithRollbackInfo(fresh, true, true, sessFront, clk, nil, 0, true)
 	if err != nil || batch["state"] != "awake" {
 		t.Fatalf("heal from a current snapshot = (%v, %v), want state=awake applied", batch, err)
 	}

@@ -936,7 +936,13 @@ func mergeMetadataPatch(dst, src map[string]string) map[string]string {
 // pendingCreateLeaseExpiredForRollbackInfo, isNamedSessionInfo,
 // namedSessionModeInfo). Byte-identical to the bead form; the reconciler forward
 // pass folds the returned batch onto its coherent infoByID snapshot.
-func healStatePatchWithRollbackInfo(info sessionpkg.Info, alive bool, observed bool, clk clock.Clock, startupTimeout time.Duration, rollbackAvailable bool) map[string]string {
+// leaseClk is the clock every pending-create lease is read against; nil means
+// clk. The reconcile pass hands in its tick-start clock so this heal and its
+// own rollback decision agree (withLeaseDecisionTime).
+func healStatePatchWithRollbackInfo(info sessionpkg.Info, alive bool, observed bool, clk clock.Clock, leaseClk clock.Clock, startupTimeout time.Duration, rollbackAvailable bool) map[string]string {
+	if leaseClk == nil {
+		leaseClk = clk
+	}
 	var now time.Time
 	var staleCreatingAfter time.Duration
 	if clk != nil {
@@ -972,7 +978,7 @@ func healStatePatchWithRollbackInfo(info sessionpkg.Info, alive bool, observed b
 	}
 	stalePendingCreateRollback := false
 	if !alive && strings.TrimSpace(info.MetadataState) == "failed-create" {
-		if info.PendingCreateClaim && pendingCreateLeaseActiveInfo(info, clk, 0) {
+		if info.PendingCreateClaim && pendingCreateLeaseActiveInfo(info, leaseClk, 0) {
 			return nil
 		}
 		target = string(sessionpkg.StateAsleep)
@@ -987,7 +993,7 @@ func healStatePatchWithRollbackInfo(info sessionpkg.Info, alive bool, observed b
 	// already understands start-pending via pendingCreateRollbackState, so widen
 	// the gate to match instead of restricting it to "creating".
 	if !alive && pendingCreateQueuedOrCreatingState(info.MetadataState) && info.PendingCreateClaim {
-		leaseExpired := pendingCreateLeaseExpiredForRollbackInfo(info, clk, startupTimeout)
+		leaseExpired := pendingCreateLeaseExpiredForRollbackInfo(info, leaseClk, startupTimeout)
 		switch {
 		case !leaseExpired || !rollbackAvailable:
 			// ProjectLifecycle uses the generic one-minute creating timeout.
@@ -1052,14 +1058,14 @@ func healStatePatchWithRollbackInfo(info sessionpkg.Info, alive bool, observed b
 // re-read revision where the store has conditional writes. A refused heal is
 // skipped rather than retried. The heal is level-triggered, so the next tick
 // recomputes it from a snapshot that includes the concurrent write.
-func healStateWithRollbackInfo(info sessionpkg.Info, alive bool, observed bool, sessFront *sessionpkg.Store, clk clock.Clock, startupTimeout time.Duration, rollbackAvailable bool) (map[string]string, error) {
+func healStateWithRollbackInfo(info sessionpkg.Info, alive bool, observed bool, sessFront *sessionpkg.Store, clk clock.Clock, leaseClk clock.Clock, startupTimeout time.Duration, rollbackAvailable bool) (map[string]string, error) {
 	// Closed beads are terminal; their advisory state metadata should not move
 	// (matches healStateWithRollback's session.Status == "closed" guard —
 	// Info.Closed is the projected mirror).
 	if info.Closed {
 		return nil, nil
 	}
-	batch := healStatePatchWithRollbackInfo(info, alive, observed, clk, startupTimeout, rollbackAvailable)
+	batch := healStatePatchWithRollbackInfo(info, alive, observed, clk, leaseClk, startupTimeout, rollbackAvailable)
 	if len(batch) == 0 {
 		return nil, nil
 	}

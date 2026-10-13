@@ -24,3 +24,14 @@ func (f *Fake) Now() time.Time { return f.Time }
 
 // Advance moves the fake clock forward by d.
 func (f *Fake) Advance(d time.Duration) { f.Time = f.Time.Add(d) }
+
+// Fixed reports one moment forever: the time a decision was made. Hand it to
+// code that measures an age so every age in one pass is read against the same
+// instant, not against a wall clock that keeps moving while the pass runs.
+// Production code uses it; Fake is for tests that need to move time.
+type Fixed struct {
+	Time time.Time
+}
+
+// Now returns the fixed instant.
+func (f Fixed) Now() time.Time { return f.Time }

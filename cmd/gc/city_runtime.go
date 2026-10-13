@@ -1238,6 +1238,10 @@ func (cr *CityRuntime) reconcilePoolDeaths(prevPoolRunning *map[string]bool) {
 // in order. The tick's arguments are fixed for the pass; the rest is written
 // by the phase that produces it and read by the phases after it.
 type tickPass struct {
+	// startedAt is the instant this tick began. The bead reconcile pass judges
+	// every pending-create lease at this instant (withLeaseDecisionTime), so a
+	// tick that runs past the lease cannot expire the creates it allocated.
+	startedAt        time.Time
 	ctx              context.Context
 	dirty            *atomic.Bool
 	lastProviderName *string
@@ -1371,6 +1375,7 @@ func (cr *CityRuntime) tick(
 		traceDetail = "manual_reload"
 	}
 	p := &tickPass{
+		startedAt:        time.Now().UTC(),
 		ctx:              ctx,
 		dirty:            dirty,
 		lastProviderName: lastProviderName,
@@ -1772,7 +1777,7 @@ func (cr *CityRuntime) tickApplySoftReloadAcceptance(p *tickPass) bool {
 func (cr *CityRuntime) tickBeadReconcile(p *tickPass) bool {
 	if cr.sessionDrains != nil {
 		phaseStart := startTickPhase()
-		cr.beadReconcileTick(p.ctx, p.result, p.sessionBeads, p.trace, false)
+		cr.beadReconcileTickAt(p.ctx, p.result, p.sessionBeads, p.trace, false, p.startedAt)
 		p.recordPhase(TraceSiteControllerTickPhase, "bead_reconcile_tick", phaseStart, traceDesiredStateFields(p.result))
 	}
 	return false
@@ -1948,7 +1953,7 @@ func (cr *CityRuntime) startupBuildDesiredStateAndSync(p *tickPass) bool {
 
 func (cr *CityRuntime) startupBeadReconcile(p *tickPass) bool {
 	if cr.sessionDrains != nil {
-		cr.beadReconcileTick(p.ctx, p.result, p.sessionBeads, p.trace, true)
+		cr.beadReconcileTickAt(p.ctx, p.result, p.sessionBeads, p.trace, true, p.startedAt)
 	}
 	return false
 }
@@ -3070,7 +3075,16 @@ func (cr *CityRuntime) newWarmClaimTriggerResolver(servingRigs map[string]beads.
 // gastownhall/gascity#3288) and the usage lane's live transcript sweep (bounded
 // per-session file discovery and reads across every awake session at once). The
 // first steady-state tick performs both.
+// beadReconcileTick runs the pass as a decision made right now. A tick calls
+// beadReconcileTickAt with its own start instead, so a slow tick judges leases
+// at the moment it began.
 func (cr *CityRuntime) beadReconcileTick(ctx context.Context, result DesiredStateResult, sessionBeads *sessionBeadSnapshot, trace *sessionReconcilerTraceCycle, bootReconcile bool) {
+	cr.beadReconcileTickAt(ctx, result, sessionBeads, trace, bootReconcile, time.Now().UTC())
+}
+
+// beadReconcileTickAt runs the bead reconcile pass with every pending-create
+// lease judged at decidedAt (withLeaseDecisionTime says why).
+func (cr *CityRuntime) beadReconcileTickAt(ctx context.Context, result DesiredStateResult, sessionBeads *sessionBeadSnapshot, trace *sessionReconcilerTraceCycle, bootReconcile bool, decidedAt time.Time) {
 	if cr.legacySessionEntry("bead_reconcile_tick") {
 		return
 	}
@@ -3289,6 +3303,7 @@ func (cr *CityRuntime) beadReconcileTick(ctx context.Context, result DesiredStat
 		// idle-timeout relaunch backstop, deduped by the marker + the
 		// unclaimed-trigger gate.
 		withWarmClaimProbe(buildWarmClaimTriggerProbe(cr.newWarmClaimTriggerResolver(rigStores), cr.stderr)),
+		withLeaseDecisionTime(decidedAt),
 	}
 	if bootReconcile {
 		// #3288: skip the per-session orphan/failed-create session-bead closes on

@@ -98,7 +98,7 @@ func TestFailedStartRollsBackAfterHealToAwake(t *testing.T) {
 	result := pendingCreateFenceFixture(t, store)
 	info := result.prepared.candidate.info
 	clk := &clock.Fake{Time: time.Now()}
-	patch, err := healStateWithRollbackInfo(info, true, true, sessionFrontDoor(store), clk, 0, true)
+	patch, err := healStateWithRollbackInfo(info, true, true, sessionFrontDoor(store), clk, nil, 0, true)
 	if err != nil {
 		t.Fatal(err)
 	}
