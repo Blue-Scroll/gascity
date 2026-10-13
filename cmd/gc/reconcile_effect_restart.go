@@ -141,8 +141,20 @@ type relaunchPlan struct {
 }
 
 // relaunchStep hands the Call the relaunch A14 still decides on the fresh
-// row and runtime read.
+// row and runtime read, and that the fence's legs this section read under
+// the lease record pass (v5.9g; STALE-READ 7.2): the deferral's reads came
+// before the record, so a pending interaction, an attach or work that lands
+// between them holds the Relaunch here. The legs are driftNeeds' (L5 on an
+// ordinary row only), less L4 where legacy's pending exemption applies, as
+// the deferral reads it.
 func relaunchStep(v txView) txStep {
+	legs := driftNeeds(v.World, v.It).Legs
+	if pendingExempt(v.Row, v.Now) {
+		legs &^= legPending
+	}
+	if fv := fenceDestructive(v.RT, v.Fence, fenceRequest{Row: v.Row, Legs: legs}); !fv.Proceed {
+		return txStep{Refuse: causeDriftDeferred + fv.Reason}
+	}
 	w := v.World.withRow(v.It.Key, v.Row, v.Meta).withRuntime(v.It.Key, v.RT)
 	if fresh, _ := decideRow(&w, v.Alloc, v.It.Key); fresh.Kind != v.It.Kind {
 		return txStep{Refuse: causeRedecided}
@@ -169,7 +181,7 @@ type relaunched struct {
 // Relaunch. An attach holds it; any failure is the fallback's.
 func relaunchCall(ctx context.Context, c txCaps, p relaunchPlan) (relaunched, error) {
 	out := relaunched{Named: p.named, Hash: p.hash}
-	r, ok := c.start.sp.(runtime.RelaunchProvider)
+	r, ok := p.leaf.(runtime.RelaunchProvider) // the leaf the section fenced, never the composite, whose router re-routes by name (C8.7)
 	if !ok {
 		out.Err = runtime.ErrRelaunchUnsupported
 		return out, nil
