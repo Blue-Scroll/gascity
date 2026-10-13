@@ -742,6 +742,11 @@ type tx struct {
 	facts       effectFacts
 	pass        any // the concluded step's Pass, to its section's Call
 	view        txView
+	// fresh is the latest fresh read, when it found the name absent on
+	// every hop (rtAbsent) or the row's runtime alive and Current; zero once
+	// a later read finds anything else or a Call starts or stops a runtime.
+	// The settlement publishes it (CONTRACT O4, v5.10g).
+	fresh notedRuntime
 }
 
 // run runs the sections, each under the row's mutation lock.
@@ -790,9 +795,9 @@ func (t *tx) run(ctx context.Context, sections []section) settlement {
 		}
 		switch sec.callKind {
 		case callStart:
-			t.started = true
+			t.started, t.fresh = true, notedRuntime{}
 		case callStop:
-			t.started, t.stopped = false, true // a stopped runtime writes nothing more
+			t.started, t.stopped, t.fresh = false, true, notedRuntime{} // a stopped runtime writes nothing more
 		}
 		if err := t.c.at(ctx, seamAfterCall); err != nil {
 			s = injected(err)
@@ -805,8 +810,23 @@ func (t *tx) run(ctx context.Context, sections []section) settlement {
 			break
 		}
 	}
+	t.noteFresh()
 	s.Facts = t.facts
 	return s
+}
+
+// noteFresh publishes the latest fresh read (CONTRACT O4, amended in
+// v5.10g): the planner notes the name gone, or the row's runtime alive and
+// Current, at the read's issue time, so the next pass reads what this
+// effect read rather than deciding again on an inventory that lags it. A
+// note the effect made itself at or after the read (a start's commit)
+// stands; a later inventory pass overrides either.
+func (t *tx) noteFresh() {
+	f := t.fresh
+	if f.At.IsZero() || f.Name == "" || t.facts.Noted != nil && !t.facts.Noted.At.Before(f.At) {
+		return
+	}
+	t.facts.Noted = &f
 }
 
 // section runs sec's attempts; end ends the effect with the settlement.
@@ -948,6 +968,14 @@ func (t *tx) read(ctx context.Context, sec section) (settlement, bool) {
 			return refused(cause), false
 		}
 		t.view.RT = rt
+		switch {
+		case rt.Class == rtAbsent:
+			t.fresh = notedRuntime{Name: t.name, At: t.view.Now, Gone: true}
+		case rt.Alive() && compareIdentity(t.expect, rt.Identity) == identityCurrent:
+			t.fresh = notedRuntime{Name: t.name, At: t.view.Now}
+		default:
+			t.fresh = notedRuntime{}
+		}
 	}
 	if t.needs.Legs != 0 || t.needs.Idle {
 		if cause := t.readFence(ctx); cause != "" {
