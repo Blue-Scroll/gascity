@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -10,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gastownhall/gascity/internal/api"
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/clock"
 	"github.com/gastownhall/gascity/internal/config"
@@ -34,7 +36,7 @@ func legacyWakeFailure(t *testing.T, row beads.Bead) map[string]string {
 	t.Helper()
 	row.Metadata = maps.Clone(row.Metadata)
 	m := beads.NewMemStoreFrom(0, []beads.Bead{row}, nil)
-	recordWakeFailure(sessionInfoFromBead(row), sessionTranscriptSearchPaths(nil), sessionFrontDoor(m), &clock.Fake{Time: gatherNow}, "worker")
+	recordWakeFailure(sessionInfoFromBead(row), sessionTranscriptSearchPaths(nil), sessionFrontDoor(m), &clock.Fake{Time: gatherNow}, "worker", resumeFailure{}, nil)
 	b, err := m.Get(row.ID)
 	if err != nil {
 		t.Fatal(err)
@@ -83,6 +85,174 @@ func TestAbandonKeepsConversationUnderObservePaths(t *testing.T) {
 			t.Fatalf("observed %v: keeps %v, write %+v; want the conversation kept=%v and the attempt accrued", observed, read.keeps, step.Write, observed)
 		}
 	}
+}
+
+// Kills a resume backstop that resets a conversation a fresh start cannot
+// help, or that misses a resume the provider refused (mc-bm1af, CONTRACT
+// v5.9w): for a failed start of a conversation whose transcript reads
+// present, a refusal resets on the first failure, a startup death of a
+// resume launch counts and resets at the third in a row, and a capacity
+// refusal (a CapacityError wrapping the startup death included), a deadline,
+// a name collision, a spawn error, or any failure of a fresh launch neither
+// resets nor counts. v2's abandon matches legacy's recordWakeFailure on every
+// key, and a committed manual conversation's reset alone records
+// session.conversation_reset{reason:resume-failed}.
+func TestResumeBackstopOnAFailedStart(t *testing.T) {
+	prev := staleResumeKeyProbe
+	staleResumeKeyProbe = func([]string, string, string, string) (bool, bool) { return true, true }
+	t.Cleanup(func() { staleResumeKeyProbe = prev })
+	died := fmt.Errorf("session %q: %w", "s-gc-1", runtime.ErrSessionDiedDuringStartup)
+	refusal := fmt.Errorf("%w; last pane output: No conversation found with session ID: k-1", runtime.ErrSessionDiedDuringStartup)
+	for _, c := range []struct {
+		name     string
+		resumed  bool
+		err      error
+		failures string
+		reset    bool
+		count    string // resume_failures after it
+	}{
+		{"a refusal, the first failure", true, refusal, "", true, ""},
+		{"another key's refusal in the history, a startup death", true, fmt.Errorf("%w; last pane output: > it said No conversation found with session ID: k-0\nkilled: out of memory", runtime.ErrSessionDiedDuringStartup), "", false, "1"},
+		{"a startup death, the first", true, died, "", false, "1"},
+		{"a startup death, the second", true, died, "1", false, "2"},
+		{"a startup death, the third", true, died, "2", true, ""},
+		{"a capacity refusal wrapping a startup death", true, &runtime.CapacityError{ExitCode: 75, Err: died}, "2", false, "2"},
+		{"a deadline on a startup death", true, fmt.Errorf("startup: %w (%w)", context.DeadlineExceeded, runtime.ErrSessionDiedDuringStartup), "2", false, "2"},
+		{"a name collision on a startup death", true, fmt.Errorf("%w (%w)", runtime.ErrSessionExists, runtime.ErrSessionDiedDuringStartup), "2", false, "2"},
+		{"a spawn error", true, errors.New("tmux: exec failed"), "2", false, "2"},
+		{"a fresh launch's startup death", false, refusal, "2", false, "2"},
+	} {
+		for _, manual := range []bool{true, false} {
+			name := fmt.Sprintf("%s, manual %v", c.name, manual)
+			meta := []string{"generation", "4", "instance_token", "tok-4", "provider", "claude", "work_dir", "/work", "session_key", "k-1", "started_config_hash", "h-1", "wake_attempts", "0", "resume_failures", c.failures}
+			if manual {
+				meta = append(meta, "session_origin", "manual")
+			}
+			row := poolRow("gc-1", "worker", 1, "creating", meta...)
+			rf := startResumeFailure(c.resumed, false, "k-1", c.err, "")
+
+			rec := events.NewFake()
+			m := beads.NewMemStoreFrom(0, []beads.Bead{withMeta(row)}, nil)
+			recordWakeFailure(sessionInfoFromBead(row), sessionTranscriptSearchPaths(nil), sessionFrontDoor(m), &clock.Fake{Time: gatherNow}, "worker", rf, rec)
+			legacy, _ := m.Get(row.ID)
+			if reset := legacy.Metadata["session_key"] == ""; reset != c.reset || legacy.Metadata["resume_failures"] != c.count {
+				t.Fatalf("%s: legacy reset %v resume_failures %q, want reset %v and %q", name, reset, legacy.Metadata["resume_failures"], c.reset, c.count)
+			}
+			want := 0
+			if c.reset && manual {
+				want = 1
+			}
+			if got := resumeFailedEvents(t, rec.Events, "worker"); got != want {
+				t.Fatalf("%s: legacy recorded %d resume-failed resets, want %d", name, got, want)
+			}
+
+			k := startKit(t, intentStart, "creating")
+			read := startFailureRead{startFailure: startFailure{cause: causeStartError, err: c.err, display: "worker", relaunched: true}, keeps: true, resume: rf}
+			step := abandonStep(abandonView(k, row, txRuntime{Class: rtAbsent}, read))
+			for key, v := range legacy.Metadata {
+				if v != row.Metadata[key] && step.Write[key] != v {
+					t.Errorf("%s: v2 writes %s = %q, legacy writes %q", name, key, step.Write[key], v)
+				}
+			}
+			if got := resumeFailedEvents(t, step.Facts.Events, "worker"); got != want {
+				t.Fatalf("%s: v2 recorded %d resume-failed resets, want %d", name, got, want)
+			}
+		}
+	}
+}
+
+// Kills a resume backstop run a conversation reset leaves behind (#7729
+// review): after `gc session reset` (RestartRequestPatch) or any other reset
+// (the wake-failure and churn resets, the stale-key clear, the fresh-wake
+// reset, legacy's dead-runtime heal) with the count at 2, the new
+// conversation's first resume death counts 1 and resets nothing, in both
+// modes.
+func TestConversationResetsEndTheResumeRun(t *testing.T) {
+	prev := staleResumeKeyProbe
+	staleResumeKeyProbe = func([]string, string, string, string) (bool, bool) { return true, true }
+	t.Cleanup(func() { staleResumeKeyProbe = prev })
+	run := map[string]string{"resume_failures": "2", "resume_launch": "true", "session_key": "k-old", "started_config_hash": "h-old"}
+	stale := session.MetadataPatch(clearStaleResumeKeyMetadata("", nil))
+	healInfo := session.Info{ID: "gc-1", MetadataState: "awake", SessionKey: "k-old", StartedConfigHash: "h-old", CreatedAt: gatherNow.Add(-time.Hour)}
+	freshWake := session.MetadataPatch{}
+	for _, k := range session.FreshWakeConversationResetKeys() {
+		freshWake[k] = ""
+	}
+	for name, reset := range map[string]session.MetadataPatch{
+		"gc session reset":           session.RestartRequestPatch("", gatherNow),
+		"a wake failure's reset":     session.ConversationResetPatch(true),
+		"a churn reset":              session.ConversationResetPatch(false),
+		"the stale-key clear":        stale,
+		"the fresh-wake reset":       freshWake,
+		"legacy's dead-runtime heal": legacyHeal(healInfo),
+	} {
+		meta := reset.Apply(run)
+		if meta["resume_failures"] != "" || meta["resume_launch"] != "" {
+			t.Fatalf("%s: run %q/%q left behind", name, meta["resume_failures"], meta["resume_launch"])
+		}
+		// The new conversation: committed, then its first resume dies while
+		// creating (the heal's asleep state is the old incarnation's).
+		meta["session_key"], meta["started_config_hash"] = "k-new", "h-new"
+		delete(meta, "state")
+		row := poolRow("gc-1", "worker", 1, "creating", append([]string{"generation", "4", "instance_token", "tok-4", "provider", "claude", "work_dir", "/work", "wake_attempts", "0"}, flatten(meta)...)...)
+		rf := startResumeFailure(true, true, "k-new", errors.New("boom"), "")
+
+		m := beads.NewMemStoreFrom(0, []beads.Bead{withMeta(row)}, nil)
+		recordWakeFailure(sessionInfoFromBead(row), sessionTranscriptSearchPaths(nil), sessionFrontDoor(m), &clock.Fake{Time: gatherNow}, "worker", rf, nil)
+		legacy, _ := m.Get(row.ID)
+		if legacy.Metadata["session_key"] != "k-new" || legacy.Metadata["resume_failures"] != "1" {
+			t.Fatalf("%s: legacy key %q resume_failures %q, want the new conversation kept and counted 1", name, legacy.Metadata["session_key"], legacy.Metadata["resume_failures"])
+		}
+		k := startKit(t, intentStart, "creating")
+		read := startFailureRead{startFailure: startFailure{cause: causeStartError, err: errors.New("boom"), display: "worker", relaunched: true}, keeps: true, resume: rf}
+		step := abandonStep(abandonView(k, row, txRuntime{Class: rtAbsent}, read))
+		if hasAny(step.Write, "session_key") || step.Write["resume_failures"] != "1" {
+			t.Fatalf("%s: v2 write %v, want the new conversation kept and counted 1", name, step.Write)
+		}
+	}
+}
+
+// Kills the failure Call blind to the dead pane: v2 classifies a refusal on
+// the peeked screen as well as in the error, and a launch's resume flag
+// rides from its prepare into the failure.
+func TestFailureCallClassifiesTheResume(t *testing.T) {
+	k := startKit(t, intentStart, "creating")
+	row := poolRow("gc-1", "worker", 1, "creating", "generation", "4", "instance_token", "tok-4", "session_key", "k-1", "started_config_hash", "h-1")
+	v := abandonView(k, row, txRuntime{Class: rtAbsent}, startFailureRead{})
+	out := startOutcome{prepared: &preparedStart{resumed: true}}
+	f := failStart(v, out, causeDiedDuringStartup, nil).Pass.(startEnd).failed
+	if !f.resumed || !f.died {
+		t.Fatalf("failure %+v, want a resume launch that died", f)
+	}
+	if rf := startResumeFailure(f.resumed, f.died, "k-1", f.err, "No conversation found with session ID: k-1"); !rf.refused || !rf.counted {
+		t.Fatalf("a refusal on the pane: %+v, want refused and counted", rf)
+	}
+	if rf := startResumeFailure(f.resumed, f.died, "k-1", f.err, ""); rf.refused || !rf.counted {
+		t.Fatalf("a death with a blank pane: %+v, want counted alone", rf)
+	}
+	refused := failStart(v, out, causeStartError, fmt.Errorf("%w; last pane output: No conversation found with session ID: k-1", runtime.ErrSessionDiedDuringStartup)).Pass.(startEnd).failed
+	if r := readStartFailure(context.Background(), txCaps{}, *refused); !r.resume.refused || !r.resume.counted {
+		t.Fatalf("the failure Call's read %+v, want the refusal classified", r.resume)
+	}
+}
+
+// resumeFailedEvents counts evs' session.conversation_reset events, each
+// checked for gc-1, subject, the template worker and the resume-failed
+// reason.
+func resumeFailedEvents(t *testing.T, evs []events.Event, subject string) int {
+	t.Helper()
+	n := 0
+	for _, e := range evs {
+		if e.Type != events.SessionConversationReset {
+			continue
+		}
+		var p api.SessionLifecyclePayload
+		if err := json.Unmarshal(e.Payload, &p); err != nil || e.SessionID != "gc-1" || e.Subject != subject || p.Template != "worker" || p.Reason != "resume-failed" {
+			t.Fatalf("event %+v (payload %+v, err %v), want gc-1, subject %q, template worker, reason resume-failed", e, p, err, subject)
+		}
+		n++
+	}
+	return n
 }
 
 // Kills a class that writes the wrong patch, an abandon that does not fail,
@@ -961,7 +1131,7 @@ func TestComposedStartKeepsTheFoldedHeal(t *testing.T) {
 	k, _ := launchKit(t, "active", "last_woke_at", woke, "detached_at", woke)
 	row := k.p.World.Census.Rows[k.it.Key]
 	r := &rowFacts{w: k.p.World, k: k.it.Key, row: row, found: true, entry: &selectionEntry{Key: k.it.Key, Liveness: livenessGone, Desired: desireWake, Template: "worker", AssignedWork: &assignedWorkView{BeadID: "gw-1"}}}
-	patch, class, _ := deadRuntimePatch(r, true)
+	patch, class, _, _ := deadRuntimePatch(r, true)
 	patch["detached_at"] = ""
 	it := r.startHealed(intent{Kind: intentRowHealFresh, Reason: decideDeadRuntimeHeal, Key: k.it.Key, Patch: patch, Class: class})
 	if it.Kind != intentStart {
@@ -1027,7 +1197,7 @@ func TestStrandedComposedStartStaysCommitted(t *testing.T) {
 	if !r.asleepStranded() {
 		t.Fatal("the seat is not stranded: the case is vacuous")
 	}
-	heal, class, _ := deadRuntimePatch(r, true)
+	heal, class, _, _ := deadRuntimePatch(r, true)
 	it := r.startHealed(intent{Kind: intentRowHealFresh, Reason: decideDeadRuntimeHeal, Key: k.it.Key, Patch: heal, Class: class})
 	if it.Kind != intentStart {
 		t.Fatalf("startHealed = %+v, want a start", it)
