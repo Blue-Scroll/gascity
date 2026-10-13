@@ -715,6 +715,59 @@ func TestCloseRechecksWorkBeforeClosing(t *testing.T) {
 	}
 }
 
+// TestStopRefusesARuntimeReplacedBeforeTheStop (mc-rq4d0). Kills a
+// name-based Stop that kills whatever holds the name at the call: a stop the
+// fence passed on the row's own runtime refuses runtime_moved, stopping
+// nothing and finalizing nothing, when the runtime under the name is
+// replaced between the fence's read and the Stop, by another row's identity,
+// or by another session object carrying the row's own (its id, its creation
+// or both differing); with nothing replaced the stop goes ahead.
+func TestStopRefusesARuntimeReplacedBeforeTheStop(t *testing.T) {
+	s, got, leaf := stopRun(t, signaled(drainOrphaned), undesired(drainOrphaned), func(p *effectPass, leaf *fenceLeaf, _ beads.Store, _ string) {
+		p.seam = func(_ context.Context, at txSeam, _ intent, section, _ int) error {
+			if at == seamBeforeCall && section == 0 {
+				for k, v := range map[string]string{"GC_SESSION_ID": "gc-9", "GC_INSTANCE_TOKEN": "tok-9"} {
+					if err := leaf.SetMeta("s-gc-1", k, v); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			return nil
+		}
+	})
+	if stops(leaf) != 0 || s.Outcome == settledLanded || !signaledRow(got) {
+		t.Fatalf("another row's identity before the Stop: settlement %+v, %d stops, row %v; want no stop and no finalize", s, stops(leaf), got.Metadata)
+	}
+
+	for _, c := range []struct {
+		name, id, created string
+	}{
+		{"another object", "$2", "2"},
+		{"another object id", "$2", "1"},
+		{"another creation", "$1", "2"},
+		{"nothing replaced", "$1", "1"},
+	} {
+		replace := c.id != "$1" || c.created != "1"
+		var obs *freshObserver
+		s, got, _ = stopRun(t, signaled(drainOrphaned), undesired(drainOrphaned), func(p *effectPass, _ *fenceLeaf, _ beads.Store, id string) {
+			obs = &freshObserver{Fake: runtime.NewFake(), l: runtime.Liveness{Running: true, Alive: true, ObjectID: "$1", ObjectCreated: "1"}, env: map[string]string{"GC_SESSION_ID": id, "GC_INSTANCE_TOKEN": "tok-3"}}
+			if err := obs.Fake.Start(context.Background(), "s-gc-1", runtime.Config{}); err != nil {
+				t.Fatal(err)
+			}
+			p.Runtime = obs.tmux()
+			p.seam = func(_ context.Context, at txSeam, _ intent, section, _ int) error {
+				if at == seamBeforeCall && section == 0 {
+					obs.l.ObjectID, obs.l.ObjectCreated = c.id, c.created // the row's identity, on another object when replaced
+				}
+				return nil
+			}
+		})
+		if n := obs.Fake.CountCalls("Stop", "s-gc-1"); replace && (n != 0 || s.Cause != fenceRuntimeMoved) || !replace && n != 1 {
+			t.Fatalf("%s: settlement %+v, %d stops, row %v; want a stop only on the fenced object", c.name, s, n, got.Metadata)
+		}
+	}
+}
+
 // TestSameObjectGuardsForeignAndCorpse (#7612 review, S10/S11). Kills a
 // Foreign finalize or a corpse removal decided on a read whose object
 // changed between its brackets: a Foreign identity read across a replaced
