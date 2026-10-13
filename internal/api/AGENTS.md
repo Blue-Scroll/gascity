@@ -89,3 +89,15 @@ assignee priority across stores and newest-first order within a store, so a
 concrete session's work wins over a template fallback. Stop reading stores once
 the first identity (the session id, when known) has a match, and keep a store's
 partial rows instead of dropping the store.
+
+## Deferred creation baseline
+
+Before scheduling an agent session, persist the command the controller resolves
+for that agent's template as the session's command baseline. Build it with
+`config.BuildProviderTemplateLaunchCommand`, the composition the controller's
+`resolveTemplate` shares, not with the strict `BuildProviderLaunchCommand`:
+the controller omits an `option_defaults` pin it cannot render and logs a
+warning, so the create must do the same instead of failing. Keep explicit
+per-session options, validated at create time, in `template_overrides`;
+otherwise startup can mistake its own baseline for config drift or compare one
+session's overrides against the template.

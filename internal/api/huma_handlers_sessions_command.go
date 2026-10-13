@@ -122,11 +122,10 @@ func (s *Server) humaHandleSessionCreate(ctx context.Context, input *SessionCrea
 	workDirQualifiedName := createCtx.Identity
 	workDir = createCtx.WorkDir
 
-	launchCommand, err := config.BuildProviderLaunchCommandWithoutOptions(s.state.CityPath(), resolved, transport)
+	command, err := s.agentTemplateLaunchCommand(agentCfg, resolved, transport)
 	if err != nil {
 		return nil, apierr.Internal.Msg(err.Error())
 	}
-	command := launchCommand.Command
 	extraMeta := sessionTemplateOverridesMetadata(body.Options, body.Message)
 	extraMeta = agentSessionCreateMetadata(extraMeta, workDirQualifiedName)
 	// The client's keys land with the create, before the controller can see
