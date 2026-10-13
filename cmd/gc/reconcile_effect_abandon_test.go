@@ -530,6 +530,100 @@ func TestRollbackCancelsRetiredWaits(t *testing.T) {
 	}
 }
 
+// Kills an occupant rollback that lands after its occupant left (F1): A10
+// rolls back a pending create inside its lease because the pass read
+// another runtime under its name (Occupied) or its own StaleSelf one (S7).
+// When the effect's fresh read finds that runtime gone, a corpse, or the
+// row's own Current runtime, the occupant is gone and the effect refuses
+// redecided while its lease holds, closing nothing (legacy decides on one
+// live read); a Foreign or StaleSelf runtime still there rolls the row back
+// as before, and so does a gone or dead occupant past the lease.
+func TestRollbackEffectNeedsItsOccupant(t *testing.T) {
+	leased := []string{"pending_create_claim", "true", "pending_create_started_at", gatherNow.Add(-time.Minute).Format(time.RFC3339)}
+	long := gatherNow.Add(-20 * time.Minute).Format(time.RFC3339)
+	expired := []string{"pending_create_claim", "true", "pending_create_started_at", long, "last_woke_at", long} // started: no never-started deadline
+	for _, c := range []struct {
+		name   string
+		meta   []string
+		reason string
+		rt     func(k *txKit)
+		closed bool
+	}{
+		{"Occupied, its occupant gone", leased, decideRollback, func(*txKit) {}, false},
+		{"Occupied, its occupant now a corpse", leased, decideRollback, func(k *txKit) {
+			k.runtimeAs("gc-9", "theirs", func(r *simRuntime) { r.corpse = true })
+		}, false},
+		{"Occupied, the row's own Current runtime in its place", leased, decideRollback, func(k *txKit) { k.runtimeAs("gc-1", "tok", nil) }, false},
+		{"Occupied, an unstamped runtime in its place", leased, decideRollback, func(k *txKit) { k.runtimeAs("", "", nil) }, false},
+		{"Occupied, its Foreign occupant still there", leased, decideRollback, func(k *txKit) { k.runtimeAs("gc-9", "theirs", nil) }, true},
+		{"Occupied, its Foreign occupant still there as a zombie", leased, decideRollback, func(k *txKit) {
+			k.runtimeAs("gc-9", "theirs", func(r *simRuntime) { r.zombie = true })
+		}, true},
+		{"S7, its StaleSelf runtime gone", leased, decideStaleCreate, func(*txKit) {}, false},
+		{"S7, its StaleSelf runtime still there", leased, decideStaleCreate, func(k *txKit) { k.runtimeAs("gc-1", "old", nil) }, true},
+		// Past the lease a gone or dead occupant leaves nothing to wait for:
+		// the row rolls back, as main and legacy roll it back, so a started
+		// create whose name another row's corpse holds is never stranded.
+		// A live non-occupant still holds it at any lease.
+		{"past its lease, started, another row's corpse under its name", expired, decideRollback, func(k *txKit) {
+			k.runtimeAs("gc-9", "theirs", func(r *simRuntime) { r.corpse = true })
+		}, true},
+		{"past its lease, started, its occupant gone", expired, decideRollback, func(*txKit) {}, true},
+		{"past its lease, the row's own Current runtime in its place", expired, decideRollback, func(k *txKit) { k.runtimeAs("gc-1", "tok", nil) }, false},
+		{"a lease anchor two hours ahead (a clock stepped back), its occupant gone", []string{"pending_create_claim", "true", "pending_create_started_at", gatherNow.Add(2 * time.Hour).Format(time.RFC3339)}, decideRollback, func(*txKit) {}, true},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			k := startKit(t, intentRollback, "creating", c.meta...)
+			k.it.Deadline = gatherNow.Add(time.Minute)
+			k.it.Reason, k.it.Occupant = c.reason, true
+			c.rt(k)
+			k.p.World.Census = readCensus(t, gatherNow, censusLegs(rowLeg, k.cache))
+			s := k.runKind()
+			b, _ := k.backing.Get("gc-1")
+			if closed := b.Status == "closed"; closed != c.closed || s.Closed != c.closed {
+				t.Fatalf("settlement %+v, row %s: closed %v, want %v", s, b.Status, closed, c.closed)
+			}
+			if !c.closed && (s.Cause != causeRedecided || b.Metadata["pending_create_claim"] != "true") {
+				t.Fatalf("settlement %+v claim %q: want refused redecided, the pending create kept", s, b.Metadata["pending_create_claim"])
+			}
+		})
+	}
+}
+
+// Kills A10 dropping the occupant mark: the Occupied and S7 rollbacks rest on
+// another runtime under the name (intent.Occupant); a rollback past its
+// deadline, or of an undesired row whose runtime is gone, does not.
+func TestArmRollbackMarksItsOccupant(t *testing.T) {
+	for _, c := range []struct {
+		name     string
+		desired  desire
+		reason   string
+		liveness rowLiveness
+		stale    bool
+		occupant bool
+	}{
+		{"past its deadline", desireNone, reasonRollbackCandidate, livenessGone, false, false},
+		{"past its deadline, occupied", desireNone, reasonRollbackCandidate, livenessOccupied, false, false},
+		{"undesired and gone", desireDrain, "undesired", livenessGone, false, false},
+		{"another row's runtime", desireNone, reasonNameOccupied, livenessOccupied, false, true},
+		{"its StaleSelf runtime (S7)", desireWake, "", livenessAlive, true, true},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			row := poolRow("gc-1", "worker", 1, "creating", "instance_token", "tok", "generation", "3", "pending_create_claim", "true")
+			k := rowKeyOf(row.ID)
+			w := &World{Observed: map[rowKey]rowObservation{}}
+			if c.stale {
+				w.Observed[k] = rowObservation{Liveness: livenessAlive, Identity: runtimeIdentity{Known: true, SessionID: "gc-1", Epoch: "2", Token: "old"}}
+			}
+			r := &rowFacts{w: w, k: k, row: newCensusRow(k, sessionInfoFromBead(row)), found: true, entry: &selectionEntry{Key: k, Desired: c.desired, Reason: c.reason, Liveness: c.liveness}}
+			it, ok := armRollback(r)
+			if !ok || it.Kind != intentRollback || it.Occupant != c.occupant {
+				t.Fatalf("armRollback = (%+v, %v), want a rollback with Occupant %v", it, ok, c.occupant)
+			}
+		})
+	}
+}
+
 // Kills an A10 rollback proposed for a row that is not a pending create, a
 // wanted pending create inside its deadline, or a live one; and one missed
 // for the three shapes A10 rolls back.
