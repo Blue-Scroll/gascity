@@ -439,6 +439,24 @@ func (p *Provider) Nudge(name string, content []runtime.ContentBlock) error {
 	return p.route(name).Nudge(name, content)
 }
 
+// SessionBinding reports the routed backend's thread binding for name when
+// that backend hosts sessions in threads of its own, and no binding otherwise.
+func (p *Provider) SessionBinding(name string) (runtime.SessionBinding, error) {
+	if bp, ok := p.route(name).(runtime.SessionBindingProvider); ok {
+		return bp.SessionBinding(name)
+	}
+	return runtime.SessionBinding{}, nil
+}
+
+// NudgeKeyed delegates to the routed backend with its delivery key when that
+// backend deduplicates keyed deliveries, and to its Nudge otherwise.
+func (p *Provider) NudgeKeyed(name string, content []runtime.ContentBlock, key string) error {
+	if kp, ok := p.route(name).(runtime.KeyedNudgeProvider); ok {
+		return kp.NudgeKeyed(name, content, key)
+	}
+	return p.route(name).Nudge(name, content)
+}
+
 // WaitForIdle delegates to the routed backend when it supports explicit
 // idle-boundary waiting.
 func (p *Provider) WaitForIdle(ctx context.Context, name string, timeout time.Duration) error {
