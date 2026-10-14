@@ -37,10 +37,7 @@ func (s *Server) resolveSessionStream(ctx context.Context, input *SessionStreamI
 		return nil, humaSessionManagerError(err)
 	}
 
-	historyReq := worker.HistoryRequest{}
-	if input.Format == "raw" && !info.Closed {
-		historyReq.TailCompactions = 1
-	}
+	historyReq := sessionStreamHistoryRequest(input.Format, info.Closed)
 	history, historyErr := handle.History(worker.WithoutOperationEvents(ctx), historyReq)
 	hasHistory := historyErr == nil && history != nil
 	if historyErr != nil && !errors.Is(historyErr, worker.ErrHistoryUnavailable) {
@@ -150,7 +147,7 @@ func (s *Server) streamSession(hctx huma.Context, input *SessionStreamInput, sen
 		case "structured":
 			s.streamSessionTranscriptLogStructuredHuma(reqCtx, send, info, handle, history, input.IncludeThinking, resumeToken, "", "")
 		default:
-			s.streamSessionTranscriptLogHuma(reqCtx, integerSend, info, handle, history)
+			s.streamSessionTranscriptLogHuma(reqCtx, integerSend, info, handle, history, historyReq)
 		}
 	case format == "structured":
 		s.streamSessionPeekStructuredHuma(reqCtx, send, info, handle, input.IncludeThinking, resumeToken)

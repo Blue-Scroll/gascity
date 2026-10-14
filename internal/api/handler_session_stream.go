@@ -114,10 +114,7 @@ func (s *Server) handleSessionStream(w http.ResponseWriter, r *http.Request) {
 		writeSessionManagerError(w, err)
 		return
 	}
-	historyReq := worker.HistoryRequest{}
-	if format == "raw" && !info.Closed {
-		historyReq.TailCompactions = 1
-	}
+	historyReq := sessionStreamHistoryRequest(format, info.Closed)
 	history, historyErr := handle.History(worker.WithoutOperationEvents(r.Context()), historyReq)
 	hasHistory := historyErr == nil && history != nil
 	if historyErr != nil && !errors.Is(historyErr, worker.ErrHistoryUnavailable) {
@@ -184,7 +181,7 @@ func (s *Server) handleSessionStream(w http.ResponseWriter, r *http.Request) {
 		case "structured":
 			s.streamSessionTranscriptHistoryStructured(ctx, w, info, handle, history, includeThinking, resumeToken, "", "")
 		default:
-			s.streamSessionTranscriptHistory(ctx, w, info, handle, history)
+			s.streamSessionTranscriptHistory(ctx, w, info, handle, history, historyReq)
 		}
 	case format == "structured":
 		s.streamSessionPeekStructured(ctx, w, info, handle, includeThinking, resumeToken)
@@ -199,6 +196,31 @@ func (s *Server) handleSessionStream(w http.ResponseWriter, r *http.Request) {
 	default:
 		s.streamSessionPeek(ctx, w, info, handle)
 	}
+}
+
+// sessionStreamHistoryRequest is the first history read of a session stream.
+// A live stream opens on the newest compaction segment, so a client gets the
+// recent window and not the whole log (the mayor's log was 7.3 MB and 4072
+// messages, vn-6a437yc). Two reads stay whole: a closed session's snapshot,
+// and the structured stream, whose resume cursor can name an entry older than
+// the newest segment.
+func sessionStreamHistoryRequest(format string, closed bool) worker.HistoryRequest {
+	if closed || format == "structured" {
+		return worker.HistoryRequest{}
+	}
+	return worker.HistoryRequest{TailCompactions: 1}
+}
+
+// conversationStreamReloadRequest is the read a conversation stream reloads
+// with. Until the stream has sent a turn it re-reads its opening window, so a
+// stream that opened on an empty newest segment cannot replay the whole log on
+// its first reload. After that it reads the whole log, so a turn written just
+// before a new compaction boundary is still found after lastSentID and sent.
+func conversationStreamReloadRequest(opening worker.HistoryRequest, lastSentID string) worker.HistoryRequest {
+	if lastSentID == "" {
+		return opening
+	}
+	return worker.HistoryRequest{}
 }
 
 func workerPhaseHasLiveOutput(phase worker.Phase) bool {
@@ -473,7 +495,7 @@ func (s *Server) streamSessionTranscriptHistoryRaw(ctx context.Context, w http.R
 	}
 }
 
-func (s *Server) streamSessionTranscriptHistory(ctx context.Context, w http.ResponseWriter, info session.Info, handle worker.HistoryHandle, initial *worker.HistorySnapshot) {
+func (s *Server) streamSessionTranscriptHistory(ctx context.Context, w http.ResponseWriter, info session.Info, handle worker.HistoryHandle, initial *worker.HistorySnapshot, opening worker.HistoryRequest) {
 	logPath := sessionStreamTranscriptPath(ctx, handle)
 	poll := time.NewTicker(outputStreamPollInterval)
 	keepalive := time.NewTicker(sseKeepalive)
@@ -549,7 +571,7 @@ func (s *Server) streamSessionTranscriptHistory(ctx context.Context, w http.Resp
 	var lw *logFileWatcher
 	reloadSnapshot := func() bool {
 		emitted := false
-		snapshot, err := handle.History(worker.WithoutOperationEvents(ctx), worker.HistoryRequest{})
+		snapshot, err := handle.History(worker.WithoutOperationEvents(ctx), conversationStreamReloadRequest(opening, lastSentID))
 		switch {
 		case err == nil:
 			emitted = emitSnapshot(snapshot)
@@ -1185,7 +1207,7 @@ func (s *Server) streamSessionTranscriptLogRawHuma(ctx context.Context, send sse
 	}
 }
 
-func (s *Server) streamSessionTranscriptLogHuma(ctx context.Context, send sse.Sender, info session.Info, handle worker.HistoryHandle, initial *worker.HistorySnapshot) {
+func (s *Server) streamSessionTranscriptLogHuma(ctx context.Context, send sse.Sender, info session.Info, handle worker.HistoryHandle, initial *worker.HistorySnapshot, opening worker.HistoryRequest) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	send = cancelOnSendError(send, cancel)
@@ -1263,7 +1285,7 @@ func (s *Server) streamSessionTranscriptLogHuma(ctx context.Context, send sse.Se
 	var lw *logFileWatcher
 	reloadSnapshot := func() bool {
 		emitted := false
-		snapshot, err := handle.History(worker.WithoutOperationEvents(ctx), worker.HistoryRequest{})
+		snapshot, err := handle.History(worker.WithoutOperationEvents(ctx), conversationStreamReloadRequest(opening, lastSentID))
 		switch {
 		case err == nil:
 			emitted = emitSnapshot(snapshot)

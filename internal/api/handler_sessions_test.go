@@ -6949,7 +6949,7 @@ func TestStreamSessionTranscriptHistoryDoesNotSkipTurnsAcrossCompactionBoundarie
 			close(done)
 			return
 		}
-		srv.streamSessionTranscriptHistory(ctx, rec, info, handle, initial)
+		srv.streamSessionTranscriptHistory(ctx, rec, info, handle, initial, worker.HistoryRequest{})
 		close(done)
 	}()
 
@@ -7041,7 +7041,7 @@ func TestStreamSessionTranscriptHistoryReloadsChangesWrittenAfterInitialHistory(
 	rec := newSyncResponseRecorder()
 	done := make(chan struct{})
 	go func() {
-		srv.streamSessionTranscriptHistory(ctx, rec, info, handle, initial)
+		srv.streamSessionTranscriptHistory(ctx, rec, info, handle, initial, worker.HistoryRequest{})
 		close(done)
 	}()
 
