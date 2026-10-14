@@ -510,7 +510,11 @@ func newSim(t *testing.T, seed uint64, o simOpts) *sim {
 	}
 	// The executor in step mode: its goroutines are joined at teardown, and
 	// every effect parks (gated) until a step releases it.
-	s.x = newEffectExecutor(func(st settlement) { s.p.settlements.post(st); s.postCh <- st }, io.Discard)
+	s.x = newEffectExecutor(func(st settlement) {
+		countPost(st) // reconcile_sim_coverage_test.go: the census counts what the planner is told
+		s.p.settlements.post(st)
+		s.postCh <- st
+	}, io.Discard)
 	s.x.clock = s.clk
 	s.x.spawn = func(f func()) {
 		s.spawned.Add(1)
@@ -525,6 +529,13 @@ func newSim(t *testing.T, seed uint64, o simOpts) *sim {
 		return res
 	}
 	s.p.effects = s.x
+	// The create effects (C1, C2), on the sessions leg under the city's
+	// identifier locks, so the allocation's plans land rows (mc-i7efm).
+	creates, err := newCreateEffects(createEffectHost{cityPath: s.env.CityPath, cityName: s.env.CityName, lookPath: s.env.LookPath, now: s.clk.Now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.p.creates = creates
 	// The planner notes effects' fresh observations in the lane's cache, as
 	// production wires it (plannerRuntime.bindHost): a start's alive read
 	// and any effect's absent one (CONTRACT O4, v5.10g).
@@ -691,9 +702,7 @@ func (s *sim) pass() {
 		if it.Kind == intentDrainBegin || it.Kind == intentDrainBeginFresh {
 			simDrainBegins.Add(1)
 		}
-		if it.Kind == intentSignalAck && it.Reason == decideFloorAckCancel {
-			simFloorCancels.Add(1)
-		}
+		countReason(it) // reconcile_sim_coverage_test.go: the floor-ack cancel the gate requires
 		if it.Reason == decideSquatterHeal {
 			simSquatterHeals.Add(1)
 		}
@@ -1557,6 +1566,13 @@ func (s *sim) lastTimer() time.Time {
 			last = r.Until
 		}
 	}
+	// An ambiguous create holds its identity's plan until its row shows or
+	// the hard bound passes (P5; ruling on seed 60 of the corpus, mc-i7efm).
+	for _, e := range s.inflight.creates {
+		if at := e.SettledAt.Add(inflightHardBound); e.Ambiguous && at.After(last) {
+			last = at
+		}
+	}
 	return last
 }
 
@@ -1577,6 +1593,14 @@ func (s *sim) rowTimers() time.Time {
 			if at, err := time.Parse(time.RFC3339, b.Metadata[k]); err == nil {
 				later(at.Add(grace))
 			}
+		}
+		// A fresh pool create keeps its scaled slot postCreateProtectionTimeout
+		// past its commit (poolSessionWithinPostCreateProtection), and the
+		// slot's ranking moves when it ends (ruling on seed 716 of the
+		// floored corpus, mc-i7efm).
+		if at, err := time.Parse(time.RFC3339, b.Metadata["creation_complete_at"]); err == nil && b.Status != "closed" &&
+			slices.Contains([]string{"active", "awake"}, b.Metadata["state"]) && b.Metadata["state_reason"] == "creation_complete" {
+			later(at.Add(postCreateProtectionTimeout))
 		}
 		// The churn clear is A6's at its threshold on an open committed row
 		// (SESS-540), which a patrol reaches.
@@ -1668,20 +1692,10 @@ func TestSimCorpus(t *testing.T) {
 	}
 }
 
-// simFloorCancels counts the floor-ack cancels (DRAIN-010) the sims
-// admitted.
-var simFloorCancels atomic.Int64
-
 // TestSimCorpusFloored is the corpus with a min_active_sessions floor of 1
 // or 2 (by seed), so floor members' own acks are canceled (PAR-FLOORACK)
 // beside every other path: no invariant may break.
 func TestSimCorpusFloored(t *testing.T) {
-	before := simFloorCancels.Load()
-	t.Cleanup(func() {
-		if !t.Failed() && simFloorCancels.Load() == before {
-			t.Error("the floored sim corpus admitted no floor-ack cancel")
-		}
-	})
 	for _, seed := range simSeeds(t) {
 		t.Run(fmt.Sprint(seed), func(t *testing.T) {
 			s := newSim(t, seed, simOpts{noPendingCreates: true})
