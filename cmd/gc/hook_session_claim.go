@@ -106,32 +106,67 @@ func hookSessionDrainPending(sessionID string) (bool, error) {
 // execution identity. Every failure yields "" -- an unset gc.work_dir is the
 // honest outcome, and the caller stamps nothing rather than guessing a path.
 func hookResolveSessionWorkDir(sessionID string) string {
-	if strings.TrimSpace(sessionID) == "" {
-		return ""
-	}
-	sessFront, err := sessionCurrentClaimFrontDoor()
-	if err != nil {
-		// Each failure below returns the same "" as a session that simply has no
-		// stampable checkout, so without naming the step a lookup fault is
-		// indistinguishable in production from the ordinary refusal. The caller
-		// behavior is unchanged; only the diagnosis is.
-		log.Printf("hookResolveSessionWorkDir: opening the session front door for %q: %v; stamping no %s",
-			sessionID, err, beadmeta.WorkDirMetadataKey)
-		return ""
-	}
-	resolved, err := sessFront.ResolveIDByExactID(strings.TrimSpace(sessionID))
-	if err != nil {
-		log.Printf("hookResolveSessionWorkDir: resolving session id %q exactly: %v; stamping no %s",
-			sessionID, err, beadmeta.WorkDirMetadataKey)
-		return ""
-	}
-	info, err := sessFront.Get(resolved)
-	if err != nil {
-		log.Printf("hookResolveSessionWorkDir: reading session bead %q: %v; stamping no %s",
-			resolved, err, beadmeta.WorkDirMetadataKey)
+	info, ok := hookLookupSessionInfo(sessionID, "stamping no "+beadmeta.WorkDirMetadataKey)
+	if !ok {
 		return ""
 	}
 	return sessionStampableWorkDir(info)
+}
+
+// hookResolveSessionSeatDir returns the checkout the session identified by
+// sessionID is running in, WITHOUT the pool refusal sessionStampableWorkDir
+// applies. It is the production implementation of the
+// hookClaimOps.ResolveSessionSeatDir seam.
+//
+// The two readers ask different questions of the same field. The stamp asks
+// "may this path become a bead's ownership evidence?", and a pool slot's
+// directory may not, because the next session of that slot reuses it. The seat
+// guard (hook_claim_seat.go) asks "is this bead's recorded tree MY tree?", and
+// for a pool slot the reused directory is exactly the answer: the next session
+// of a seat is the one that should pick up what the last one left there.
+func hookResolveSessionSeatDir(sessionID string) string {
+	info, ok := hookLookupSessionInfo(sessionID, "guarding no seat")
+	if !ok {
+		return ""
+	}
+	return strings.TrimSpace(info.WorkDir)
+}
+
+// hookLookupSessionInfo reads the session bead for sessionID through the session
+// front door. consequence names what the caller does without it, so the log line
+// says which reader lost its answer.
+//
+// The id is resolved EXACTLY, for the same reason SetCurrentClaim does: the bd
+// fuzzy resolver would otherwise let a prefix collision hand back the checkout of
+// a different session. Every failure yields ok=false; the caller decides what an
+// unknown session means for it.
+func hookLookupSessionInfo(sessionID, consequence string) (session.Info, bool) {
+	if strings.TrimSpace(sessionID) == "" {
+		return session.Info{}, false
+	}
+	sessFront, err := sessionCurrentClaimFrontDoor()
+	if err != nil {
+		// Each failure below returns the same answer as a session that simply has
+		// no checkout, so without naming the step a lookup fault is
+		// indistinguishable in production from the ordinary refusal. The caller
+		// behavior is unchanged; only the diagnosis is.
+		log.Printf("hook session lookup: opening the session front door for %q: %v; %s",
+			sessionID, err, consequence)
+		return session.Info{}, false
+	}
+	resolved, err := sessFront.ResolveIDByExactID(strings.TrimSpace(sessionID))
+	if err != nil {
+		log.Printf("hook session lookup: resolving session id %q exactly: %v; %s",
+			sessionID, err, consequence)
+		return session.Info{}, false
+	}
+	info, err := sessFront.Get(resolved)
+	if err != nil {
+		log.Printf("hook session lookup: reading session bead %q: %v; %s",
+			resolved, err, consequence)
+		return session.Info{}, false
+	}
+	return info, true
 }
 
 // sessionStampableWorkDir returns the checkout of info that may be stamped onto a

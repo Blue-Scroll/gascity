@@ -254,6 +254,11 @@ type hookClaimOps struct {
 	// until this claim). Empty result means nothing is knowable and nothing is
 	// stamped.
 	ResolveSessionWorkDir hookResolveSessionWorkDirFunc
+	// ResolveSessionSeatDir returns the checkout the CLAIMING session is running
+	// in, pool slots included, so the fresh-claim tier can tell its own seat's
+	// stranded bead from another seat's (hook_claim_seat.go). Empty result means
+	// the seat is unknown and the guard stands down.
+	ResolveSessionSeatDir hookResolveSessionWorkDirFunc
 	// StampWorkMeta writes the claim-time execution-identity metadata patch
 	// (gc.work_branch and/or the durable session back-reference gc.session_id /
 	// gc.session_name) onto the claimed bead in ONE update. Best-effort.
@@ -574,6 +579,9 @@ func (ops *hookClaimOps) applyDefaults() {
 	}
 	if ops.ResolveSessionWorkDir == nil {
 		ops.ResolveSessionWorkDir = hookResolveSessionWorkDir
+	}
+	if ops.ResolveSessionSeatDir == nil {
+		ops.ResolveSessionSeatDir = hookResolveSessionSeatDir
 	}
 	if ops.StampWorkMeta == nil {
 		ops.StampWorkMeta = hookStampWorkMetaWithBdStore
@@ -927,18 +935,26 @@ func claimFirstEligibleHookCandidate(candidates []beads.Bead, opts hookClaimOpti
 	defer cancel()
 	claimsErrored := false
 	now := ops.nowOrWallClock()
-	for _, candidate := range candidates {
+	seat := newHookClaimSeat(opts, ops, dir)
+	for _, candidate := range seat.ownFirst(candidates) {
 		reclaimedFrom := ""
-		if !hookCandidateClaimable(candidate, opts.RouteTargets, now) {
-			// ga-7rj87d FR1/FR2: a route-matched candidate whose ONLY claim
-			// blocker is an existing (possibly stale) assignee gets a scoped,
-			// opt-in reclaim attempt before being skipped. Off by default
-			// (NFR4/NFR5): the flag check short-circuits before
-			// hookCandidateReclaimEligible or ops.ReclaimStale ever run, so the
-			// flag-off path is byte-for-byte unchanged.
-			if !opts.AutoReclaimStaleClaims || !hookCandidateReclaimEligible(candidate, opts.RouteTargets, now) {
-				continue
-			}
+		claimable := hookCandidateClaimable(candidate, opts.RouteTargets, now)
+		// ga-7rj87d FR1/FR2: a route-matched candidate whose ONLY claim blocker
+		// is an existing (possibly stale) assignee gets a scoped, opt-in reclaim
+		// attempt before being skipped. Off by default (NFR4/NFR5): the flag
+		// check short-circuits before hookCandidateReclaimEligible or
+		// ops.ReclaimStale ever run.
+		if !claimable && (!opts.AutoReclaimStaleClaims || !hookCandidateReclaimEligible(candidate, opts.RouteTargets, now)) {
+			continue
+		}
+		// vn-3qa7dmi. Asked before the reclaim as well as the claim: a reclaim
+		// of a bead whose work sits in another seat's tree is the same theft.
+		if other, held := seat.heldElsewhere(candidate); held {
+			fmt.Fprintf(stderr, "gc hook --claim: skipping %s: it records %s, another seat's checkout, so its work may still be there; clear %s and %s on the bead to free it\n", //nolint:errcheck
+				candidate.ID, other, beadmeta.WorkDirMetadataKey, beadmeta.LegacyWorkDirMetadataKey)
+			continue
+		}
+		if !claimable {
 			if ops.claimWindowSpent() {
 				return refuseExpiredHookClaimWindow(candidate.ID, ops, stderr)
 			}
