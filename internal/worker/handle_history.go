@@ -112,6 +112,7 @@ func (h *SessionHandle) historyWithRequest(req HistoryRequest) (*HistorySnapshot
 		GCSessionID:           gcSessionID,
 		LogicalConversationID: strings.TrimSpace(req.LogicalID),
 		TailCompactions:       req.TailCompactions,
+		Limit:                 req.Limit,
 		BeforeEntryID:         req.BeforeEntryID,
 		AfterEntryID:          req.AfterEntryID,
 	})
@@ -125,7 +126,7 @@ func (h *SessionHandle) historyWithRequest(req HistoryRequest) (*HistorySnapshot
 	// snapshots. Returning them through the generation cache can replace a
 	// successful page with a previously cached full (or different) view when
 	// the underlying transcript generation has not changed.
-	if req.TailCompactions > 0 || strings.TrimSpace(req.BeforeEntryID) != "" || strings.TrimSpace(req.AfterEntryID) != "" {
+	if req.TailCompactions > 0 || req.Limit > 0 || strings.TrimSpace(req.BeforeEntryID) != "" || strings.TrimSpace(req.AfterEntryID) != "" {
 		return cloneHistorySnapshot(snapshot), nil
 	}
 	return h.mergeLoadedHistorySnapshot(snapshot), nil

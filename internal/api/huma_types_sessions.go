@@ -91,6 +91,7 @@ type SessionTranscriptInput struct {
 	IncludeThinking bool   `query:"include_thinking" required:"false" doc:"Include thinking block text and signature in structured responses. Defaults to false; both are redacted otherwise."`
 	Before          string `query:"before" required:"false" doc:"Pagination cursor: return entries before this stable transcript entry ID."`
 	After           string `query:"after" required:"false" doc:"Pagination cursor: return entries after this stable transcript entry ID."`
+	Limit           int    `query:"limit" required:"false" minimum:"0" doc:"Return at most this many transcript entries, cut after before/after and tail. Omit or 0 for no limit. Without after it keeps the newest entries and sets pagination.has_older_messages when it dropped some; pass pagination.truncated_before_message as before to read the next older page. With after it keeps the entries right after the cursor and sets has_newer_messages. A limited structured snapshot's resume token is a suffix window, so the stream resumes from it with upserts. Counts entries, not turns: the conversation format can show fewer."`
 }
 
 // SessionStreamInput is the Huma input for GET /v0/city/{cityName}/session/{id}/stream.

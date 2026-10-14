@@ -301,6 +301,7 @@ func (s *Server) humaHandleSessionTranscript(ctx context.Context, input *Session
 		if wantStructured {
 			history, historyErr := handle.History(worker.WithoutOperationEvents(ctx), worker.HistoryRequest{
 				TailCompactions: tail,
+				Limit:           input.Limit,
 				BeforeEntryID:   before,
 				AfterEntryID:    after,
 			})
@@ -333,6 +334,7 @@ func (s *Server) humaHandleSessionTranscript(ctx context.Context, input *Session
 		if wantRaw {
 			transcript, err := handle.Transcript(ctx, worker.TranscriptRequest{
 				TailCompactions: tail,
+				Limit:           input.Limit,
 				BeforeEntryID:   before,
 				AfterEntryID:    after,
 				Raw:             true,
@@ -358,6 +360,7 @@ func (s *Server) humaHandleSessionTranscript(ctx context.Context, input *Session
 
 		transcript, err := handle.Transcript(ctx, worker.TranscriptRequest{
 			TailCompactions: tail,
+			Limit:           input.Limit,
 			BeforeEntryID:   before,
 			AfterEntryID:    after,
 		})

@@ -86,9 +86,16 @@ func (s *Server) handleSessionTranscript(w http.ResponseWriter, r *http.Request)
 				tail = n
 			}
 		}
+		limit := 0
+		if v := r.URL.Query().Get("limit"); v != "" {
+			if n, convErr := strconv.Atoi(v); convErr == nil && n >= 0 {
+				limit = n
+			}
+		}
 		if wantStructured {
 			history, historyErr := handle.History(worker.WithoutOperationEvents(r.Context()), worker.HistoryRequest{
 				TailCompactions: tail,
+				Limit:           limit,
 				BeforeEntryID:   before,
 				AfterEntryID:    after,
 			})
@@ -118,6 +125,7 @@ func (s *Server) handleSessionTranscript(w http.ResponseWriter, r *http.Request)
 		if wantRaw {
 			transcript, err := handle.Transcript(r.Context(), worker.TranscriptRequest{
 				TailCompactions: tail,
+				Limit:           limit,
 				BeforeEntryID:   before,
 				AfterEntryID:    after,
 				Raw:             true,
@@ -138,6 +146,7 @@ func (s *Server) handleSessionTranscript(w http.ResponseWriter, r *http.Request)
 
 		transcript, err := handle.Transcript(r.Context(), worker.TranscriptRequest{
 			TailCompactions: tail,
+			Limit:           limit,
 			BeforeEntryID:   before,
 			AfterEntryID:    after,
 		})

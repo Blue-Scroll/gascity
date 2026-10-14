@@ -230,10 +230,14 @@ func normalizeNudgeWakePolicy(policy NudgeWakePolicy) NudgeWakePolicy {
 
 // HistoryRequest scopes transcript loading for a worker.
 type HistoryRequest struct {
-	TailCompactions int    `json:"tail_compactions,omitempty"`
-	LogicalID       string `json:"logical_conversation_id,omitempty"`
-	BeforeEntryID   string `json:"before_entry_id,omitempty"`
-	AfterEntryID    string `json:"after_entry_id,omitempty"`
+	TailCompactions int `json:"tail_compactions,omitempty"`
+	// Limit keeps at most this many entries after the cursor and tail cuts,
+	// so a reader can ask for a window smaller than one compaction segment.
+	// 0 means no limit.
+	Limit         int    `json:"limit,omitempty"`
+	LogicalID     string `json:"logical_conversation_id,omitempty"`
+	BeforeEntryID string `json:"before_entry_id,omitempty"`
+	AfterEntryID  string `json:"after_entry_id,omitempty"`
 }
 
 // PendingInteraction is the worker-level view of a blocking interaction.

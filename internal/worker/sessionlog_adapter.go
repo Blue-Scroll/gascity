@@ -21,8 +21,11 @@ type LoadRequest struct {
 	GCSessionID           string
 	LogicalConversationID string
 	TailCompactions       int
-	BeforeEntryID         string
-	AfterEntryID          string
+	// Limit keeps at most this many entries after the cursor and tail cuts.
+	// See sessionlog.LimitSession. 0 means no limit.
+	Limit         int
+	BeforeEntryID string
+	AfterEntryID  string
 }
 
 // TranscriptRequest scopes provider-native transcript reads that preserve raw
@@ -31,9 +34,12 @@ type TranscriptRequest struct {
 	Provider        string
 	TranscriptPath  string
 	TailCompactions int
-	BeforeEntryID   string
-	AfterEntryID    string
-	Raw             bool
+	// Limit keeps at most this many entries after the cursor and tail cuts.
+	// See sessionlog.LimitSession. 0 means no limit.
+	Limit         int
+	BeforeEntryID string
+	AfterEntryID  string
+	Raw           bool
 }
 
 // TranscriptResult wraps a provider-native transcript read behind the worker
@@ -262,6 +268,7 @@ func (a SessionLogAdapter) ReadTranscript(req TranscriptRequest) (*TranscriptRes
 	if err != nil {
 		return nil, err
 	}
+	sessionlog.LimitSession(sess, req.Limit, afterID != "")
 
 	result := &TranscriptResult{
 		Provider:       req.Provider,
@@ -317,12 +324,15 @@ func (a SessionLogAdapter) LoadHistory(req LoadRequest) (*HistorySnapshot, error
 		return nil, err
 	}
 	session := fullSession
-	paged := req.TailCompactions > 0 || beforeID != "" || afterID != ""
+	paged := req.TailCompactions > 0 || req.Limit > 0 || beforeID != "" || afterID != ""
 	if paged {
 		session, err = sessionlog.PageSession(fullSession, req.TailCompactions, beforeID, afterID)
 		if err != nil {
 			return nil, err
 		}
+		// PageSession returned a copy, so this cut leaves fullSession whole for
+		// the transcript-wide facts below.
+		sessionlog.LimitSession(session, req.Limit, afterID != "")
 	}
 
 	entries := normalizeHistoryEntries(req.Provider, path, session.ID, session.Messages)

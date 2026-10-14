@@ -91,16 +91,21 @@ type WaitParam struct {
 // tail stays typed as a string on the wire so three request states are
 // distinguishable:
 //
-//   - absent ("")   → handler applies its own default (usually 1)
+//   - absent ("")   → handler applies its own default. The session
+//     transcript returns every segment; agent output returns the last 1.
 //   - "0"           → return all segments (no pagination)
-//   - "N" where N>0 → return the last N segments
+//   - "N" where N>0 → return from the Nth-from-last compaction boundary. A
+//     log with N or fewer boundaries comes back whole, boundaries included.
+//
+// A compaction segment can hold thousands of entries. A reader that wants a
+// screenful asks the session transcript for limit=N instead.
 //
 // A prior refactor typed this as int and collapsed the first two states
 // into "tail=0", which silently broke the "return all" contract. The
 // Resolve method validates non-negative integer format and returns 422
 // for garbage.
 type TailParam struct {
-	Tail string `query:"tail" required:"false" doc:"Number of recent compaction segments to return. This API parameter keeps compaction-segment semantics even though gc session logs --tail counts displayed transcript entries. Omit for the endpoint default (usually 1); 0 returns all segments; N>0 returns the last N."`
+	Tail string `query:"tail" required:"false" doc:"Number of recent compaction segments to return. This API parameter keeps compaction-segment semantics even though gc session logs --tail counts displayed transcript entries. Omit for the endpoint default: the session transcript returns every segment, agent output returns the last 1. 0 returns all segments. N>0 returns from the Nth-from-last compaction boundary; a log with N or fewer boundaries comes back whole."`
 }
 
 // Resolve validates Tail. Huma calls this during binding.

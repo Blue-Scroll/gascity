@@ -9423,7 +9423,7 @@ type PatchV0CityByCityNameAgentByBaseParams struct {
 
 // GetV0CityByCityNameAgentByBaseOutputParams defines parameters for GetV0CityByCityNameAgentByBaseOutput.
 type GetV0CityByCityNameAgentByBaseOutputParams struct {
-	// Tail Number of recent compaction segments to return. This API parameter keeps compaction-segment semantics even though gc session logs --tail counts displayed transcript entries. Omit for the endpoint default (usually 1); 0 returns all segments; N>0 returns the last N.
+	// Tail Number of recent compaction segments to return. This API parameter keeps compaction-segment semantics even though gc session logs --tail counts displayed transcript entries. Omit for the endpoint default: the session transcript returns every segment, agent output returns the last 1. 0 returns all segments. N>0 returns from the Nth-from-last compaction boundary; a log with N or fewer boundaries comes back whole.
 	Tail *string `form:"tail,omitempty" json:"tail,omitempty"`
 
 	// Before Message UUID cursor for loading older messages.
@@ -9453,7 +9453,7 @@ type PatchV0CityByCityNameAgentByDirByBaseParams struct {
 
 // GetV0CityByCityNameAgentByDirByBaseOutputParams defines parameters for GetV0CityByCityNameAgentByDirByBaseOutput.
 type GetV0CityByCityNameAgentByDirByBaseOutputParams struct {
-	// Tail Number of recent compaction segments to return. This API parameter keeps compaction-segment semantics even though gc session logs --tail counts displayed transcript entries. Omit for the endpoint default (usually 1); 0 returns all segments; N>0 returns the last N.
+	// Tail Number of recent compaction segments to return. This API parameter keeps compaction-segment semantics even though gc session logs --tail counts displayed transcript entries. Omit for the endpoint default: the session transcript returns every segment, agent output returns the last 1. 0 returns all segments. N>0 returns from the Nth-from-last compaction boundary; a log with N or fewer boundaries comes back whole.
 	Tail *string `form:"tail,omitempty" json:"tail,omitempty"`
 
 	// Before Message UUID cursor for loading older messages.
@@ -10326,7 +10326,7 @@ type PostV0CityByCityNameSessionByIdSuspendParams struct {
 
 // GetV0CityByCityNameSessionByIdTranscriptParams defines parameters for GetV0CityByCityNameSessionByIdTranscript.
 type GetV0CityByCityNameSessionByIdTranscriptParams struct {
-	// Tail Number of recent compaction segments to return. This API parameter keeps compaction-segment semantics even though gc session logs --tail counts displayed transcript entries. Omit for the endpoint default (usually 1); 0 returns all segments; N>0 returns the last N.
+	// Tail Number of recent compaction segments to return. This API parameter keeps compaction-segment semantics even though gc session logs --tail counts displayed transcript entries. Omit for the endpoint default: the session transcript returns every segment, agent output returns the last 1. 0 returns all segments. N>0 returns from the Nth-from-last compaction boundary; a log with N or fewer boundaries comes back whole.
 	Tail *string `form:"tail,omitempty" json:"tail,omitempty"`
 
 	// Format Transcript format: conversation (default), raw, or structured.
@@ -10340,6 +10340,9 @@ type GetV0CityByCityNameSessionByIdTranscriptParams struct {
 
 	// After Pagination cursor: return entries after this stable transcript entry ID.
 	After *string `form:"after,omitempty" json:"after,omitempty"`
+
+	// Limit Return at most this many transcript entries, cut after before/after and tail. Omit or 0 for no limit. Without after it keeps the newest entries and sets pagination.has_older_messages when it dropped some; pass pagination.truncated_before_message as before to read the next older page. With after it keeps the entries right after the cursor and sets has_newer_messages. A limited structured snapshot's resume token is a suffix window, so the stream resumes from it with upserts. Counts entries, not turns: the conversation format can show fewer.
+	Limit *int64 `form:"limit,omitempty" json:"limit,omitempty"`
 }
 
 // GetV0CityByCityNameSessionByIdTranscriptParamsFormat defines parameters for GetV0CityByCityNameSessionByIdTranscript.
@@ -32840,6 +32843,22 @@ func NewGetV0CityByCityNameSessionByIdTranscriptRequest(server string, cityName 
 		if params.After != nil {
 
 			if queryFrag, err := runtime.StyleParamWithOptions("form", false, "after", *params.After, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationQuery, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			} else if parsed, err := url.ParseQuery(queryFrag); err != nil {
+				return nil, err
+			} else {
+				for k, v := range parsed {
+					for _, v2 := range v {
+						queryValues.Add(k, v2)
+					}
+				}
+			}
+
+		}
+
+		if params.Limit != nil {
+
+			if queryFrag, err := runtime.StyleParamWithOptions("form", false, "limit", *params.Limit, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationQuery, Type: "integer", Format: "int64"}); err != nil {
 				return nil, err
 			} else if parsed, err := url.ParseQuery(queryFrag); err != nil {
 				return nil, err

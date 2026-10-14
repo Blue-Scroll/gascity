@@ -28052,12 +28052,12 @@
             }
           },
           {
-            "description": "Number of recent compaction segments to return. This API parameter keeps compaction-segment semantics even though gc session logs --tail counts displayed transcript entries. Omit for the endpoint default (usually 1); 0 returns all segments; N\u003e0 returns the last N.",
+            "description": "Number of recent compaction segments to return. This API parameter keeps compaction-segment semantics even though gc session logs --tail counts displayed transcript entries. Omit for the endpoint default: the session transcript returns every segment, agent output returns the last 1. 0 returns all segments. N\u003e0 returns from the Nth-from-last compaction boundary; a log with N or fewer boundaries comes back whole.",
             "explode": false,
             "in": "query",
             "name": "tail",
             "schema": {
-              "description": "Number of recent compaction segments to return. This API parameter keeps compaction-segment semantics even though gc session logs --tail counts displayed transcript entries. Omit for the endpoint default (usually 1); 0 returns all segments; N\u003e0 returns the last N.",
+              "description": "Number of recent compaction segments to return. This API parameter keeps compaction-segment semantics even though gc session logs --tail counts displayed transcript entries. Omit for the endpoint default: the session transcript returns every segment, agent output returns the last 1. 0 returns all segments. N\u003e0 returns from the Nth-from-last compaction boundary; a log with N or fewer boundaries comes back whole.",
               "type": "string"
             }
           },
@@ -28968,12 +28968,12 @@
             }
           },
           {
-            "description": "Number of recent compaction segments to return. This API parameter keeps compaction-segment semantics even though gc session logs --tail counts displayed transcript entries. Omit for the endpoint default (usually 1); 0 returns all segments; N\u003e0 returns the last N.",
+            "description": "Number of recent compaction segments to return. This API parameter keeps compaction-segment semantics even though gc session logs --tail counts displayed transcript entries. Omit for the endpoint default: the session transcript returns every segment, agent output returns the last 1. 0 returns all segments. N\u003e0 returns from the Nth-from-last compaction boundary; a log with N or fewer boundaries comes back whole.",
             "explode": false,
             "in": "query",
             "name": "tail",
             "schema": {
-              "description": "Number of recent compaction segments to return. This API parameter keeps compaction-segment semantics even though gc session logs --tail counts displayed transcript entries. Omit for the endpoint default (usually 1); 0 returns all segments; N\u003e0 returns the last N.",
+              "description": "Number of recent compaction segments to return. This API parameter keeps compaction-segment semantics even though gc session logs --tail counts displayed transcript entries. Omit for the endpoint default: the session transcript returns every segment, agent output returns the last 1. 0 returns all segments. N\u003e0 returns from the Nth-from-last compaction boundary; a log with N or fewer boundaries comes back whole.",
               "type": "string"
             }
           },
@@ -48834,12 +48834,12 @@
             }
           },
           {
-            "description": "Number of recent compaction segments to return. This API parameter keeps compaction-segment semantics even though gc session logs --tail counts displayed transcript entries. Omit for the endpoint default (usually 1); 0 returns all segments; N\u003e0 returns the last N.",
+            "description": "Number of recent compaction segments to return. This API parameter keeps compaction-segment semantics even though gc session logs --tail counts displayed transcript entries. Omit for the endpoint default: the session transcript returns every segment, agent output returns the last 1. 0 returns all segments. N\u003e0 returns from the Nth-from-last compaction boundary; a log with N or fewer boundaries comes back whole.",
             "explode": false,
             "in": "query",
             "name": "tail",
             "schema": {
-              "description": "Number of recent compaction segments to return. This API parameter keeps compaction-segment semantics even though gc session logs --tail counts displayed transcript entries. Omit for the endpoint default (usually 1); 0 returns all segments; N\u003e0 returns the last N.",
+              "description": "Number of recent compaction segments to return. This API parameter keeps compaction-segment semantics even though gc session logs --tail counts displayed transcript entries. Omit for the endpoint default: the session transcript returns every segment, agent output returns the last 1. 0 returns all segments. N\u003e0 returns from the Nth-from-last compaction boundary; a log with N or fewer boundaries comes back whole.",
               "type": "string"
             }
           },
@@ -48896,6 +48896,18 @@
             "schema": {
               "description": "Pagination cursor: return entries after this stable transcript entry ID.",
               "type": "string"
+            }
+          },
+          {
+            "description": "Return at most this many transcript entries, cut after before/after and tail. Omit or 0 for no limit. Without after it keeps the newest entries and sets pagination.has_older_messages when it dropped some; pass pagination.truncated_before_message as before to read the next older page. With after it keeps the entries right after the cursor and sets has_newer_messages. A limited structured snapshot's resume token is a suffix window, so the stream resumes from it with upserts. Counts entries, not turns: the conversation format can show fewer.",
+            "explode": false,
+            "in": "query",
+            "name": "limit",
+            "schema": {
+              "description": "Return at most this many transcript entries, cut after before/after and tail. Omit or 0 for no limit. Without after it keeps the newest entries and sets pagination.has_older_messages when it dropped some; pass pagination.truncated_before_message as before to read the next older page. With after it keeps the entries right after the cursor and sets has_newer_messages. A limited structured snapshot's resume token is a suffix window, so the stream resumes from it with upserts. Counts entries, not turns: the conversation format can show fewer.",
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
             }
           }
         ],

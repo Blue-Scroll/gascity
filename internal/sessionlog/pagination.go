@@ -121,6 +121,41 @@ func PageSession(session *Session, tailCompactions int, beforeEntryID, afterEntr
 	return paginateSession(&page, tailCompactions, beforeEntryID, afterEntryID)
 }
 
+// LimitSession keeps at most limit entries of an already paginated session and
+// corrects its pagination so the dropped side reads as "more exists". It runs
+// after the before/after cursor and the tail-compactions cut, so a compaction
+// segment is no longer the smallest window a reader can ask for.
+//
+// Which side it keeps depends on the direction of travel. A read with an
+// after cursor is paging forward, so it keeps the OLDEST limit entries after
+// the cursor and sets HasNewerMessages: keeping the newest would leave a gap
+// between the cursor and the page that nothing reports. Every other read keeps
+// the NEWEST limit entries and sets HasOlderMessages, with
+// TruncatedBeforeMessage naming the first kept entry, the cursor for the next
+// older page.
+//
+// limit <= 0 means no limit. The session is changed in place; callers that
+// still need the full message list must pass a copy (PageSession returns one).
+func LimitSession(session *Session, limit int, forward bool) {
+	if session == nil || limit <= 0 || len(session.Messages) <= limit {
+		return
+	}
+	info := session.Pagination
+	if info == nil {
+		info = &PaginationInfo{TotalMessageCount: len(session.Messages)}
+		session.Pagination = info
+	}
+	if forward {
+		session.Messages = session.Messages[:limit]
+		info.HasNewerMessages = true
+	} else {
+		session.Messages = session.Messages[len(session.Messages)-limit:]
+		info.HasOlderMessages = true
+		info.TruncatedBeforeMessage = session.Messages[0].UUID
+	}
+	info.ReturnedMessageCount = len(session.Messages)
+}
+
 func validateUniqueEntryIDs(session *Session) error {
 	_, err := uniqueEntryIDs(session)
 	return err
