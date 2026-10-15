@@ -2625,6 +2625,22 @@ func (tx nativeDoltTransactionForTest) AddDependency(ctx context.Context, dep *b
 	return tx.storage.AddDependency(ctx, dep, actor)
 }
 
+// dependencyAddOptionsRecorder is implemented by a test storage that wants to
+// see the options an edge was written with.
+type dependencyAddOptionsRecorder interface {
+	recordDependencyAddOptions(dep *beadslib.Dependency, opts beadslib.DependencyAddOptions)
+}
+
+// AddDependencyWithOptions is the call createInTx makes. The edge still goes
+// through the storage's AddDependency, so the failure hooks older tests
+// install there keep firing.
+func (tx nativeDoltTransactionForTest) AddDependencyWithOptions(ctx context.Context, dep *beadslib.Dependency, actor string, opts beadslib.DependencyAddOptions) error {
+	if rec, ok := tx.storage.(dependencyAddOptionsRecorder); ok {
+		rec.recordDependencyAddOptions(dep, opts)
+	}
+	return tx.storage.AddDependency(ctx, dep, actor)
+}
+
 func (tx nativeDoltTransactionForTest) RemoveDependency(ctx context.Context, issueID, dependsOnID, actor string) error {
 	return tx.storage.RemoveDependency(ctx, issueID, dependsOnID, actor)
 }

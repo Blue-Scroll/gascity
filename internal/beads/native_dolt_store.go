@@ -81,9 +81,10 @@ func nativeDoltOperationContext(parent context.Context) (context.Context, contex
 // batch died at the 120s deadline mid-edges, retried into the same wall, and
 // fell back to per-bead creates — turning a single atomic pour into ~9 minutes
 // of partial work (2026-07-17 code red). Until the per-edge check is replaced
-// by one whole-graph CycleThroughEdges pass (needs a beads-side export of
-// DependencyAddOptions), give each node and edge a slice of budget on top of
-// the flat floor so the atomic path completes instead of falling back.
+// by one whole-graph CycleThroughEdges pass (beads v1.3.1 exports
+// DependencyAddOptions, so that is now a gc-side change), give each node and
+// edge a slice of budget on top of the flat floor so the atomic path completes
+// instead of falling back.
 func nativeGraphApplyDeadline(plan *GraphApplyPlan) time.Duration {
 	d := bdCommandTimeout
 	if plan == nil {
@@ -1621,6 +1622,7 @@ func (s *NativeDoltStore) createInTx(ctx context.Context, tx beadslib.Transactio
 	// it so nobody reads this call as writing the edges, then write each edge
 	// with the call that really does.
 	issue.Dependencies = nil
+	minted := strings.TrimSpace(issue.ID) == ""
 	if err := tx.CreateIssue(ctx, issue, s.actor); err != nil {
 		return Bead{}, err
 	}
@@ -1633,10 +1635,31 @@ func (s *NativeDoltStore) createInTx(ctx context.Context, tx beadslib.Transactio
 			continue
 		}
 		persisted := *dep
-		if strings.TrimSpace(persisted.IssueID) == "" {
+		ownEdge := strings.TrimSpace(persisted.IssueID) == ""
+		if ownEdge {
 			persisted.IssueID = issue.ID
 		}
-		if err := tx.AddDependency(ctx, &persisted, s.actor); err != nil {
+		// An edge out of a bead this transaction just minted cannot close a
+		// cycle. A cycle through u -> v needs a path from v back to u, and
+		// that needs an edge INTO u. Nothing has one: nobody knew u's id
+		// before CreateIssue picked it, and every edge this loop writes leaves
+		// u. So skip the library's per-edge cycle check for exactly these
+		// edges. That check is a recursive query over both dependency tables,
+		// and under load it outran the client's socket timeout: one edge in
+		// the ~30 of a formula pour rolled the whole pour back, 7 pours of 7
+		// (vn-5i9cwlv).
+		//
+		// The library asks a caller that skips it to run CycleThroughEdges
+		// before commit. That reads the whole dependency graph, which is the
+		// cost being avoided, and the argument above already rules a cycle
+		// out. Keep the check for a pinned id (a migration copy can land
+		// after edges that name it), for an edge the caller gave another
+		// source, and for a self-edge, whose refusal lives inside the check.
+		// The hierarchy and target checks run for every edge either way.
+		opts := beadslib.DependencyAddOptions{
+			SkipCycleCheck: minted && ownEdge && persisted.DependsOnID != issue.ID,
+		}
+		if err := tx.AddDependencyWithOptions(ctx, &persisted, s.actor, opts); err != nil {
 			return Bead{}, fmt.Errorf("persisting native create dependency %q -> %q: %w", persisted.IssueID, persisted.DependsOnID, nativeStoreError(persisted.IssueID, err))
 		}
 		persistedDeps = append(persistedDeps, &persisted)
