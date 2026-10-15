@@ -97,6 +97,16 @@ const (
 	// than inheriting an expired window and escalating the moment its pane
 	// goes quiet.
 	executionClaimNudgeTokenKey = "execution_claim_nudge_token"
+	// executionClaimStartedKey persists execution evidence (mc-muv2x):
+	// "<instance_token>|<bead id>" once the backstop has seen an
+	// execution.step_started of that claimed bead from this incarnation. The
+	// veto reads it, so the evidence outlives the event log's tail: a long
+	// turn's step_started can scroll out of any bounded window before its
+	// pane next goes quiet. A value for another token or bead is no evidence,
+	// so the claim marker's clear leaves it (mc-muv2x review): the cache folds
+	// blocked, deferred, review and testing into open, so a stamped claim can
+	// drop out of the in_progress snapshot for a pass and come back.
+	executionClaimStartedKey = "execution_claim_started"
 	// executionClaimNudgeStalledKey latches the one-shot escalation so the
 	// typed event and the drain request fire once per stalled claim rather than
 	// once per tick for as long as the claim is held.
@@ -186,6 +196,26 @@ type executionClaim struct {
 	StoreRef string
 	Assignee string
 	Store    beads.Store
+	// The claimed bead's lifecycle identity, as the hook stamps it: its
+	// graph step, the session that holds it, and its kind
+	// (executionLifecycleCandidate).
+	StepID, SessionID, SessionName, Kind string
+}
+
+// executionLifecycleCandidate reports whether claim can carry a step_started
+// from session s: the hook's own gate (hookClaimLifecycleCandidate), read off
+// the snapshot's metadata. A rooted graph step, stamped with this seat's
+// session, not a control bead. Only such a claim is ever stamped, so only
+// such a claim reads the event tail (mc-muv2x review): a v1 molecule step,
+// a control kind, or a claim made outside the hook would re-read it every
+// pass, forever.
+func executionLifecycleCandidate(claim executionClaim, s beads.Bead) bool {
+	if claim.RootID == "" || claim.StepID == "" || beadmeta.IsControlKind(claim.Kind) ||
+		claim.SessionID == "" || claim.SessionID != strings.TrimSpace(s.ID) {
+		return false
+	}
+	name := strings.TrimSpace(s.Metadata["session_name"])
+	return name == "" || claim.SessionName == name
 }
 
 // executionClaimSnapshot indexes in-progress claims by their exact assignee
@@ -207,9 +237,13 @@ func newExecutionClaimSnapshot(work []beads.Bead, stores []beads.Store, storeRef
 			continue
 		}
 		claim := executionClaim{
-			BeadID:   wb.ID,
-			RootID:   strings.TrimSpace(wb.Metadata[beadmeta.RootBeadIDMetadataKey]),
-			Assignee: assignee,
+			BeadID:      wb.ID,
+			RootID:      strings.TrimSpace(wb.Metadata[beadmeta.RootBeadIDMetadataKey]),
+			Assignee:    assignee,
+			StepID:      strings.TrimSpace(wb.Metadata[beadmeta.StepIDMetadataKey]),
+			SessionID:   strings.TrimSpace(wb.Metadata[beadmeta.SessionIDMetadataKey]),
+			SessionName: strings.TrimSpace(wb.Metadata[beadmeta.SessionNameMetadataKey]),
+			Kind:        strings.TrimSpace(wb.Metadata[beadmeta.KindMetadataKey]),
 		}
 		if i < len(storeRefs) {
 			claim.StoreRef = normalizeIdleClaimStoreRef(storeRefs[i])
@@ -287,11 +321,21 @@ func (p poolExecutionBackstop) resolve(s beads.Bead, _ map[string]beads.Bead, se
 		p.observeHold(p.store, &s, executionHoldMultiClaim, p.stdout)
 		return backstopTarget{}, backstopResolutionHold
 	}
+	claim := claims[0]
+	// Persist execution evidence while the event is still in the tail,
+	// busy or quiet (mc-muv2x): until this incarnation's claim is stamped,
+	// each pass reads the tail, and the first sighting stamps the row. Only
+	// a claim that can carry a step_started (executionLifecycleCandidate) is
+	// ever stamped, so any other reads no tail, never pays for a read that
+	// cannot answer, and keeps the activity clock alone, as before the veto.
+	started := p.markedStarted(s, claim.BeadID)
+	if !started && executionLifecycleCandidate(claim, s) && p.executedSinceWake(s, claim.BeadID) {
+		started = p.markStarted(&s, claim.BeadID)
+	}
 	if hold := p.quietHold(s, sessName); hold != "" {
 		p.observeHold(p.store, &s, hold, p.stdout)
 		return backstopTarget{}, backstopResolutionHold
 	}
-	claim := claims[0]
 	target := backstopTarget{
 		ID:       claim.BeadID,
 		RootID:   claim.RootID,
@@ -299,10 +343,10 @@ func (p poolExecutionBackstop) resolve(s beads.Bead, _ map[string]beads.Bead, se
 		Assignee: claim.Assignee,
 		Store:    claim.Store,
 	}
-	// Execution evidence vetoes "unexecuted" (v5.10x): read only once this
-	// incarnation's window has run out, so a seat inside its grace pays no
-	// read, and every action past it (a nudge, the escalation) waits on it.
-	if same, attempts, last := p.state(s, target); same && decideBackstopAction(attempts, last, p.now) != backstopActionWait && p.executedSinceWake(s, claim.BeadID) {
+	// Execution evidence vetoes "unexecuted" (v5.10x): the row's stamp
+	// (mc-muv2x), so every action past the window (a nudge, the escalation)
+	// waits on it.
+	if same, attempts, last := p.state(s, target); same && decideBackstopAction(attempts, last, p.now) != backstopActionWait && started {
 		p.observeHold(p.store, &s, executionHoldExecuting, p.stdout)
 		return backstopTarget{}, backstopResolutionHold
 	}
@@ -457,6 +501,26 @@ func (p poolExecutionBackstop) executedSinceWake(s beads.Bead, beadID string) bo
 		}
 	}
 	return false
+}
+
+// startedValue is executionClaimStartedKey's value for s's incarnation and
+// beadID.
+func startedValue(s beads.Bead, beadID string) string {
+	return strings.TrimSpace(s.Metadata["instance_token"]) + "|" + strings.TrimSpace(beadID)
+}
+
+// markedStarted reports the row's persisted execution evidence for its
+// current incarnation and beadID (mc-muv2x).
+func (p poolExecutionBackstop) markedStarted(s beads.Bead, beadID string) bool {
+	return strings.TrimSpace(beadID) != "" && strings.TrimSpace(s.Metadata[executionClaimStartedKey]) == startedValue(s, beadID)
+}
+
+// markStarted stamps the row's execution evidence for its incarnation and
+// beadID, and reports whether the evidence holds (it does even when the write
+// fails: the sighting is this pass's evidence, and the next pass reads again).
+func (p poolExecutionBackstop) markStarted(s *beads.Bead, beadID string) bool {
+	writeSessionMetadata(p.store, s, map[string]string{executionClaimStartedKey: startedValue(*s, beadID)}, "execution-claim-started", p.stdout)
+	return true
 }
 
 func (p poolExecutionBackstop) observe(store beads.Store, s *beads.Bead, target backstopTarget, now time.Time, stdout io.Writer) {
