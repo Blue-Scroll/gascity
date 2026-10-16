@@ -2879,7 +2879,9 @@ func claimDueQueuedNudgesMatching(cityPath string, now time.Time, match func(que
 // carries a pin and its batch can be claimed whole (wholePinnedBatch), the
 // batch is that pinned batch, all of its pending items and nothing else: a
 // redelivery after an unknown outcome must be the same delivery. Otherwise it
-// is every due unpinned item, pinned to a new key.
+// is every due unpinned item, pinned to a new key. A pinned batch is taken
+// whole whatever its items' deliver_after, unlike storebinding's
+// NudgeQueue.ClaimBatch, which waits until every member is due.
 //
 // The claim also moves each item it takes onto target's fence in the queue
 // (refencedQueuedNudge), not only in the delivered copy. A batch thus carries
@@ -2929,7 +2931,9 @@ func claimDueQueuedNudges(cityPath string, now time.Time, match func(queuedNudge
 		due := func(item queuedNudge) bool {
 			return item.DeliverAfter.IsZero() || !item.DeliverAfter.After(now)
 		}
-		claim := func(item queuedNudge) bool { return match(item) && due(item) }
+		// due before match: match may list the city's sessions (the Leg-B
+		// census), which a candidate that is not yet due never needs.
+		claim := func(item queuedNudge) bool { return due(item) && match(item) }
 		stamp := func(item queuedNudge) queuedNudge { return item }
 		if batchTarget != nil {
 			pinned := wholePinnedBatch(state, claim, match)
@@ -2938,7 +2942,7 @@ func claimDueQueuedNudges(cityPath string, now time.Time, match func(queuedNudge
 				claim = func(item queuedNudge) bool { return item.DeliveryBatch == pinned && match(item) }
 			} else {
 				batch = newQueuedNudgeBatchID()
-				claim = func(item queuedNudge) bool { return item.DeliveryBatch == "" && match(item) && due(item) }
+				claim = func(item queuedNudge) bool { return item.DeliveryBatch == "" && due(item) && match(item) }
 			}
 			stamp = func(item queuedNudge) queuedNudge {
 				item = refencedQueuedNudge(*batchTarget, item)
@@ -2972,6 +2976,13 @@ func claimDueQueuedNudges(cityPath string, now time.Time, match func(queuedNudge
 // partial text and later replay that receipt for the missing items, acking
 // them unseen. A batch that cannot be claimed whole waits this pass, to be
 // reassembled on a later pass or retired when its items expire.
+//
+// Whether a batch splits is decided only for a batch that has a due,
+// claimable item, because match may list the city's sessions (the Leg-B
+// census): a batch whose items are all backed off never asks it. Deciding it
+// does ask about the batch's items that are not yet due: the batch is claimed
+// whole whatever their deliver_after, so whether each passes the fence decides
+// the claim.
 func wholePinnedBatch(state *nudgeQueueState, claimable, match func(queuedNudge) bool) string {
 	inFlight := make(map[string]bool, len(state.InFlight))
 	for _, item := range state.InFlight {
@@ -2980,14 +2991,22 @@ func wholePinnedBatch(state *nudgeQueueState, claimable, match func(queuedNudge)
 		}
 	}
 	split := map[string]bool{}
-	for _, item := range state.Pending {
-		if item.DeliveryBatch != "" && !match(item) {
-			split[item.DeliveryBatch] = true
+	splits := func(batch string) bool {
+		if decided, ok := split[batch]; ok {
+			return decided
 		}
+		split[batch] = false
+		for _, item := range state.Pending {
+			if item.DeliveryBatch == batch && !match(item) {
+				split[batch] = true
+				break
+			}
+		}
+		return split[batch]
 	}
 	for _, item := range state.Pending {
 		batch := item.DeliveryBatch
-		if batch == "" || inFlight[batch] || split[batch] || !claimable(item) {
+		if batch == "" || inFlight[batch] || !claimable(item) || splits(batch) {
 			continue
 		}
 		return batch
