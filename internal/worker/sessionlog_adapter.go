@@ -250,8 +250,13 @@ func (a SessionLogAdapter) ReadTranscript(req TranscriptRequest) (*TranscriptRes
 	if err != nil {
 		return nil, err
 	}
-	var sess *sessionlog.Session
+	sess, windowed, err := readNewestWindow(req.Provider, path, req.TailCompactions, req.Limit, beforeID, afterID, req.Raw)
+	if err != nil {
+		return nil, err
+	}
 	switch {
+	case windowed:
+		sess, err = sessionlog.PageSession(sess, 0, beforeID, "")
 	case req.Raw && afterID != "":
 		sess, err = sessionlog.ReadProviderFileRawNewer(req.Provider, path, req.TailCompactions, afterID)
 	case req.Raw && beforeID != "":
@@ -319,18 +324,27 @@ func (a SessionLogAdapter) LoadHistory(req LoadRequest) (*HistorySnapshot, error
 	if err != nil {
 		return nil, fmt.Errorf("stat transcript: %w", err)
 	}
-	fullSession, err := sessionlog.ReadProviderFileRaw(req.Provider, path, 0)
+	// branch is the whole active branch, or only its newest part when the
+	// window read answered (branch.Partial). The page and the transcript-wide
+	// facts below read it the same way either way.
+	branch, windowed, err := readNewestWindow(req.Provider, path, req.TailCompactions, req.Limit, beforeID, afterID, true)
 	if err != nil {
 		return nil, err
 	}
-	session := fullSession
-	paged := req.TailCompactions > 0 || req.Limit > 0 || beforeID != "" || afterID != ""
-	if paged {
-		session, err = sessionlog.PageSession(fullSession, req.TailCompactions, beforeID, afterID)
+	if !windowed {
+		branch, err = sessionlog.ReadProviderFileRaw(req.Provider, path, 0)
 		if err != nil {
 			return nil, err
 		}
-		// PageSession returned a copy, so this cut leaves fullSession whole for
+	}
+	session := branch
+	paged := req.TailCompactions > 0 || req.Limit > 0 || beforeID != "" || afterID != ""
+	if paged {
+		session, err = sessionlog.PageSession(branch, req.TailCompactions, beforeID, afterID)
+		if err != nil {
+			return nil, err
+		}
+		// PageSession returned a copy, so this cut leaves branch unchanged for
 		// the transcript-wide facts below.
 		sessionlog.LimitSession(session, req.Limit, afterID != "")
 	}
@@ -339,10 +353,10 @@ func (a SessionLogAdapter) LoadHistory(req LoadRequest) (*HistorySnapshot, error
 	contextEntries := entries
 	if paged {
 		// Pair tool_result blocks whose tool_use is off the current page against
-		// the full session (already read above — no extra I/O), so paginated
+		// the branch (already read above — no extra I/O), so paginated
 		// structured pages keep typed command/diff/read/task results instead of
 		// degrading to plain text at page boundaries.
-		contextEntries = normalizeHistoryEntries(req.Provider, path, fullSession.ID, fullSession.Messages)
+		contextEntries = normalizeHistoryEntries(req.Provider, path, branch.ID, branch.Messages)
 	}
 	entries = attachStructuredToolDataWithContext(entries, contextEntries)
 	if beforeID == "" {
@@ -356,7 +370,7 @@ func (a SessionLogAdapter) LoadHistory(req LoadRequest) (*HistorySnapshot, error
 			return nil, err
 		}
 	}
-	compactionCount, lastEntryID, pendingIDs := transcriptGlobalFacts(fullSession.Messages)
+	compactionCount, lastEntryID, pendingIDs := transcriptGlobalFacts(branch.Messages)
 
 	tailMeta, err := sessionlog.ExtractTailMeta(path)
 	if err != nil {
@@ -370,26 +384,26 @@ func (a SessionLogAdapter) LoadHistory(req LoadRequest) (*HistorySnapshot, error
 		logicalConversationID = firstNonEmpty(strings.TrimSpace(req.GCSessionID), session.ID)
 	}
 
-	openToolUseIDs := sortedKeys(fullSession.OrphanedToolUseIDs)
-	diagnostics := historyDiagnostics(fullSession.Diagnostics)
+	openToolUseIDs := sortedKeys(branch.OrphanedToolUseIDs)
+	diagnostics := historyDiagnostics(branch.Diagnostics)
 	continuity := Continuity{
 		Status:          ContinuityStatusContinuous,
 		CompactionCount: compactionCount,
-		HasBranches:     fullSession.HasBranches,
+		HasBranches:     branch.HasBranches,
 	}
 	if compactionCount > 0 {
 		continuity.Status = ContinuityStatusCompacted
 	}
-	if len(fullSession.Messages) == 0 {
+	if len(branch.Messages) == 0 {
 		continuity.Status = ContinuityStatusUnknown
 	}
 	if len(diagnostics) > 0 {
 		continuity.Note = diagnostics[0].Message
-		if len(fullSession.Messages) > 0 {
+		if len(branch.Messages) > 0 {
 			continuity.Status = ContinuityStatusDegraded
 		}
 	}
-	tailDegradedReason := tailDegradedReason(fullSession.Diagnostics)
+	tailDegradedReason := tailDegradedReason(branch.Diagnostics)
 
 	return &HistorySnapshot{
 		GCSessionID:           req.GCSessionID,
@@ -467,6 +481,19 @@ func transcriptPageEntryIDs(beforeEntryID, afterEntryID string) (string, string,
 		return "", "", ErrTranscriptCursorConflict
 	}
 	return beforeID, afterID, nil
+}
+
+// readNewestWindow reads a limited page from the end of the transcript when
+// the request allows it: a limit, no tail-compactions cut and no after cursor
+// (a forward page starts above any window). windowed is false when the request
+// does not allow it or the end of the file cannot answer; the caller then
+// reads the whole file. A windowed session is the newest part of the active
+// branch, not the page: page it like a whole-file session.
+func readNewestWindow(provider, path string, tailCompactions, limit int, beforeID, afterID string, raw bool) (*sessionlog.Session, bool, error) {
+	if limit <= 0 || tailCompactions > 0 || afterID != "" {
+		return nil, false, nil
+	}
+	return sessionlog.ReadProviderFileWindow(provider, path, limit, beforeID, raw)
 }
 
 func normalizeEntry(provider, path, sessionID string, order int, entry *sessionlog.Entry) HistoryEntry {

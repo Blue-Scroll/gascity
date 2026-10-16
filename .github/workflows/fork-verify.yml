@@ -85,6 +85,17 @@ jobs:
           # than letting every row fail for a reason the log does not name.
           jq --version
           go test ./examples/gastown/ -run 'TestSpawnStorm' -count=1 -v
+      - name: Unit tests, a limited transcript read comes from the end of the log (vn-t7v7fm4)
+        # The phone opens the mayor with limit=60, and gc parsed all 6 MB of
+        # his log to keep 60 entries: 10 to 67 s under load. These pin that the
+        # read from the end gives the whole-file page, falls back to the whole
+        # file when the end cannot answer, and that the API spec and client
+        # carry pagination.partial_read.
+        run: |
+          go test ./internal/sessionlog/ -run 'TestReadProviderFileWindow|TestFamilyReaders|TestBuildDag|TestParseFile|TestLimitSession' -count=1 -v
+          go test ./internal/worker/ -run 'TestLoadHistoryLimitReadsTheEndOfALongLog|TestReadTranscriptLimitReadsTheEndOfALongLog|TestSessionLogAdapterPagination' -count=1 -v
+          go test ./internal/api/ -run 'TestOpenAPISpecInSync|TestHandleSessionTranscriptLimit|TestSessionStreamConversation' -count=1 -v
+          go test ./internal/api/genclient/ -run 'TestGeneratedClientInSync' -count=1 -v
       - name: gc's schema pins match the beads town links (vn-cuad16u)
         # gc pins bd's two schema cursors as constants
         # (internal/beads/schema_cursor.go). The town builds gc against

@@ -2944,8 +2944,11 @@ type PackResponse struct {
 
 // PaginationInfo defines model for PaginationInfo.
 type PaginationInfo struct {
-	HasNewerMessages       *bool   `json:"has_newer_messages,omitempty"`
-	HasOlderMessages       bool    `json:"has_older_messages"`
+	HasNewerMessages *bool `json:"has_newer_messages,omitempty"`
+	HasOlderMessages bool  `json:"has_older_messages"`
+
+	// PartialRead True when gc answered a limit from the end of the log without reading all of it. total_message_count and total_compactions then count only the part it read, so the log holds at least that many, and the structured history's compaction count, branch flag, open tool calls, pending interactions and diagnostics cover only that part too. has_older_messages, has_newer_messages and truncated_before_message are exact either way.
+	PartialRead            *bool   `json:"partial_read,omitempty"`
 	ReturnedMessageCount   int64   `json:"returned_message_count"`
 	TotalCompactions       int64   `json:"total_compactions"`
 	TotalMessageCount      int64   `json:"total_message_count"`
@@ -10341,7 +10344,7 @@ type GetV0CityByCityNameSessionByIdTranscriptParams struct {
 	// After Pagination cursor: return entries after this stable transcript entry ID.
 	After *string `form:"after,omitempty" json:"after,omitempty"`
 
-	// Limit Return at most this many transcript entries, cut after before/after and tail. Omit or 0 for no limit. Without after it keeps the newest entries and sets pagination.has_older_messages when it dropped some; pass pagination.truncated_before_message as before to read the next older page. With after it keeps the entries right after the cursor and sets has_newer_messages. A limited structured snapshot's resume token is a suffix window, so the stream resumes from it with upserts. Counts entries, not turns: the conversation format can show fewer.
+	// Limit Return at most this many transcript entries, cut after before/after and tail. Omit or 0 for no limit. Without after it keeps the newest entries and sets pagination.has_older_messages when it dropped some; pass pagination.truncated_before_message as before to read the next older page. With after it keeps the entries right after the cursor and sets has_newer_messages. A limited structured snapshot's resume token is a suffix window, so the stream resumes from it with upserts. Counts entries, not turns: the conversation format can show fewer. Without after or tail, gc reads a long log from its end and stops once it holds the page; pagination.partial_read then says the counts cover only what it read.
 	Limit *int64 `form:"limit,omitempty" json:"limit,omitempty"`
 }
 
