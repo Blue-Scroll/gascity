@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -35,6 +36,12 @@ type Session struct {
 
 	// Diagnostics surfaces parser health for the underlying session file.
 	Diagnostics SessionDiagnostics
+
+	// Partial is true when Messages is only the newest part of the active
+	// branch, read without the rest of the file (ReadProviderFileWindow). The
+	// other fields then cover only that part too. Paging a partial session
+	// sets PaginationInfo.PartialRead, so the API says so.
+	Partial bool
 }
 
 // SessionDiagnostics reports non-fatal issues detected while loading a
@@ -52,6 +59,8 @@ type PaginationInfo struct {
 	ReturnedMessageCount   int    `json:"returned_message_count"`
 	TruncatedBeforeMessage string `json:"truncated_before_message,omitempty"`
 	TotalCompactions       int    `json:"total_compactions"`
+	// PartialRead is true when gc read only the end of the log to answer.
+	PartialRead bool `json:"partial_read,omitempty" doc:"True when gc answered a limit from the end of the log without reading all of it. total_message_count and total_compactions then count only the part it read, so the log holds at least that many, and the structured history's compaction count, branch flag, open tool calls, pending interactions and diagnostics cover only that part too. has_older_messages, has_newer_messages and truncated_before_message are exact either way."`
 }
 
 // RawPayloads decodes each non-empty Entry.Raw into a generic JSON value
@@ -128,9 +137,7 @@ func ReadFile(path string, tailCompactions int) (*Session, error) {
 		}
 	}
 
-	// Extract session ID from filename.
-	base := filepath.Base(path)
-	sessionID := strings.TrimSuffix(base, filepath.Ext(base))
+	sessionID := sessionIDFromPath(path)
 
 	sess := &Session{
 		ID:                 sessionID,
@@ -150,44 +157,59 @@ func ReadFile(path string, tailCompactions int) (*Session, error) {
 	return sess, nil
 }
 
+// familyReaders maps each transcript family with its own file format to its
+// reader. A family missing here writes Claude Code JSONL, which ReadFile reads.
+var familyReaders = map[string]func(path string, tailCompactions int) (*Session, error){
+	"auggie":      ReadAuggieFile,
+	"amp":         ReadAmpFile,
+	"codex":       ReadCodexFile,
+	"copilot":     ReadCopilotFile,
+	"cursor":      ReadCursorFile,
+	"grok":        ReadGrokFile,
+	"kiro":        ReadKiroFile,
+	"gemini":      ReadGeminiFile,
+	"kimi":        ReadKimiFile,
+	"mimocode":    ReadMimoCodeFile,
+	"opencode":    ReadOpenCodeFile,
+	"zcode":       ReadZCodeFile,
+	"pi":          ReadPiFile,
+	"antigravity": ReadAntigravityFile,
+}
+
+// rawFamilyReaders is familyReaders for the raw view. It must name the same
+// families (TestFamilyReadersNameTheSameFamilies): a family in only one map
+// would be read as Claude JSONL in the other view.
+var rawFamilyReaders = map[string]func(path string, tailCompactions int) (*Session, error){
+	"auggie":      ReadAuggieFile,
+	"amp":         ReadAmpFile,
+	"codex":       ReadCodexFile,
+	"copilot":     ReadCopilotFile,
+	"cursor":      ReadCursorFile,
+	"grok":        ReadGrokFile,
+	"kiro":        ReadKiroFile,
+	"gemini":      ReadGeminiFile,
+	"kimi":        ReadKimiFile,
+	"mimocode":    ReadMimoCodeFile,
+	"opencode":    ReadOpenCodeFile,
+	"zcode":       ReadZCodeFile,
+	"pi":          ReadPiFile,
+	"antigravity": ReadAntigravityFileRaw,
+}
+
+// readsClaudeJSONL reports whether provider's transcript is a Claude Code
+// JSONL file, the format ReadFile and ReadFileRaw parse.
+func readsClaudeJSONL(provider string) bool {
+	_, ownFormat := rawFamilyReaders[ProviderFamily(provider)]
+	return !ownFormat
+}
+
 // ReadProviderFile reads a provider-specific transcript file.
 func ReadProviderFile(provider, path string, tailCompactions int) (*Session, error) {
-	var (
-		sess *Session
-		err  error
-	)
-	switch ProviderFamily(provider) {
-	case "auggie":
-		sess, err = ReadAuggieFile(path, tailCompactions)
-	case "amp":
-		sess, err = ReadAmpFile(path, tailCompactions)
-	case "codex":
-		sess, err = ReadCodexFile(path, tailCompactions)
-	case "copilot":
-		sess, err = ReadCopilotFile(path, tailCompactions)
-	case "cursor":
-		sess, err = ReadCursorFile(path, tailCompactions)
-	case "grok":
-		sess, err = ReadGrokFile(path, tailCompactions)
-	case "kiro":
-		sess, err = ReadKiroFile(path, tailCompactions)
-	case "gemini":
-		sess, err = ReadGeminiFile(path, tailCompactions)
-	case "kimi":
-		sess, err = ReadKimiFile(path, tailCompactions)
-	case "mimocode":
-		sess, err = ReadMimoCodeFile(path, tailCompactions)
-	case "opencode":
-		sess, err = ReadOpenCodeFile(path, tailCompactions)
-	case "zcode":
-		sess, err = ReadZCodeFile(path, tailCompactions)
-	case "pi":
-		sess, err = ReadPiFile(path, tailCompactions)
-	case "antigravity":
-		sess, err = ReadAntigravityFile(path, tailCompactions)
-	default:
-		sess, err = ReadFile(path, tailCompactions)
+	read := ReadFile
+	if familyRead, ok := familyReaders[ProviderFamily(provider)]; ok {
+		read = familyRead
 	}
+	sess, err := read(path, tailCompactions)
 	if err != nil {
 		return nil, err
 	}
@@ -209,8 +231,7 @@ func ReadFileRaw(path string, tailCompactions int) (*Session, error) {
 	dag := BuildDag(entries)
 	messages := dag.ActiveBranch
 
-	base := filepath.Base(path)
-	sessionID := strings.TrimSuffix(base, filepath.Ext(base))
+	sessionID := sessionIDFromPath(path)
 
 	sess := &Session{
 		ID:                 sessionID,
@@ -234,42 +255,11 @@ func ReadFileRaw(path string, tailCompactions int) (*Session, error) {
 // on each returned entry, so the Codex reader is sufficient for both raw and
 // conversation views.
 func ReadProviderFileRaw(provider, path string, tailCompactions int) (*Session, error) {
-	var (
-		sess *Session
-		err  error
-	)
-	switch ProviderFamily(provider) {
-	case "auggie":
-		sess, err = ReadAuggieFile(path, tailCompactions)
-	case "amp":
-		sess, err = ReadAmpFile(path, tailCompactions)
-	case "codex":
-		sess, err = ReadCodexFile(path, tailCompactions)
-	case "copilot":
-		sess, err = ReadCopilotFile(path, tailCompactions)
-	case "cursor":
-		sess, err = ReadCursorFile(path, tailCompactions)
-	case "grok":
-		sess, err = ReadGrokFile(path, tailCompactions)
-	case "kiro":
-		sess, err = ReadKiroFile(path, tailCompactions)
-	case "gemini":
-		sess, err = ReadGeminiFile(path, tailCompactions)
-	case "kimi":
-		sess, err = ReadKimiFile(path, tailCompactions)
-	case "mimocode":
-		sess, err = ReadMimoCodeFile(path, tailCompactions)
-	case "opencode":
-		sess, err = ReadOpenCodeFile(path, tailCompactions)
-	case "zcode":
-		sess, err = ReadZCodeFile(path, tailCompactions)
-	case "pi":
-		sess, err = ReadPiFile(path, tailCompactions)
-	case "antigravity":
-		sess, err = ReadAntigravityFileRaw(path, tailCompactions)
-	default:
-		sess, err = ReadFileRaw(path, tailCompactions)
+	read := ReadFileRaw
+	if familyRead, ok := rawFamilyReaders[ProviderFamily(provider)]; ok {
+		read = familyRead
 	}
+	sess, err := read(path, tailCompactions)
 	if err != nil {
 		return nil, err
 	}
@@ -296,8 +286,7 @@ func ReadFileOlder(path string, tailCompactions int, beforeMessageID string) (*S
 		}
 	}
 
-	base := filepath.Base(path)
-	sessionID := strings.TrimSuffix(base, filepath.Ext(base))
+	sessionID := sessionIDFromPath(path)
 
 	return paginateSession(&Session{
 		ID:                 sessionID,
@@ -318,8 +307,7 @@ func ReadFileRawOlder(path string, tailCompactions int, beforeMessageID string) 
 	dag := BuildDag(entries)
 	messages := dag.ActiveBranch
 
-	base := filepath.Base(path)
-	sessionID := strings.TrimSuffix(base, filepath.Ext(base))
+	sessionID := sessionIDFromPath(path)
 
 	return paginateSession(&Session{
 		ID:                 sessionID,
@@ -357,8 +345,7 @@ func ReadFileNewer(path string, tailCompactions int, afterMessageID string) (*Se
 		}
 	}
 
-	base := filepath.Base(path)
-	sessionID := strings.TrimSuffix(base, filepath.Ext(base))
+	sessionID := sessionIDFromPath(path)
 
 	return paginateSession(&Session{
 		ID:                 sessionID,
@@ -379,8 +366,7 @@ func ReadFileRawNewer(path string, tailCompactions int, afterMessageID string) (
 	dag := BuildDag(entries)
 	messages := dag.ActiveBranch
 
-	base := filepath.Base(path)
-	sessionID := strings.TrimSuffix(base, filepath.Ext(base))
+	sessionID := sessionIDFromPath(path)
 
 	return paginateSession(&Session{
 		ID:                 sessionID,
@@ -425,15 +411,21 @@ func parseFileDetailed(path string) ([]*Entry, SessionDiagnostics, error) {
 		return nil, SessionDiagnostics{}, fmt.Errorf("opening session file: %w", err)
 	}
 	defer f.Close() //nolint:errcheck // read-only file
+	return parseEntries(f)
+}
 
+// parseEntries reads JSONL lines into entries. It is the one line parser for a
+// Claude session file, whole (parseFileDetailed) or its newest part
+// (ReadProviderFileWindow), so both see the same entries and diagnostics.
+func parseEntries(r io.Reader) ([]*Entry, SessionDiagnostics, error) {
 	var entries []*Entry
 	var diagnostics SessionDiagnostics
 	var lastNonEmptyLineMalformed bool
-	scanner := bufio.NewScanner(f)
+	scanner := bufio.NewScanner(r)
 	// Default scanner buffer is 64KB; Claude entries can be large
 	// (tool results with full file contents, base64 images, etc.).
 	// Use 50MB max to handle very large entries without aborting the whole file.
-	scanner.Buffer(make([]byte, 0, 256*1024), 50*1024*1024)
+	scanner.Buffer(make([]byte, 0, 256*1024), maxEntryLineBytes)
 
 	for scanner.Scan() {
 		line := scanner.Bytes()
@@ -460,6 +452,9 @@ func parseFileDetailed(path string) ([]*Entry, SessionDiagnostics, error) {
 	diagnostics.MalformedTail = lastNonEmptyLineMalformed
 	return entries, diagnostics, nil
 }
+
+// maxEntryLineBytes is the longest JSONL line the parser accepts.
+const maxEntryLineBytes = 50 * 1024 * 1024
 
 // sliceAtCompactBoundaries returns the tail portion of messages starting
 // from the Nth-from-last compact boundary. The boundary itself is

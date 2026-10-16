@@ -103,6 +103,7 @@ func paginateSession(session *Session, tailCompactions int, beforeEntryID, after
 	}
 
 	paginated, info := sliceAtCompactBoundaries(session.Messages, tailCompactions, beforeEntryID, afterEntryID)
+	info.PartialRead = session.Partial
 	session.Messages = paginated
 	session.Pagination = info
 	return session, nil
@@ -142,7 +143,7 @@ func LimitSession(session *Session, limit int, forward bool) {
 	}
 	info := session.Pagination
 	if info == nil {
-		info = &PaginationInfo{TotalMessageCount: len(session.Messages)}
+		info = &PaginationInfo{TotalMessageCount: len(session.Messages), PartialRead: session.Partial}
 		session.Pagination = info
 	}
 	if forward {

@@ -37,6 +37,30 @@ type DagResult struct {
 //  5. Collect all tool_result IDs from entire session
 //  6. Find orphaned tool_use blocks on active branch
 func BuildDag(entries []*Entry) *DagResult {
+	index := indexDag(entries)
+	best, _, ok := index.activeTip()
+	if !ok {
+		return &DagResult{}
+	}
+	activeBranch, compactionCount, _ := index.walkToRoot(best, true)
+	return index.result(entries, activeBranch, compactionCount)
+}
+
+// dagIndex holds the parent/child maps and tips of a set of entries. BuildDag
+// resolves a whole file with it; the newest-window read (tail_window.go)
+// resolves the end of a file with the same tip choice and the same walk, so
+// the two can never pick a different branch for the entries they share.
+type dagIndex struct {
+	nodeMap map[string]*dagNode
+	tips    []dagTip
+}
+
+type dagTip struct {
+	node   *dagNode
+	length int
+}
+
+func indexDag(entries []*Entry) dagIndex {
 	nodeMap := make(map[string]*dagNode)
 	childrenMap := make(map[string][]string) // parentUuid → child uuids
 
@@ -56,27 +80,24 @@ func BuildDag(entries []*Entry) *DagResult {
 	}
 
 	// Find tips (nodes with no children).
-	type tipInfo struct {
-		node   *dagNode
-		length int
-	}
-	var tips []tipInfo
+	var tips []dagTip
 	for _, node := range nodeMap {
-		children := childrenMap[node.uuid]
-		if len(children) == 0 {
-			length := walkBranchLength(node.uuid, nodeMap)
-			tips = append(tips, tipInfo{node: node, length: length})
+		if len(childrenMap[node.uuid]) == 0 {
+			tips = append(tips, dagTip{node: node, length: walkBranchLength(node.uuid, nodeMap)})
 		}
 	}
+	return dagIndex{nodeMap: nodeMap, tips: tips}
+}
 
-	if len(tips) == 0 {
-		return &DagResult{}
+// activeTip selects the active tip: latest timestamp wins, then longest
+// branch, then latest lineIndex. tied reports that another tip shares the
+// winner's timestamp, so the choice rested on branch length or file position.
+func (d dagIndex) activeTip() (best dagTip, tied bool, ok bool) {
+	if len(d.tips) == 0 {
+		return dagTip{}, false, false
 	}
-
-	// Select active tip: latest timestamp wins, then longest branch,
-	// then latest lineIndex.
-	best := tips[0]
-	for _, t := range tips[1:] {
+	best = d.tips[0]
+	for _, t := range d.tips[1:] {
 		bestTs := best.node.entry.Timestamp
 		currentTs := t.node.entry.Timestamp
 		switch {
@@ -92,18 +113,28 @@ func BuildDag(entries []*Entry) *DagResult {
 			}
 		}
 	}
+	for _, t := range d.tips {
+		if t.node != best.node && t.node.entry.Timestamp.Equal(best.node.entry.Timestamp) {
+			tied = true
+			break
+		}
+	}
+	return best, tied, true
+}
 
-	// Walk from tip to root.
-	var activeBranch []*Entry
-	activeBranchUUIDs := make(map[string]bool)
+// walkToRoot walks from tip to root and returns the branch in root → tip
+// order. A parent that is not in the index ends the walk. When fallback is
+// true, a compact boundary whose logicalParentUuid is missing continues from
+// the node just above it in the file instead, which is right for a whole file
+// (the parent is in no file at all) and wrong for part of one (the parent may
+// sit above the part). cut reports that the walk ended on a missing parent
+// rather than at a root.
+func (d dagIndex) walkToRoot(tip dagTip, fallback bool) (branch []*Entry, compactionCount int, cut bool) {
 	visited := make(map[string]bool)
-	compactionCount := 0
-
-	current := best.node
+	current := tip.node
 	for current != nil && !visited[current.uuid] {
 		visited[current.uuid] = true
-		activeBranch = append(activeBranch, current.entry)
-		activeBranchUUIDs[current.uuid] = true
+		branch = append(branch, current.entry)
 
 		if current.entry.IsCompactBoundary() {
 			compactionCount++
@@ -119,22 +150,27 @@ func BuildDag(entries []*Entry) *DagResult {
 			break
 		}
 
-		next, ok := nodeMap[nextID]
-		if !ok && current.entry.LogicalParentUUID != "" {
+		next, ok := d.nodeMap[nextID]
+		switch {
+		case ok:
+		case fallback && current.entry.LogicalParentUUID != "":
 			// logicalParentUuid references a message not in this file.
 			// Fallback: find the node with highest lineIndex before current.
-			next = findFallbackParent(current.lineIndex, nodeMap, visited)
-		} else if !ok {
-			break
+			next = findFallbackParent(current.lineIndex, d.nodeMap, visited)
+		default:
+			cut = true
 		}
 		current = next
 	}
 
 	// Reverse to get root → tip order.
-	for i, j := 0, len(activeBranch)-1; i < j; i, j = i+1, j-1 {
-		activeBranch[i], activeBranch[j] = activeBranch[j], activeBranch[i]
+	for i, j := 0, len(branch)-1; i < j; i, j = i+1, j-1 {
+		branch[i], branch[j] = branch[j], branch[i]
 	}
+	return branch, compactionCount, cut
+}
 
+func (d dagIndex) result(entries, activeBranch []*Entry, compactionCount int) *DagResult {
 	// Collect all tool_result IDs from entire session (not just active branch).
 	allToolResultIDs := collectAllToolResultIDs(entries)
 
@@ -144,7 +180,7 @@ func BuildDag(entries []*Entry) *DagResult {
 	return &DagResult{
 		ActiveBranch:       activeBranch,
 		OrphanedToolUseIDs: orphaned,
-		HasBranches:        len(tips) > 1,
+		HasBranches:        len(d.tips) > 1,
 		CompactionCount:    compactionCount,
 	}
 }
