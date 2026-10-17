@@ -2778,7 +2778,13 @@ type OrderHistoryEntry struct {
 	ScopedName    string    `json:"scoped_name"`
 	Signal        *string   `json:"signal,omitempty"`
 	StoreRef      string    `json:"store_ref"`
-	WispRootId    *string   `json:"wisp_root_id,omitempty"`
+
+	// TimedOut Exec runs: true when the controller killed the command at its timeout. Set on every exec run with a recorded result.
+	TimedOut *bool `json:"timed_out,omitempty"`
+
+	// TimeoutMs Exec runs: the timeout the command ran under, in milliseconds.
+	TimeoutMs  *string `json:"timeout_ms,omitempty"`
+	WispRootId *string `json:"wisp_root_id,omitempty"`
 }
 
 // OrderHistoryListBody defines model for OrderHistoryListBody.
@@ -2857,6 +2863,14 @@ type OrderSuppressedPayload struct {
 	FirstSuppressed string `json:"first_suppressed"`
 	OrderName       string `json:"order_name"`
 	SuppressedForMs int64  `json:"suppressed_for_ms"`
+}
+
+// OrderTimedOutPayload defines model for OrderTimedOutPayload.
+type OrderTimedOutPayload struct {
+	BeadId     string `json:"bead_id"`
+	DurationMs int64  `json:"duration_ms"`
+	OrderName  string `json:"order_name"`
+	TimeoutMs  int64  `json:"timeout_ms"`
 }
 
 // OrdersFeedBody defines model for OrdersFeedBody.
@@ -6506,6 +6520,22 @@ type TypedEventStreamEnvelopeOrderSuppressed struct {
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
 }
 
+// TypedEventStreamEnvelopeOrderTimedOut defines model for TypedEventStreamEnvelopeOrderTimedOut.
+type TypedEventStreamEnvelopeOrderTimedOut struct {
+	Actor            string                   `json:"actor"`
+	DependsOnStepIds *[]string                `json:"depends_on_step_ids,omitempty"`
+	Message          *string                  `json:"message,omitempty"`
+	Payload          OrderTimedOutPayload     `json:"payload"`
+	RunId            *string                  `json:"run_id,omitempty"`
+	Seq              int64                    `json:"seq"`
+	SessionId        *string                  `json:"session_id,omitempty"`
+	StepId           *string                  `json:"step_id,omitempty"`
+	Subject          *string                  `json:"subject,omitempty"`
+	Ts               time.Time                `json:"ts"`
+	Type             string                   `json:"type"`
+	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
+}
+
 // TypedEventStreamEnvelopeProjectIdentityStamped defines model for TypedEventStreamEnvelopeProjectIdentityStamped.
 type TypedEventStreamEnvelopeProjectIdentityStamped struct {
 	Actor            string                        `json:"actor"`
@@ -8241,6 +8271,23 @@ type TypedTaggedEventStreamEnvelopeOrderSuppressed struct {
 	DependsOnStepIds *[]string                `json:"depends_on_step_ids,omitempty"`
 	Message          *string                  `json:"message,omitempty"`
 	Payload          OrderSuppressedPayload   `json:"payload"`
+	RunId            *string                  `json:"run_id,omitempty"`
+	Seq              int64                    `json:"seq"`
+	SessionId        *string                  `json:"session_id,omitempty"`
+	StepId           *string                  `json:"step_id,omitempty"`
+	Subject          *string                  `json:"subject,omitempty"`
+	Ts               time.Time                `json:"ts"`
+	Type             string                   `json:"type"`
+	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
+}
+
+// TypedTaggedEventStreamEnvelopeOrderTimedOut defines model for TypedTaggedEventStreamEnvelopeOrderTimedOut.
+type TypedTaggedEventStreamEnvelopeOrderTimedOut struct {
+	Actor            string                   `json:"actor"`
+	City             string                   `json:"city"`
+	DependsOnStepIds *[]string                `json:"depends_on_step_ids,omitempty"`
+	Message          *string                  `json:"message,omitempty"`
+	Payload          OrderTimedOutPayload     `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
@@ -11310,6 +11357,32 @@ func (t *EventPayload) FromOrderSuppressedPayload(v OrderSuppressedPayload) erro
 
 // MergeOrderSuppressedPayload performs a merge with any union data inside the EventPayload, using the provided OrderSuppressedPayload
 func (t *EventPayload) MergeOrderSuppressedPayload(v OrderSuppressedPayload) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
+// AsOrderTimedOutPayload returns the union data inside the EventPayload as a OrderTimedOutPayload
+func (t EventPayload) AsOrderTimedOutPayload() (OrderTimedOutPayload, error) {
+	var body OrderTimedOutPayload
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromOrderTimedOutPayload overwrites any union data inside the EventPayload as the provided OrderTimedOutPayload
+func (t *EventPayload) FromOrderTimedOutPayload(v OrderTimedOutPayload) error {
+	b, err := json.Marshal(v)
+	t.union = b
+	return err
+}
+
+// MergeOrderTimedOutPayload performs a merge with any union data inside the EventPayload, using the provided OrderTimedOutPayload
+func (t *EventPayload) MergeOrderTimedOutPayload(v OrderTimedOutPayload) error {
 	b, err := json.Marshal(v)
 	if err != nil {
 		return err
@@ -15531,6 +15604,34 @@ func (t *TypedEventStreamEnvelope) MergeTypedEventStreamEnvelopeOrderSuppressed(
 	return err
 }
 
+// AsTypedEventStreamEnvelopeOrderTimedOut returns the union data inside the TypedEventStreamEnvelope as a TypedEventStreamEnvelopeOrderTimedOut
+func (t TypedEventStreamEnvelope) AsTypedEventStreamEnvelopeOrderTimedOut() (TypedEventStreamEnvelopeOrderTimedOut, error) {
+	var body TypedEventStreamEnvelopeOrderTimedOut
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromTypedEventStreamEnvelopeOrderTimedOut overwrites any union data inside the TypedEventStreamEnvelope as the provided TypedEventStreamEnvelopeOrderTimedOut
+func (t *TypedEventStreamEnvelope) FromTypedEventStreamEnvelopeOrderTimedOut(v TypedEventStreamEnvelopeOrderTimedOut) error {
+	v.Type = "order.timed_out"
+	b, err := json.Marshal(v)
+	t.union = b
+	return err
+}
+
+// MergeTypedEventStreamEnvelopeOrderTimedOut performs a merge with any union data inside the TypedEventStreamEnvelope, using the provided TypedEventStreamEnvelopeOrderTimedOut
+func (t *TypedEventStreamEnvelope) MergeTypedEventStreamEnvelopeOrderTimedOut(v TypedEventStreamEnvelopeOrderTimedOut) error {
+	v.Type = "order.timed_out"
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
 // AsTypedEventStreamEnvelopeProjectIdentityStamped returns the union data inside the TypedEventStreamEnvelope as a TypedEventStreamEnvelopeProjectIdentityStamped
 func (t TypedEventStreamEnvelope) AsTypedEventStreamEnvelopeProjectIdentityStamped() (TypedEventStreamEnvelopeProjectIdentityStamped, error) {
 	var body TypedEventStreamEnvelopeProjectIdentityStamped
@@ -16953,6 +17054,8 @@ func (t TypedEventStreamEnvelope) ValueByDiscriminator() (interface{}, error) {
 		return t.AsTypedEventStreamEnvelopeOrderSkipped()
 	case "order.suppressed":
 		return t.AsTypedEventStreamEnvelopeOrderSuppressed()
+	case "order.timed_out":
+		return t.AsTypedEventStreamEnvelopeOrderTimedOut()
 	case "project.identity.stamped":
 		return t.AsTypedEventStreamEnvelopeProjectIdentityStamped()
 	case "provider.swapped":
@@ -18710,6 +18813,34 @@ func (t *TypedTaggedEventStreamEnvelope) MergeTypedTaggedEventStreamEnvelopeOrde
 	return err
 }
 
+// AsTypedTaggedEventStreamEnvelopeOrderTimedOut returns the union data inside the TypedTaggedEventStreamEnvelope as a TypedTaggedEventStreamEnvelopeOrderTimedOut
+func (t TypedTaggedEventStreamEnvelope) AsTypedTaggedEventStreamEnvelopeOrderTimedOut() (TypedTaggedEventStreamEnvelopeOrderTimedOut, error) {
+	var body TypedTaggedEventStreamEnvelopeOrderTimedOut
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromTypedTaggedEventStreamEnvelopeOrderTimedOut overwrites any union data inside the TypedTaggedEventStreamEnvelope as the provided TypedTaggedEventStreamEnvelopeOrderTimedOut
+func (t *TypedTaggedEventStreamEnvelope) FromTypedTaggedEventStreamEnvelopeOrderTimedOut(v TypedTaggedEventStreamEnvelopeOrderTimedOut) error {
+	v.Type = "order.timed_out"
+	b, err := json.Marshal(v)
+	t.union = b
+	return err
+}
+
+// MergeTypedTaggedEventStreamEnvelopeOrderTimedOut performs a merge with any union data inside the TypedTaggedEventStreamEnvelope, using the provided TypedTaggedEventStreamEnvelopeOrderTimedOut
+func (t *TypedTaggedEventStreamEnvelope) MergeTypedTaggedEventStreamEnvelopeOrderTimedOut(v TypedTaggedEventStreamEnvelopeOrderTimedOut) error {
+	v.Type = "order.timed_out"
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
 // AsTypedTaggedEventStreamEnvelopeProjectIdentityStamped returns the union data inside the TypedTaggedEventStreamEnvelope as a TypedTaggedEventStreamEnvelopeProjectIdentityStamped
 func (t TypedTaggedEventStreamEnvelope) AsTypedTaggedEventStreamEnvelopeProjectIdentityStamped() (TypedTaggedEventStreamEnvelopeProjectIdentityStamped, error) {
 	var body TypedTaggedEventStreamEnvelopeProjectIdentityStamped
@@ -20132,6 +20263,8 @@ func (t TypedTaggedEventStreamEnvelope) ValueByDiscriminator() (interface{}, err
 		return t.AsTypedTaggedEventStreamEnvelopeOrderSkipped()
 	case "order.suppressed":
 		return t.AsTypedTaggedEventStreamEnvelopeOrderSuppressed()
+	case "order.timed_out":
+		return t.AsTypedTaggedEventStreamEnvelopeOrderTimedOut()
 	case "project.identity.stamped":
 		return t.AsTypedTaggedEventStreamEnvelopeProjectIdentityStamped()
 	case "provider.swapped":

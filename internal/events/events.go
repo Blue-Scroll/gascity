@@ -357,7 +357,12 @@ const (
 	// that some or all of its work did not run: a bead scope it could not
 	// reach, or a safety gate that held a step back. It accompanies the run's
 	// order.completed so a skip is never read as a clean completion.
-	OrderSkipped                    = "order.skipped"
+	OrderSkipped = "order.skipped"
+	// OrderTimedOut reports that the controller killed an exec order's command
+	// at its timeout. It accompanies the run's order.failed so a killed run is
+	// never read as one that ran and exited with an error, and so a watcher
+	// can count kills without parsing the failure text.
+	OrderTimedOut                   = "order.timed_out"
 	ProviderSwapped                 = "provider.swapped"
 	WorkerOperation                 = "worker.operation"
 	ProjectIdentityStamped          = "project.identity.stamped"
@@ -532,7 +537,7 @@ var KnownEventTypes = []string{
 	RequestResultSessionSubmit, RequestResultRigCreate, RequestFailed,
 	RigProvisionProgress,
 	CityCreated, CityUnregisterRequested,
-	OrderFired, OrderCompleted, OrderFailed, OrderSuppressed, OrderSkipped,
+	OrderFired, OrderCompleted, OrderFailed, OrderSuppressed, OrderSkipped, OrderTimedOut,
 	ProviderSwapped, WorkerOperation, ProjectIdentityStamped, SupervisorFSPressureSkippedTick,
 	MoleculeResolved,
 	SupervisorStarted, SupervisorShutdownRequested, SupervisorRequest,

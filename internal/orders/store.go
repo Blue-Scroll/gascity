@@ -155,6 +155,9 @@ type OrderRun struct {
 	Open bool
 	// Cursor is the decoded EventCursor (max seq across the run's labels).
 	Cursor EventCursor
+	// Exec is how the run's exec command ended, or nil when the bead records
+	// none (see ExecResultFromMetadata).
+	Exec *ExecResult
 }
 
 // State returns the feed-facing lifecycle status of the run: "failed" when the
@@ -308,6 +311,21 @@ func (s *Store) CreateRun(scoped string, opts RunOpts) (OrderRun, error) {
 func (s *Store) SetOutcome(runID string, outcome RunOutcome) error {
 	if err := s.store.Update(runID, beads.UpdateOpts{Labels: outcome.Labels()}); err != nil {
 		return fmt.Errorf("setting order run outcome on %q: %w", runID, err)
+	}
+	return nil
+}
+
+// SetExecOutcome stamps an exec run's outcome label set and how its command
+// ended in one write, so a reader never sees the label without the result.
+// result is nil when the command never started (its env failed to build);
+// then only the label is written.
+func (s *Store) SetExecOutcome(runID string, outcome RunOutcome, result *ExecResult) error {
+	opts := beads.UpdateOpts{Labels: outcome.Labels()}
+	if result != nil {
+		opts.Metadata = result.Metadata()
+	}
+	if err := s.store.Update(runID, opts); err != nil {
+		return fmt.Errorf("setting order run exec outcome on %q: %w", runID, err)
 	}
 	return nil
 }
@@ -496,9 +514,10 @@ func RunFromTrackingBead(b beads.Bead) (OrderRun, bool) {
 // decodeRun projects an order tracking/run bead onto an OrderRun. It is pure,
 // side-effect-free, and backend-invariant (reads only bead fields), matching the
 // projection-invariance invariant. The cooldown clock (CreatedAt), open flag,
-// outcome (from labels), and event cursor (max seq from labels) are decoded here.
+// outcome (from labels), event cursor (max seq from labels), and exec result
+// (from metadata) are decoded here.
 func decodeRun(scoped string, b beads.Bead) OrderRun {
-	return OrderRun{
+	run := OrderRun{
 		ID:        b.ID,
 		Scoped:    scoped,
 		Outcome:   outcomeFromLabels(b.Labels),
@@ -507,6 +526,10 @@ func decodeRun(scoped string, b beads.Bead) OrderRun {
 		Open:      b.Status != "closed",
 		Cursor:    EventCursor(MaxSeqFromLabels([][]string{b.Labels})),
 	}
+	if result, ok := ExecResultFromMetadata(b.Metadata); ok {
+		run.Exec = &result
+	}
+	return run
 }
 
 // NameFromOrderRunLabel resolves the scoped order name from a bead's

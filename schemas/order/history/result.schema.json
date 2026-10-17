@@ -17,7 +17,11 @@
           "rig": { "type": "string" },
           "bead_id": { "type": "string" },
           "executed": { "type": "string" },
-          "created_at": { "type": "string", "format": "date-time" }
+          "created_at": { "type": "string", "format": "date-time" },
+          "exit_code": { "type": "integer", "description": "Exec runs: exit status of a command that exited on its own. Absent when it was killed or never started." },
+          "duration_ms": { "type": "integer", "description": "Exec runs: how long the command ran." },
+          "timeout_ms": { "type": "integer", "description": "Exec runs: the timeout the command ran under." },
+          "timed_out": { "type": "boolean", "description": "Exec runs: true when the controller killed the command at its timeout. Present on every exec run with a recorded result." }
         },
         "additionalProperties": true
       }

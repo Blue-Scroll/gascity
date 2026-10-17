@@ -2362,6 +2362,8 @@ func (m *memoryOrderDispatcher) dispatchExec(ctx context.Context, front *orders.
 	// declared is the outcome file of a run that exited 0; its skipped/partial
 	// declaration (if any) is reported after order.completed.
 	var declared *orderOutcomeFile
+	// result is how the command ended; nil when it never started.
+	var result *orders.ExecResult
 	if err != nil {
 		redactionEnv := append(os.Environ(), env...)
 		redacted := redactOrderEnvError(err, redactionEnv)
@@ -2381,13 +2383,21 @@ func (m *memoryOrderDispatcher) dispatchExec(ctx context.Context, front *orders.
 				}
 			}()
 		}
+		started := time.Now()
 		output, err = m.execRun(ctx, a.Exec, target.ScopeRoot, env)
+		ended := orderExecResult(err, time.Since(started), effectiveTimeout(a, m.maxTimeout))
+		result = &ended
 		if err == nil {
 			declared = outcomeFile
 		}
 		if err != nil {
 			redactionEnv := append(os.Environ(), env...)
 			execErrMsg = execenv.RedactText(err.Error(), redactionEnv)
+			if ended.TimedOut {
+				// "context deadline exceeded" names Go, not the order. Say
+				// what happened to the command.
+				execErrMsg = ended.KilledReason()
+			}
 			outcome = orders.RunOutcomeExecFailed
 			logDispatchError(m.stderr, "gc: order exec %s failed: %s", scoped, execErrMsg)
 			if len(output) > 0 {
@@ -2401,8 +2411,9 @@ func (m *memoryOrderDispatcher) dispatchExec(ctx context.Context, front *orders.
 	}
 
 	// Label tracking bead with outcome via store (not CLI). For event execs,
-	// cursor labels were already persisted before the command ran.
-	if err := front.SetOutcome(trackingID, outcome); err != nil {
+	// cursor labels were already persisted before the command ran. A command
+	// that ran gets its result in the same write, so the bead says how it ended.
+	if err := front.SetExecOutcome(trackingID, outcome, result); err != nil {
 		logDispatchError(m.stderr, "gc: order %s: failed to label exec tracking bead %s: %v", scoped, trackingID, err)
 		msg := fmt.Sprintf("exec tracking bead %s label failed: %v", trackingID, err)
 		if hasEventCursor {
@@ -2426,6 +2437,20 @@ func (m *memoryOrderDispatcher) dispatchExec(ctx context.Context, front *orders.
 			Subject: scoped,
 			Message: execErrMsg,
 		})
+		if result != nil && result.TimedOut {
+			m.rec.Record(events.Event{
+				Type:    events.OrderTimedOut,
+				Actor:   "controller",
+				Subject: scoped,
+				Message: execErrMsg,
+				Payload: events.OrderTimedOutPayloadJSON(events.OrderTimedOutPayload{
+					OrderName:  scoped,
+					BeadID:     trackingID,
+					TimeoutMS:  result.Timeout.Milliseconds(),
+					DurationMS: result.Duration.Milliseconds(),
+				}),
+			})
+		}
 		return
 	}
 	m.rec.Record(events.Event{
@@ -2436,6 +2461,27 @@ func (m *memoryOrderDispatcher) dispatchExec(ctx context.Context, front *orders.
 	if declared != nil {
 		recordOrderOutcome(m.rec, m.stderr, scoped, declared)
 	}
+}
+
+// orderExecResult reads how an exec order's command ended from the error its
+// runner returned. The runner answers a run killed at its timeout with the
+// context's DeadlineExceeded (see shellExecRunner), so that error, and only
+// that error, is a timeout. An exit status is kept only for a process that
+// exited on its own: a signal-killed or never-started process has none.
+func orderExecResult(err error, duration, timeout time.Duration) orders.ExecResult {
+	result := orders.ExecResult{Duration: duration, Timeout: timeout}
+	var exitErr *exec.ExitError
+	switch {
+	case err == nil:
+		code := 0
+		result.ExitCode = &code
+	case errors.Is(err, context.DeadlineExceeded):
+		result.TimedOut = true
+	case errors.As(err, &exitErr) && exitErr.ExitCode() >= 0:
+		code := exitErr.ExitCode()
+		result.ExitCode = &code
+	}
+	return result
 }
 
 // prepareOrderWispRecipe compiles an order's formula into a recipe and returns
