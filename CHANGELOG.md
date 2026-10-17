@@ -351,6 +351,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Codex structured history keeps every turn's model and token usage.**
+  Usage was read only from the rollout tail, so older turns (and older
+  history pages) lost it once the session grew (thanks @csells).
+
 - **Stopping a Claude turn that is waiting on a permission prompt now cancels
   the prompt.** The tmux interrupt sent Ctrl-C, which leaves Claude's prompt
   up; it now sends Escape (the prompt's own cancel key) when a prompt is on
