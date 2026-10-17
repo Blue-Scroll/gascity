@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gastownhall/gascity/internal/api/genclient"
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/orders"
 )
@@ -1217,6 +1218,70 @@ func TestHandleOrderHistoryMarksAdHocOutputMetadata(t *testing.T) {
 	}
 	if !resp.Entries[0].HasOutput {
 		t.Fatal("has_output = false, want true for captured output metadata")
+	}
+}
+
+// An exec run's result reaches the history API, and the CLI's client decoder
+// reads it back into the same ExecResult the dispatcher wrote (vn-fe6fsvx).
+func TestHandleOrderHistoryReportsExecResult(t *testing.T) {
+	fs := newFakeState(t)
+	fs.cityBeadStore = beads.NewMemStore()
+	rigStore := fs.stores["myrig"]
+	if rigStore == nil {
+		t.Fatal("expected rig store")
+	}
+	exitZero := 0
+	for _, r := range []orders.ExecResult{
+		{Duration: 571 * time.Second, Timeout: 900 * time.Second, ExitCode: &exitZero},
+		{Duration: 900 * time.Second, Timeout: 900 * time.Second, TimedOut: true},
+	} {
+		if _, err := rigStore.Create(beads.Bead{
+			Title:    "order:sweep",
+			Status:   "closed",
+			Labels:   []string{"order-run:sweep:rig:myrig", "exec"},
+			Metadata: r.Metadata(),
+		}); err != nil {
+			t.Fatalf("create history bead: %v", err)
+		}
+	}
+
+	h := newTestCityHandler(t, fs)
+	req := httptest.NewRequest(http.MethodGet, cityURL(fs, "/orders/history?scoped_name=sweep:rig:myrig"), nil)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body = %s", w.Code, http.StatusOK, w.Body.String())
+	}
+
+	var body genclient.OrderHistoryListBody
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	views := orderHistoryFromGenList(&body)
+	if len(views) != 2 {
+		t.Fatalf("len(entries) = %d, want 2: %s", len(views), w.Body.String())
+	}
+	var killed, clean *orders.ExecResult
+	for i, v := range views {
+		if v.Exec == nil {
+			t.Fatalf("entry %d decoded no exec result: %s", i, w.Body.String())
+		}
+		if v.Exec.TimedOut {
+			killed = v.Exec
+		} else {
+			clean = v.Exec
+		}
+	}
+	if killed == nil || killed.ExitCode != nil || killed.Timeout != 900*time.Second || killed.Duration != 900*time.Second {
+		t.Fatalf("killed run = %+v, want timed out at 900s with no exit code", killed)
+	}
+	if clean == nil || clean.ExitCode == nil || *clean.ExitCode != 0 || clean.Duration != 571*time.Second {
+		t.Fatalf("clean run = %+v, want exit 0 after 571s", clean)
+	}
+	for _, e := range *body.Entries {
+		if e.TimedOut != nil && *e.TimedOut && (e.Error == nil || *e.Error != "killed at its 15m0s timeout") {
+			t.Fatalf("killed run error = %v, want the killed-at-timeout line", e.Error)
+		}
 	}
 }
 

@@ -1,6 +1,11 @@
 package api
 
-import "github.com/gastownhall/gascity/internal/api/genclient"
+import (
+	"strconv"
+
+	"github.com/gastownhall/gascity/internal/api/genclient"
+	"github.com/gastownhall/gascity/internal/orders"
+)
 
 // OrderHistoryView is the CLI-facing shape for `gc order history` rows. It
 // mirrors the subset of fields the CLI formatter reads so cmd/gc/ never
@@ -11,6 +16,9 @@ type OrderHistoryView struct {
 	ScopedName string
 	Rig        string
 	CreatedAt  string
+	// Exec is how the run's exec command ended, or nil when the run recorded
+	// none (a wisp run, an in-flight run, an older bead).
+	Exec *orders.ExecResult
 }
 
 // orderHistoryViewFromGen translates one genclient.OrderHistoryEntry into an
@@ -25,7 +33,33 @@ func orderHistoryViewFromGen(g genclient.OrderHistoryEntry) OrderHistoryView {
 	if g.Rig != nil {
 		out.Rig = *g.Rig
 	}
+	out.Exec = execResultFromGen(g)
 	return out
+}
+
+// execResultFromGen decodes an entry's exec result through the same codec the
+// server encoded it with. timed_out is the marker: the server sets it on every
+// exec run with a recorded result and on nothing else, so duration_ms alone
+// (which a convergence gate also writes) is not read as an exec run.
+func execResultFromGen(g genclient.OrderHistoryEntry) *orders.ExecResult {
+	if g.TimedOut == nil {
+		return nil
+	}
+	meta := map[string]string{orders.MetaExecTimedOut: strconv.FormatBool(*g.TimedOut)}
+	for key, value := range map[string]*string{
+		orders.MetaExecDurationMs: g.DurationMs,
+		orders.MetaExecTimeoutMs:  g.TimeoutMs,
+		orders.MetaExecExitCode:   g.ExitCode,
+	} {
+		if value != nil {
+			meta[key] = *value
+		}
+	}
+	result, ok := orders.ExecResultFromMetadata(meta)
+	if !ok {
+		return nil
+	}
+	return &result
 }
 
 // orderHistoryFromGenList translates the genclient list body into

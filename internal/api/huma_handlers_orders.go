@@ -327,11 +327,15 @@ func (s *Server) humaHandleOrderHistory(_ context.Context, input *OrderHistoryIn
 		}
 
 		gate := convergence.GateOutputFromMetadata(b.Metadata)
-		if gate.DurationMs != "" {
-			entry.DurationMs = &gate.DurationMs
-		}
-		if gate.ExitCode != "" {
-			entry.ExitCode = &gate.ExitCode
+		if result, ok := orders.ExecResultFromMetadata(b.Metadata); ok {
+			entry.setExecResult(result)
+		} else {
+			if gate.DurationMs != "" {
+				entry.DurationMs = &gate.DurationMs
+			}
+			if gate.ExitCode != "" {
+				entry.ExitCode = &gate.ExitCode
+			}
 		}
 		entry.HasOutput = entry.CaptureOutput || gate.HasOutput()
 
@@ -359,11 +363,31 @@ type orderHistoryEntry struct {
 	Labels        []string `json:"labels"`
 	DurationMs    *string  `json:"duration_ms,omitempty"`
 	ExitCode      *string  `json:"exit_code,omitempty"`
+	TimeoutMs     *string  `json:"timeout_ms,omitempty" doc:"Exec runs: the timeout the command ran under, in milliseconds."`
+	TimedOut      *bool    `json:"timed_out,omitempty" doc:"Exec runs: true when the controller killed the command at its timeout. Set on every exec run with a recorded result."`
 	Signal        *string  `json:"signal,omitempty"`
 	Error         *string  `json:"error,omitempty"`
 	WispRootID    *string  `json:"wisp_root_id,omitempty"`
 	CaptureOutput bool     `json:"capture_output"`
 	HasOutput     bool     `json:"has_output"`
+}
+
+// setExecResult fills the entry from how an exec run's command ended. A run
+// killed at its timeout has no exit code; its error says it was killed.
+func (e *orderHistoryEntry) setExecResult(r orders.ExecResult) {
+	meta := r.Metadata()
+	durationMs, timeoutMs := meta[orders.MetaExecDurationMs], meta[orders.MetaExecTimeoutMs]
+	e.DurationMs = &durationMs
+	e.TimeoutMs = &timeoutMs
+	timedOut := r.TimedOut
+	e.TimedOut = &timedOut
+	if code, ok := meta[orders.MetaExecExitCode]; ok {
+		e.ExitCode = &code
+	}
+	if r.TimedOut {
+		msg := r.KilledReason()
+		e.Error = &msg
+	}
 }
 
 // humaHandleOrderHistoryDetail is the Huma-typed handler for GET /v0/order/history/{bead_id}.

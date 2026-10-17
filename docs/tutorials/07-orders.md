@@ -380,6 +380,12 @@ pancakes-check  mc-zbd   2026-04-08T07:31:22Z
 pancakes-check  mc-9p8   2026-04-08T07:26:18Z
 ```
 
+For an exec order, `gc order history --json` also says how each run's command
+ended: `exit_code`, `duration_ms`, the `timeout_ms` it ran under, and
+`timed_out`. A run the controller killed at its timeout has `timed_out: true`
+and no `exit_code`, and it also records an `order.timed_out` event next to its
+`order.failed`, so a watcher can count kills without reading the failure text.
+
 The tracking bead is created synchronously _before_ the dispatch goroutine
 launches — which is what keeps the cooldown trigger from re-firing on the very
 next tick. The trigger checks for recent tracking beads when deciding if the

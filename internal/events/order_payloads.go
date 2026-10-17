@@ -57,7 +57,28 @@ func OrderSkippedPayloadJSON(p OrderSkippedPayload) json.RawMessage {
 	return b
 }
 
+// OrderTimedOutPayload is the typed payload for order.timed_out events: which
+// order was killed, the tracking bead that records the run, the limit it hit,
+// and how long it had run when it was killed.
+type OrderTimedOutPayload struct {
+	OrderName  string `json:"order_name"`
+	BeadID     string `json:"bead_id"`
+	TimeoutMS  int64  `json:"timeout_ms"`
+	DurationMS int64  `json:"duration_ms"`
+}
+
+// IsEventPayload marks OrderTimedOutPayload as an events.Payload variant.
+func (OrderTimedOutPayload) IsEventPayload() {}
+
+// OrderTimedOutPayloadJSON builds the JSON wire form for attachment to an
+// Event.Payload field.
+func OrderTimedOutPayloadJSON(p OrderTimedOutPayload) json.RawMessage {
+	b, _ := json.Marshal(p) //nolint:errcheck // a struct of scalars cannot fail to marshal
+	return b
+}
+
 func init() {
 	RegisterPayload(OrderSuppressed, OrderSuppressedPayload{})
 	RegisterPayload(OrderSkipped, OrderSkippedPayload{})
+	RegisterPayload(OrderTimedOut, OrderTimedOutPayload{})
 }

@@ -1376,6 +1376,7 @@ go_test(
         "order_dispatch_tracking_index_race_test.go",
         "order_dynamic_integration_test.go",
         "order_enabled_filter_test.go",
+        "order_exec_result_test.go",
         "order_gate_budget_test.go",
         "order_outcome_test.go",
         "order_scan_contract_test.go",

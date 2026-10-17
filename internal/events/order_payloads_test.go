@@ -119,3 +119,39 @@ func TestOrderSkippedPayloadJSONAlwaysCarriesAScopesArray(t *testing.T) {
 		t.Fatalf("scopes must be a JSON array, got %s", raw)
 	}
 }
+
+func TestOrderTimedOutIsAKnownEventTypeWithATypedPayload(t *testing.T) {
+	t.Parallel()
+
+	if !slices.Contains(KnownEventTypes, OrderTimedOut) {
+		t.Fatalf("%q is missing from KnownEventTypes; the SSE projection would carry it untyped", OrderTimedOut)
+	}
+	sample, ok := LookupPayload(OrderTimedOut)
+	if !ok {
+		t.Fatalf("%q has no registered payload", OrderTimedOut)
+	}
+	if _, ok := sample.(OrderTimedOutPayload); !ok {
+		t.Fatalf("%q registered payload is %T, want OrderTimedOutPayload", OrderTimedOut, sample)
+	}
+}
+
+func TestOrderTimedOutPayloadRoundTrips(t *testing.T) {
+	t.Parallel()
+
+	want := OrderTimedOutPayload{
+		OrderName:  "refinery-queue-sweep",
+		BeadID:     "gc-42",
+		TimeoutMS:  900_000,
+		DurationMS: 900_004,
+	}
+	decoded, typed, err := DecodePayload(OrderTimedOut, OrderTimedOutPayloadJSON(want))
+	if err != nil {
+		t.Fatalf("DecodePayload: %v", err)
+	}
+	if !typed {
+		t.Fatal("DecodePayload reported no registered type for order.timed_out")
+	}
+	if got, ok := decoded.(OrderTimedOutPayload); !ok || got != want {
+		t.Fatalf("round-trip = %#v, want %+v", decoded, want)
+	}
+}

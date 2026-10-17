@@ -991,7 +991,7 @@ func doOrderRunExecTracked(a orders.Order, cityPath string, cfg *config.City, fr
 			outcome = orders.RunOutcomeExecEnvFailed
 		}
 	}
-	if err := front.SetOutcome(run.ID, outcome); err != nil {
+	if err := front.SetExecOutcome(run.ID, outcome, result.exec); err != nil {
 		fmt.Fprintf(stderr, "gc order run: labeling exec tracking bead for %s: %v\n", scoped, err) //nolint:errcheck // best-effort stderr
 		return 1
 	}
@@ -1006,6 +1006,8 @@ func doOrderRunExec(a orders.Order, cityPath string, cfg *config.City, vars map[
 type orderRunExecResult struct {
 	code         int
 	failureLabel string
+	// exec is how the command ended; nil when it never started.
+	exec *orders.ExecResult
 }
 
 func doOrderRunExecResult(a orders.Order, cityPath string, cfg *config.City, vars map[string]string, stdout, stderr io.Writer) orderRunExecResult {
@@ -1040,18 +1042,24 @@ func doOrderRunExecResult(a orders.Order, cityPath string, cfg *config.City, var
 		}()
 	}
 
+	started := time.Now()
 	output, err := shellExecRunner(ctx, a.Exec, target.ScopeRoot, env)
+	ended := orderExecResult(err, time.Since(started), timeout)
 	// The exec env now projects the controller's GH_TOKEN/GITHUB_TOKEN into the
 	// child, so any order that echoes one would leak it. Redact the exec error
 	// and combined output against the projected env on both the failure and
 	// success paths, matching the controller dispatch path (order_dispatch.go).
 	redactionEnv := append(os.Environ(), env...)
 	if err != nil {
-		fmt.Fprintf(stderr, "gc order run: exec failed: %s\n", execenv.RedactText(err.Error(), redactionEnv)) //nolint:errcheck
+		msg := execenv.RedactText(err.Error(), redactionEnv)
+		if ended.TimedOut {
+			msg = ended.KilledReason()
+		}
+		fmt.Fprintf(stderr, "gc order run: exec failed: %s\n", msg) //nolint:errcheck
 		if len(output) > 0 {
 			fmt.Fprintf(stderr, "%s", execenv.RedactText(string(output), redactionEnv)) //nolint:errcheck
 		}
-		return orderRunExecResult{code: 1, failureLabel: "exec-failed"}
+		return orderRunExecResult{code: 1, failureLabel: "exec-failed", exec: &ended}
 	}
 	if len(output) > 0 {
 		fmt.Fprintf(stdout, "%s", execenv.RedactText(string(output), redactionEnv)) //nolint:errcheck
@@ -1060,7 +1068,7 @@ func doOrderRunExecResult(a orders.Order, cityPath string, cfg *config.City, var
 	if outcomeFile != nil {
 		printOrderRunOutcome(outcomeFile, a.Name, stdout, stderr)
 	}
-	return orderRunExecResult{code: 0}
+	return orderRunExecResult{code: 0, exec: &ended}
 }
 
 // --- gc order check ---
@@ -1576,13 +1584,7 @@ func renderOrderHistoryFromAPI(cr api.CachedRead[[]api.OrderHistoryView], name, 
 				fmt.Fprintf(stderr, "gc order history: parsing API created_at %q: %v\n", e.CreatedAt, err) //nolint:errcheck // best-effort stderr
 				return 1
 			}
-			payload.Entries = append(payload.Entries, orderHistoryJSONEntry{
-				Order:     e.Name,
-				Rig:       e.Rig,
-				BeadID:    e.BeadID,
-				Executed:  createdAt.Format(time.RFC3339),
-				CreatedAt: createdAt,
-			})
+			payload.Entries = append(payload.Entries, newOrderHistoryJSONEntry(e.Name, e.Rig, e.BeadID, createdAt, e.Exec))
 		}
 		return writeCLIJSONLineOrExit(stdout, stderr, "gc order history", payload)
 	}
@@ -1669,6 +1671,7 @@ func doOrderHistoryBounded(name, rig string, aa []orders.Order, resolveStores or
 		rig       string
 		id        string
 		createdAt time.Time
+		exec      *orders.ExecResult
 	}
 	var entries []historyEntry
 	seenEntries := make(map[string]bool)
@@ -1708,6 +1711,7 @@ func doOrderHistoryBounded(name, rig string, aa []orders.Order, resolveStores or
 					rig:       a.Rig,
 					id:        r.ID,
 					createdAt: r.CreatedAt,
+					exec:      r.Exec,
 				})
 			}
 		}
@@ -1753,13 +1757,7 @@ func doOrderHistoryBounded(name, rig string, aa []orders.Order, resolveStores or
 			Summary:       orderHistoryJSONSummary{Total: len(entries)},
 		}
 		for _, e := range entries {
-			payload.Entries = append(payload.Entries, orderHistoryJSONEntry{
-				Order:     e.order,
-				Rig:       e.rig,
-				BeadID:    e.id,
-				Executed:  e.createdAt.Format(time.RFC3339),
-				CreatedAt: e.createdAt,
-			})
+			payload.Entries = append(payload.Entries, newOrderHistoryJSONEntry(e.order, e.rig, e.id, e.createdAt, e.exec))
 		}
 		return writeCLIJSONLineOrExit(stdout, stderr, "gc order history", payload)
 	}
@@ -1805,6 +1803,33 @@ type orderHistoryJSONEntry struct {
 	BeadID    string    `json:"bead_id"`
 	Executed  string    `json:"executed"`
 	CreatedAt time.Time `json:"created_at"`
+	// The four fields below are how an exec run's command ended. All are
+	// absent when the run recorded no result; timed_out is present (true or
+	// false) on every run that did, so a reader can count kills.
+	ExitCode   *int   `json:"exit_code,omitempty"`
+	DurationMs *int64 `json:"duration_ms,omitempty"`
+	TimeoutMs  *int64 `json:"timeout_ms,omitempty"`
+	TimedOut   *bool  `json:"timed_out,omitempty"`
+}
+
+// newOrderHistoryJSONEntry builds one `gc order history --json` row. Both the
+// local read and the API read go through it, so the two print one shape.
+func newOrderHistoryJSONEntry(order, rig, beadID string, createdAt time.Time, exec *orders.ExecResult) orderHistoryJSONEntry {
+	entry := orderHistoryJSONEntry{
+		Order:     order,
+		Rig:       rig,
+		BeadID:    beadID,
+		Executed:  createdAt.Format(time.RFC3339),
+		CreatedAt: createdAt,
+	}
+	if exec != nil {
+		durationMs, timeoutMs, timedOut := exec.Duration.Milliseconds(), exec.Timeout.Milliseconds(), exec.TimedOut
+		entry.ExitCode = exec.ExitCode
+		entry.DurationMs = &durationMs
+		entry.TimeoutMs = &timeoutMs
+		entry.TimedOut = &timedOut
+	}
+	return entry
 }
 
 type orderHistoryJSONSummary struct {

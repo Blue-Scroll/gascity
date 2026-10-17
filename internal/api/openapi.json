@@ -2731,6 +2731,9 @@
             "$ref": "#/components/schemas/OrderSuppressedPayload"
           },
           {
+            "$ref": "#/components/schemas/OrderTimedOutPayload"
+          },
+          {
             "$ref": "#/components/schemas/OutboundChannelMismatchPayload"
           },
           {
@@ -5330,6 +5333,14 @@
           "store_ref": {
             "type": "string"
           },
+          "timed_out": {
+            "description": "Exec runs: true when the controller killed the command at its timeout. Set on every exec run with a recorded result.",
+            "type": "boolean"
+          },
+          "timeout_ms": {
+            "description": "Exec runs: the timeout the command ran under, in milliseconds.",
+            "type": "string"
+          },
           "wisp_root_id": {
             "type": "string"
           }
@@ -5570,6 +5581,32 @@
           "consecutive",
           "first_suppressed",
           "suppressed_for_ms"
+        ],
+        "type": "object"
+      },
+      "OrderTimedOutPayload": {
+        "additionalProperties": false,
+        "properties": {
+          "bead_id": {
+            "type": "string"
+          },
+          "duration_ms": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "order_name": {
+            "type": "string"
+          },
+          "timeout_ms": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "order_name",
+          "bead_id",
+          "timeout_ms",
+          "duration_ms"
         ],
         "type": "object"
       },
@@ -12792,6 +12829,7 @@
             "order.fired": "#/components/schemas/TypedEventStreamEnvelopeOrderFired",
             "order.skipped": "#/components/schemas/TypedEventStreamEnvelopeOrderSkipped",
             "order.suppressed": "#/components/schemas/TypedEventStreamEnvelopeOrderSuppressed",
+            "order.timed_out": "#/components/schemas/TypedEventStreamEnvelopeOrderTimedOut",
             "project.identity.stamped": "#/components/schemas/TypedEventStreamEnvelopeProjectIdentityStamped",
             "provider.swapped": "#/components/schemas/TypedEventStreamEnvelopeProviderSwapped",
             "request.failed": "#/components/schemas/TypedEventStreamEnvelopeRequestFailed",
@@ -13017,6 +13055,9 @@
           },
           {
             "$ref": "#/components/schemas/TypedEventStreamEnvelopeOrderSuppressed"
+          },
+          {
+            "$ref": "#/components/schemas/TypedEventStreamEnvelopeOrderTimedOut"
           },
           {
             "$ref": "#/components/schemas/TypedEventStreamEnvelopeProjectIdentityStamped"
@@ -14581,6 +14622,7 @@
                 "order.failed",
                 "order.suppressed",
                 "order.skipped",
+                "order.timed_out",
                 "provider.swapped",
                 "worker.operation",
                 "project.identity.stamped",
@@ -16682,6 +16724,63 @@
           "payload"
         ],
         "title": "TypedEventStreamEnvelope order.suppressed",
+        "type": "object"
+      },
+      "TypedEventStreamEnvelopeOrderTimedOut": {
+        "additionalProperties": false,
+        "properties": {
+          "actor": {
+            "type": "string"
+          },
+          "depends_on_step_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "message": {
+            "type": "string"
+          },
+          "payload": {
+            "$ref": "#/components/schemas/OrderTimedOutPayload"
+          },
+          "run_id": {
+            "type": "string"
+          },
+          "seq": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "step_id": {
+            "type": "string"
+          },
+          "subject": {
+            "type": "string"
+          },
+          "ts": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "type": {
+            "const": "order.timed_out",
+            "type": "string"
+          },
+          "workflow": {
+            "$ref": "#/components/schemas/WorkflowEventProjection"
+          }
+        },
+        "required": [
+          "seq",
+          "type",
+          "ts",
+          "actor",
+          "payload"
+        ],
+        "title": "TypedEventStreamEnvelope order.timed_out",
         "type": "object"
       },
       "TypedEventStreamEnvelopeProjectIdentityStamped": {
@@ -19312,6 +19411,7 @@
             "order.fired": "#/components/schemas/TypedTaggedEventStreamEnvelopeOrderFired",
             "order.skipped": "#/components/schemas/TypedTaggedEventStreamEnvelopeOrderSkipped",
             "order.suppressed": "#/components/schemas/TypedTaggedEventStreamEnvelopeOrderSuppressed",
+            "order.timed_out": "#/components/schemas/TypedTaggedEventStreamEnvelopeOrderTimedOut",
             "project.identity.stamped": "#/components/schemas/TypedTaggedEventStreamEnvelopeProjectIdentityStamped",
             "provider.swapped": "#/components/schemas/TypedTaggedEventStreamEnvelopeProviderSwapped",
             "request.failed": "#/components/schemas/TypedTaggedEventStreamEnvelopeRequestFailed",
@@ -19537,6 +19637,9 @@
           },
           {
             "$ref": "#/components/schemas/TypedTaggedEventStreamEnvelopeOrderSuppressed"
+          },
+          {
+            "$ref": "#/components/schemas/TypedTaggedEventStreamEnvelopeOrderTimedOut"
           },
           {
             "$ref": "#/components/schemas/TypedTaggedEventStreamEnvelopeProjectIdentityStamped"
@@ -21196,6 +21299,7 @@
                 "order.failed",
                 "order.suppressed",
                 "order.skipped",
+                "order.timed_out",
                 "provider.swapped",
                 "worker.operation",
                 "project.identity.stamped",
@@ -23442,6 +23546,67 @@
           "city"
         ],
         "title": "TypedTaggedEventStreamEnvelope order.suppressed",
+        "type": "object"
+      },
+      "TypedTaggedEventStreamEnvelopeOrderTimedOut": {
+        "additionalProperties": false,
+        "properties": {
+          "actor": {
+            "type": "string"
+          },
+          "city": {
+            "type": "string"
+          },
+          "depends_on_step_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "message": {
+            "type": "string"
+          },
+          "payload": {
+            "$ref": "#/components/schemas/OrderTimedOutPayload"
+          },
+          "run_id": {
+            "type": "string"
+          },
+          "seq": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "step_id": {
+            "type": "string"
+          },
+          "subject": {
+            "type": "string"
+          },
+          "ts": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "type": {
+            "const": "order.timed_out",
+            "type": "string"
+          },
+          "workflow": {
+            "$ref": "#/components/schemas/WorkflowEventProjection"
+          }
+        },
+        "required": [
+          "seq",
+          "type",
+          "ts",
+          "actor",
+          "payload",
+          "city"
+        ],
+        "title": "TypedTaggedEventStreamEnvelope order.timed_out",
         "type": "object"
       },
       "TypedTaggedEventStreamEnvelopeProjectIdentityStamped": {
