@@ -351,6 +351,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Stopping a Claude turn that is waiting on a permission prompt now cancels
+  the prompt.** The tmux interrupt sent Ctrl-C, which leaves Claude's prompt
+  up; it now sends Escape (the prompt's own cancel key) when a prompt is on
+  screen, never a numbered option. When it cannot read the pane it logs a
+  warning and sends Ctrl-C as before. (thanks @csells)
+
 - **A Claude API failure now shows as a provider error in structured session
   history, not as an assistant reply.** Entries Claude flags with
   `isApiErrorMessage` carry a `provider_error` system event (with Claude's
