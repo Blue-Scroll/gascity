@@ -682,6 +682,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   too, with a warning naming the file. Rigs that inherit the city endpoint are
   compacted as before (#7994).
 
+- **Suspending a session shortly after it woke keeps its conversation.** An
+  operator, idle or `gc stop` suspend no longer counts as a rapid crash or
+  churn that cleared `session_key`, so the next wake resumes. (thanks @csells)
+
 ## [1.5.0] - 2026-10-05
 
 ### Upgrading Notes
