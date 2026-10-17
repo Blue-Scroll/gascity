@@ -92,3 +92,15 @@ func (m *DerivedActivityMemo) Derivations() int {
 func transcriptGenerationID(info os.FileInfo) string {
 	return fmt.Sprintf("%d:%d", info.ModTime().UnixNano(), info.Size())
 }
+
+// TranscriptGenerationID is the Generation.ID a history read of the transcript
+// at path would stamp on its snapshot right now. A reader that already holds a
+// snapshot of that path with this generation would read the same snapshot
+// again, so it can skip the read (vn-u1p1nw1).
+func TranscriptGenerationID(path string) (string, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return "", err
+	}
+	return transcriptGenerationID(info), nil
+}

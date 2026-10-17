@@ -683,8 +683,9 @@ func (s *Server) streamSessionTranscriptHistoryStructured(ctx context.Context, w
 			StructuredMessages: messages,
 			Pagination:         snapshot.Pagination,
 		}
-		if update := buildStructuredStreamUpdate(currentResumeToken, projection, includeThinking); update != nil {
-			currentResumeToken = update.History.Cursor.ResumeToken
+		update, nextToken := liveStructuredStreamUpdate(currentResumeToken, projection, includeThinking)
+		currentResumeToken = nextToken
+		if update != nil {
 			writeStructuredSSEUpdate(w, update)
 			lastProgress = time.Now()
 			emitted = true
@@ -736,9 +737,10 @@ func (s *Server) streamSessionTranscriptHistoryStructured(ctx context.Context, w
 	}
 
 	var lw *logFileWatcher
+	reload := newStructuredStreamReload(handle, includeThinking, initial)
 	reloadSnapshot := func() bool {
 		emitted := false
-		snapshot, err := handle.History(worker.WithoutOperationEvents(ctx), worker.HistoryRequest{})
+		snapshot, err := reload.read(ctx, currentResumeToken)
 		switch {
 		case err == nil:
 			emitted = emitSnapshot(snapshot)
@@ -1403,8 +1405,9 @@ func (s *Server) streamSessionTranscriptLogStructuredHuma(ctx context.Context, s
 			StructuredMessages: messages,
 			Pagination:         snapshot.Pagination,
 		}
-		if update := buildStructuredStreamUpdate(currentResumeToken, projection, includeThinking); update != nil {
-			currentResumeToken = update.History.Cursor.ResumeToken
+		update, nextToken := liveStructuredStreamUpdate(currentResumeToken, projection, includeThinking)
+		currentResumeToken = nextToken
+		if update != nil {
 			_ = send(StringIDMessage{ID: currentResumeToken, Data: *update})
 			lastProgress = time.Now()
 			emitted = true
@@ -1453,9 +1456,10 @@ func (s *Server) streamSessionTranscriptLogStructuredHuma(ctx context.Context, s
 	}
 
 	var lw *logFileWatcher
+	reload := newStructuredStreamReload(handle, includeThinking, initial)
 	reloadSnapshot := func() bool {
 		emitted := false
-		snapshot, err := handle.History(worker.WithoutOperationEvents(ctx), worker.HistoryRequest{})
+		snapshot, err := reload.read(ctx, currentResumeToken)
 		switch {
 		case err == nil:
 			emitted = emitSnapshot(snapshot)

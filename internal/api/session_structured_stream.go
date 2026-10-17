@@ -102,6 +102,60 @@ func buildStructuredStreamUpdate(resumeToken string, projection SessionStreamStr
 	return &current
 }
 
+// liveStructuredStreamUpdate is buildStructuredStreamUpdate for a live
+// stream's history reads. It also returns the token the stream compares its
+// next read against, which is bounded (boundedStructuredResumeToken) whenever
+// projection has a message. A frame it returns carries that same token, so a
+// client that reconnects resumes from what the stream holds.
+func liveStructuredStreamUpdate(resumeToken string, projection SessionStreamStructuredMessageEvent, includeThinking bool) (*SessionStreamStructuredMessageEvent, string) {
+	update := buildStructuredStreamUpdate(resumeToken, projection, includeThinking)
+	next := resumeToken
+	if update != nil {
+		next = update.History.Cursor.ResumeToken
+	}
+	// A nil update means the client already holds projection, so a token for
+	// projection's newest messages describes the client as well as one for
+	// all of them does.
+	if bounded, ok := boundedStructuredResumeToken(projection, includeThinking); ok {
+		next = bounded
+		if update != nil {
+			update.History.Cursor.ResumeToken = bounded
+		}
+	}
+	return update, next
+}
+
+// structuredStreamTokenWindow is how many of the newest messages a live
+// structured stream's resume token names. See boundedStructuredResumeToken.
+const structuredStreamTokenWindow = 32
+
+// boundedStructuredResumeToken is a resume token for a client that holds
+// projection, naming only its newest structuredStreamTokenWindow messages as a
+// suffix window. A live stream keeps its token this small so that each reload
+// can check it against the end of the log alone (structuredStreamReload)
+// instead of re-reading and re-hashing every message the stream ever sent
+// (vn-u1p1nw1). A suffix token resumes with upserts on any read that holds its
+// window, the whole log included (vn-c5p1mf0). What it gives up: a rewrite
+// above the window no longer resets the client. ok is false when projection
+// has no messages, because a suffix token needs a message to anchor on.
+func boundedStructuredResumeToken(projection SessionStreamStructuredMessageEvent, includeThinking bool) (string, bool) {
+	messages := projection.StructuredMessages
+	if len(messages) == 0 {
+		return "", false
+	}
+	if len(messages) > structuredStreamTokenWindow {
+		messages = messages[len(messages)-structuredStreamTokenWindow:]
+	}
+	window := projection
+	window.StructuredMessages = messages
+	// Without pagination the token hashes window exactly as the suffix branch
+	// of buildStructuredStreamUpdate hashes the same messages on the next read.
+	window.Pagination = nil
+	token := structuredResumeToken(window, includeThinking)
+	token.SuffixWindow = true
+	return encodeStructuredResumeToken(token), true
+}
+
 func structuredSuffixWindowRange(token sessionStructuredResumeTokenV1, messages []SessionStructuredMessage) (int, int, string) {
 	cursorIndex := -1
 	for i := range messages {
