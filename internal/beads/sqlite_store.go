@@ -770,10 +770,10 @@ func (s *SQLiteStore) normalizeCreate(b Bead) (Bead, error) {
 }
 
 // insertRevision is the revision upsertBeadTx inserts a new row at: 1, as on
-// MemStore, so a row nothing has written since its insert still carries a
-// usable token (zero means "no usable token" under the REVISION CONTRACT on
-// ConditionalWriter); 0 on a layout with no revision column, whose reads
-// carry none.
+// MemStore, so an insert mints a nonzero token as every other write does (a
+// row at 0 is one an older binary inserted, whose 0 is a real token under the
+// REVISION CONTRACT on ConditionalWriter); 0 on a layout with no revision
+// column, whose reads carry none.
 func (s *SQLiteStore) insertRevision() int64 {
 	if !s.hasRevisionColumn {
 		return 0
@@ -1267,10 +1267,14 @@ func (s *SQLiteStore) Update(id string, opts UpdateOpts) error {
 // bumping the claim fence when the edit moves ownership. An edit that leaves
 // the stored row as it is commits nothing: the store decides the no-op against
 // the row its own transaction read, so the revision and updated_at stay put
-// and no CAS token another writer holds goes stale.
+// and no CAS token another writer holds goes stale. A read-only store refuses
+// every edit up front, so a same-value one is refused as a changing one is.
 func (s *SQLiteStore) rewriteBead(id string, apply func(Bead) Bead) error {
 	if err := s.ensureOpen(); err != nil {
 		return err
+	}
+	if s.readOnly {
+		return fmt.Errorf("sqlite update %q: store is read-only", id)
 	}
 	return retryOnBusy(func() error {
 		ctx := context.Background()
