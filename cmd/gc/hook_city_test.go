@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -145,4 +146,42 @@ func mustOpenCityStore(t *testing.T, cityDir string) beads.Store {
 		t.Fatalf("openCityStoreAt: %v", err)
 	}
 	return store
+}
+
+// TestHookCityWorkStartedSeamsShareTheFrontDoor pins the work_started seams
+// (PHASE1-2 W1) to the invocation's one session front door and city: the read,
+// the started write and its removal open the city store once between them,
+// the store ref is read off the loaded config, and work.started_unrecorded
+// goes to the invocation's event log, without resolving the city again.
+func TestHookCityWorkStartedSeamsShareTheFrontDoor(t *testing.T) {
+	clearGCEnv(t)
+	disableManagedDoltRecoveryForTest(t)
+	t.Setenv("GC_BEADS", "file")
+	cityDir := writeFenceTestCity(t)
+	sessionID := newFenceSessionBead(t, cityDir, session.StateActive, "live-token")
+	cfg, err := loadCityConfig(cityDir, io.Discard)
+	if err != nil {
+		t.Fatalf("load city config: %v", err)
+	}
+	t.Chdir(t.TempDir()) // nothing to resolve from here
+	opens := countHookCityStoreOpens(t)
+	ops := newHookCity(cityDir, cfg).claimOps()
+
+	if raw, err := ops.ReadWorkStarted(sessionID); err != nil || raw != "" {
+		t.Fatalf("ReadWorkStarted = %q, %v; want an empty cell", raw, err)
+	}
+	key := hookStartedKey{Store: ops.StoreRef(cityDir), Bead: "gc-claimed"}
+	_, _ = ops.RecordWorkStarted(sessionID, hookStartedFence{Token: "live-token"}, key, "claim") // the file store may not fence: either way, no second open
+	_ = ops.ForgetWorkStarted(sessionID, key)
+	if got := opens.Load(); got != 1 {
+		t.Fatalf("the work_started seams opened the city store %d times, want 1", got)
+	}
+	if key.Store != "city" {
+		t.Fatalf("store ref of the city dir = %q, want city", key.Store)
+	}
+	ops.EmitWorkStartedUnrecorded(sessionID, "worker", "gc-claimed", errors.New("test cause"))
+	data, err := os.ReadFile(filepath.Join(cityDir, ".gc", "events.jsonl"))
+	if err != nil || !strings.Contains(string(data), "work.started_unrecorded") {
+		t.Fatalf("event log %s, %v: want work.started_unrecorded recorded in the invocation's city", data, err)
+	}
 }

@@ -73,8 +73,9 @@ func (h *hookCity) recorder() events.Recorder {
 }
 
 // claimOps returns claim ops whose session seams (the drain-pending probe, the
-// session work-dir lookup, the current-claim stamp and its clear) answer through
-// the invocation's one session front door, and whose events and continuation
+// session work-dir lookup, the current-claim stamp and its clear, and the
+// work_started write, removal and read) answer through the invocation's one
+// session front door, whose claim store refs are read off its loaded config, and whose events and continuation
 // nudge reach the invocation's city without resolving it again. Every other
 // seam is left to its default (hookClaimOps.applyDefaults).
 func (h *hookCity) claimOps() hookClaimOps {
@@ -105,6 +106,21 @@ func (h *hookCity) claimOps() hookClaimOps {
 	}
 	ops.EnqueueContinuationNudge = func(assignee string) {
 		continuationNudgeEnqueueAt(h.path, assignee)
+	}
+	ops.RecordWorkStarted = func(sessionID string, fence hookStartedFence, key hookStartedKey, via string) (hookStartedResult, error) {
+		return recordWorkStartedVia(h.sessionFront, sessionID, fence, key, via)
+	}
+	ops.ForgetWorkStarted = func(sessionID string, key hookStartedKey) error {
+		return forgetWorkStartedVia(h.sessionFront, sessionID, key)
+	}
+	ops.ReadWorkStarted = func(sessionID string) (string, error) {
+		return sessionWorkStartedVia(h.sessionFront, sessionID)
+	}
+	ops.StoreRef = func(dir string) string {
+		return claimStoreRefAt(h.path, h.cfg, dir)
+	}
+	ops.EmitWorkStartedUnrecorded = func(sessionID, template, beadID string, cause error) {
+		emitWorkStartedUnrecordedTo(h.recorder(), sessionID, template, beadID, cause)
 	}
 	return ops
 }

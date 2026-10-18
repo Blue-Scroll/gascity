@@ -8,6 +8,7 @@ import (
 	"testing/synctest"
 	"time"
 
+	"github.com/gastownhall/gascity/internal/beadmeta"
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/events"
 	"github.com/gastownhall/gascity/internal/runtime"
@@ -839,16 +840,34 @@ func TestDormantFinalizeClearsALeftoverRequest(t *testing.T) {
 // names, so the seat closes and a fresh seat takes the claim; another
 // in-progress bead of the seat's, or the same drain for another reason,
 // keeps its work as before.
+//
+// T9 (mc-358yo, PHASE1-2 §6.5). With the work ladder off (until W3), only an
+// execution_claim_started stamp at the row's current instance token keeps
+// the claim, unless a dispatch hold parks it: a work_started entry, or an
+// earlier incarnation's stamp, would keep a claim the seat was woken on and
+// never ran and bring the v5.10x loop back, so such a claim goes back as
+// before. With the ladder on, the stop is the ladder's recycle, which gives
+// back nothing (§8 W3): every claim is kept.
 func TestExecutionStalledStopReleasesItsClaimAndCloses(t *testing.T) {
 	for _, c := range []struct {
 		name    string
 		reason  string
 		release bool
-		other   bool // the seat holds a second in-progress bead
+		other   bool   // the seat holds a second in-progress bead
+		started string // the seat's record: "cell", "stamp" (current token), "old-stamp" or "unreadable"
+		ladder  bool   // the work ladder is on
+		hold    string // a dispatch hold label on the claim
 	}{
-		{"execution-stalled", executionStalledDrainReason, true, false},
-		{"execution-stalled, a second claim held", executionStalledDrainReason, true, true},
-		{"another drain reason", drainOrphaned, false, false},
+		{"execution-stalled", executionStalledDrainReason, true, false, "", false, ""},
+		{"execution-stalled, a second claim held", executionStalledDrainReason, true, true, "", false, ""},
+		{"another drain reason", drainOrphaned, false, false, "", false, ""},
+		{"ladder off: work_started names it, released (v5.10x)", executionStalledDrainReason, true, false, "cell", false, ""},
+		{"ladder off: an earlier incarnation's stamp, released (v5.10x)", executionStalledDrainReason, true, false, "old-stamp", false, ""},
+		{"ladder off: this incarnation's stamp, kept", executionStalledDrainReason, false, false, "stamp", false, ""},
+		{"ladder off: stamped but hold:mayor, released", executionStalledDrainReason, true, false, "stamp", false, beadmeta.HoldMayorLabel},
+		{"ladder on: work_started names it, kept", executionStalledDrainReason, false, false, "cell", true, ""},
+		{"ladder on: no record, kept (the recycle gives back nothing)", executionStalledDrainReason, false, false, "", true, ""},
+		{"ladder on: on hold:external, kept (the recycle gives back nothing)", executionStalledDrainReason, false, false, "", true, beadmeta.HoldExternalLabel},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			var claimID, otherID string
@@ -876,6 +895,30 @@ func TestExecutionStalledStopReleasesItsClaimAndCloses(t *testing.T) {
 				}
 				if err := store.SetMetadata(id, executionClaimNudgeWorkKey, claim.ID); err != nil {
 					t.Fatal(err)
+				}
+				setWorkLadderDeployed(t, c.ladder)
+				if c.hold != "" {
+					if err := store.Update(claim.ID, beads.UpdateOpts{Labels: []string{c.hold}}); err != nil {
+						t.Fatal(err)
+					}
+				}
+				row, err := store.Get(id)
+				if err != nil {
+					t.Fatal(err)
+				}
+				switch c.started {
+				case "cell":
+					casSetMeta(t, store, id, session.WorkStartedKey, session.EncodeWorkStarted(session.WorkStarted{}.With(session.WorkStartedEntry{Bead: claim.ID, Via: session.WorkStartedViaClaim})))
+				case "stamp":
+					if err := store.SetMetadata(id, executionClaimStartedKey, row.Metadata["instance_token"]+"|"+claim.ID); err != nil {
+						t.Fatal(err)
+					}
+				case "old-stamp":
+					if err := store.SetMetadata(id, executionClaimStartedKey, "tok-old|"+claim.ID); err != nil {
+						t.Fatal(err)
+					}
+				case "unreadable":
+					casSetMeta(t, store, id, session.WorkStartedKey, "{")
 				}
 				rel := newCloseReleases(p.World, nil, io.Discard)
 				rel.legs = testWorkLegs(p.World.CityPath, p.World.Env.Cfg, store, nil) // the pass's raw work legs, over the row's store
@@ -999,4 +1042,29 @@ func TestExecutionStalledStopWithNothingLiveReleasesOnConfirmation(t *testing.T)
 			}
 		})
 	}
+}
+
+// casSetMeta writes key on row id by a CAS at its current revision, as a
+// CASOnly key must be written.
+func casSetMeta(t *testing.T, store beads.Store, id, key, value string) {
+	t.Helper()
+	w, ok := beads.ConditionalWriterFor(store)
+	if !ok {
+		t.Fatalf("store %T has no conditional writer", store)
+	}
+	b, err := store.Get(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.UpdateIfMatch(id, b.Revision, beads.UpdateOpts{Metadata: map[string]string{key: value}}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// setWorkLadderDeployed sets workLadderDeployed for one test.
+func setWorkLadderDeployed(t *testing.T, on bool) {
+	t.Helper()
+	prev := workLadderDeployed
+	workLadderDeployed = on
+	t.Cleanup(func() { workLadderDeployed = prev })
 }
