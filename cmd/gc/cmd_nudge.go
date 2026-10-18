@@ -672,6 +672,10 @@ func classifyQueuedNudgeIDs(cityPath string, ids []string, now time.Time) (map[s
 }
 
 func cmdNudgeDrainWithFormat(args []string, inject bool, hookFormat string, stdout, stderr io.Writer) int {
+	// One composed city-config load for the whole invocation: the target
+	// resolution, the step reminder and every store open each loaded it again
+	// (see invocationConfigMemo).
+	defer beginInvocationConfigMemo()()
 	// --inject writes a <system-reminder> straight into a provider's system
 	// prompt, and gc stages the overlays that call it into the session work
 	// directory — commonly a city or rig root — so a human who opens the same
@@ -726,6 +730,20 @@ func cmdNudgeDrainWithFormat(args []string, inject bool, hookFormat string, stdo
 		return 1
 	}
 
+	// The step reminder is the slowest read a drain makes: in process it opens
+	// the rig store at GC_RIG_ROOT and scans that rig by gc.routed_to once per
+	// identity. Ask the controller for it now, so the request runs while the
+	// target resolves; both paths below take it for the city the explicit
+	// environment names, which is the city they resolve.
+	var stepLookup *wispStepLookup
+	explicitCity, explicit := "", false
+	if inject {
+		if explicitCity, explicit = nudgeDrainExplicitCityPath(); explicit {
+			stepLookup = startWispStepLookup(explicitCity, stderr)
+			defer stepLookup.stop()
+		}
+	}
+
 	// Empty-queue fast path. Resolving the target loads the city config and
 	// opens the session store, and on an empty queue the only things it would
 	// feed are the context advisory (which renders nothing for a payload with
@@ -735,13 +753,13 @@ func cmdNudgeDrainWithFormat(args []string, inject bool, hookFormat string, stdo
 	// resolution; a queued item or a usage sample takes the full path.
 	wispPrefetched := false
 	if inject && !contextUsage.ok {
-		if cityPath, ok := nudgeDrainExplicitCityPath(); ok && nudgeQueueIsEmpty(cityPath) {
-			wispExtra = wispStepInjectionContent(cityPath)
+		if explicit && nudgeQueueIsEmpty(explicitCity) {
+			wispExtra = stepLookup.content()
 			wispPrefetched = true
 			// The full path writes the step reminder only once the target
 			// resolves, so a non-empty reminder still needs that proof. Recheck
 			// the queue too: a nudge enqueued during the lookup must be claimed.
-			if wispExtra == "" && nudgeQueueIsEmpty(cityPath) {
+			if wispExtra == "" && nudgeQueueIsEmpty(explicitCity) {
 				return 0
 			}
 		}
@@ -768,7 +786,7 @@ func cmdNudgeDrainWithFormat(args []string, inject bool, hookFormat string, stdo
 	if inject {
 		injectPrefix += contextInjectLineForSample(contextUsage, target.cfg.AgentDefaults.ContextAdvisory, target.agent.ContextAdvisory)
 		if !wispPrefetched {
-			wispExtra = wispStepInjectionContent(target.cityPath)
+			wispExtra = stepLookup.contentFor(target.cityPath)
 		}
 	}
 
@@ -1792,6 +1810,9 @@ func resolveNudgeTargetPreferringHookIdentity(identifier string, preferHookIdent
 	if err != nil {
 		return nudgeTarget{}, err
 	}
+	// The load ran the builtin readiness pass the routing read needs; resolve
+	// the routes alongside the store open (prewarmCLIStorageRoutes).
+	defer prewarmCLIStorageRoutes(cityPath)()
 	return resolveNudgeTargetInStore(cityPath, cfg, openNudgeBeadStore(cityPath), identifier, preferHookIdentity)
 }
 
@@ -2160,6 +2181,37 @@ func maybeStartNudgePoller(target nudgeTarget) {
 	// races concurrent acquirers — see reapStaleNudgePoller). Best-effort:
 	// never block a spawn.
 	_ = reapStaleNudgePollers(target.cityPath)
+	startNudgePollerUnlessDispatched(target)
+}
+
+// startNudgePollerReap reaps cityPath's stale poller PID files in the
+// background and returns the wait for it. `gc prime --hook` reaps this way
+// while it does its own reads, and starts its poller with
+// startNudgePollerUnlessDispatched: the reap lists the whole pollers
+// directory, which keeps a lock file for every session that ever ran a poller
+// (97k entries and 0.14-0.21 s on maintainer-city), and the spawn decision
+// does not depend on it, since ensureNudgePoller checks its own PID file under
+// the same per-file lock the reap takes.
+func startNudgePollerReap(cityPath string) (wait func()) {
+	reap := nudgePollerReaper
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = reap(cityPath)
+	}()
+	return func() { <-done }
+}
+
+// nudgePollerReaper is the reap startNudgePollerReap runs: a seam, so a test
+// can see when it starts.
+var nudgePollerReaper = reapStaleNudgePollers
+
+// startNudgePollerUnlessDispatched is maybeStartNudgePoller without the reap,
+// for a caller that reaps the pollers directory itself (startNudgePollerReap).
+func startNudgePollerUnlessDispatched(target nudgeTarget) {
+	if target.sessionName == "" {
+		return
+	}
 	// Supervisor-hosted dispatcher owns delivery in supervisor mode; the
 	// per-session poller would race with it and reintroduce the bd-shellout
 	// load it was designed to eliminate.
