@@ -114,6 +114,7 @@ func (rt *plannerRuntime) bindHost(h plannerHost) {
 		}
 		return nil
 	}
+	h.gather.WakeReads = rt.wakeReads
 	h.gather.ReadyWaits = func() map[string]bool {
 		if l := rt.lane.Load(); l != nil {
 			return l.readyWaitSet()
@@ -235,6 +236,15 @@ func (rt *plannerRuntime) start(parent context.Context) bool {
 	rt.laneDone = lane.start(ctx)
 	go rt.planner.run(ctx)
 	return true
+}
+
+// wakeReads asks the lane for a pass, so a poke or a reload reaches the
+// legs and custom scale_checks it reads without waiting out the patrol. It
+// never blocks, and does nothing before start.
+func (rt *plannerRuntime) wakeReads() {
+	if l := rt.lane.Load(); l != nil {
+		l.wake()
+	}
 }
 
 // waitDependencyClosed runs the lane's waits step alone when a pending deps
