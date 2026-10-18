@@ -233,7 +233,7 @@ var fields = withObserved(with(with(with(with(with(with(with(registry, false, v2
 	NamedSessionIdentityMetadata, NamedSessionModeMetadata, "alias", "alias_history", "pool_alias_conflict", "pool_alias_conflict_count",
 	"pool_alias_conflict_at", "synced_at", "work_dir", "wake_mode", "session_key", "continuation_epoch", "command", "provider", "provider_kind",
 	"builtin_ancestor", "resume_flag", "resume_style", "resume_command", "session_id_flag", "close_reason", "closed_at"), false, v2("cmd/gc/reconcile_baseline.go", "baselinePatch"),
-	"started_config_hash", "started_provision_hash", "started_launch_hash", "core_hash_breakdown", "started_live_hash", "live_hash"), false, v2("cmd/gc/reconcile_steps_nudges.go", "externalReadsLane.nudges"),
+	"started_config_hash", "started_provision_hash", "started_launch_hash", "core_hash_breakdown", "started_live_hash", "live_hash"), false, v2("cmd/gc/reconcile_steps_nudges.go", "externalReadsLane.legacyBackstops"),
 	"idle_claim_nudge_trigger", "idle_claim_nudge_count", "idle_claim_nudge_at", "idle_claim_nudge_token", "idle_claim_nudge_stalled", "idle_claim_nudge_stalled_token", "continuation_claim_nudge_work",
 	"continuation_claim_nudge_root", "continuation_claim_nudge_store_ref", "continuation_claim_nudge_generation",
 	"continuation_claim_nudge_count", "continuation_claim_nudge_at", "execution_claim_nudge_work", "execution_claim_nudge_root",
@@ -380,10 +380,9 @@ var registry = slices.Concat([]Field{
 	// by a CAS on the row.
 	{Key: WorkStartedKey, Class: ClassWork, NewKey: true, CASOnly: true, Writers: sites(
 		op("cmd/gc/hook_session_claim.go", "recordWorkStarted"), op("cmd/gc/hook_session_claim.go", "forgetWorkStarted"))},
-	{
-		Key: WorkLadderKey, Class: ClassWork, NewKey: true, CASOnly: true,
-		NoWriter: "the v2 work-ladder lane step (PHASE1-2 W3) writes it; registered with work_started so the hook reads its pending release",
-	},
+	{Key: WorkLadderKey, Class: ClassWork, NewKey: true, CASOnly: true, Writers: sites(
+		v2("cmd/gc/work_ladder_lane.go", "ladderPass.commit"), v2("cmd/gc/work_ladder_lane.go", "ladderPass.settle"),
+		v2("cmd/gc/work_ladder_lane.go", "ladderPass.release"), v2("cmd/gc/work_ladder_lane.go", "externalReadsLane.clearLadderReleases"))},
 	{Key: ResetCommittedAtKey, Class: ClassMarker, Writers: sites(legacy(srcTransition, "RestartRequestPatch"))},
 	{Key: "drain_finalize", Class: ClassMarker, Writers: sites(legacy("cmd/gc/session_pool_drain_deadline.go", "retirePoolSlotAtDrainDeadline"))},
 	{Key: "startup_dialog_verified", Class: ClassMarker, Writers: sites(op("internal/session/chat.go", "Manager.markStartupDialogsVerifiedLocked"))},

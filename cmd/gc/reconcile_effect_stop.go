@@ -14,6 +14,7 @@ import (
 	"github.com/gastownhall/gascity/internal/events"
 	"github.com/gastownhall/gascity/internal/runtime"
 	"github.com/gastownhall/gascity/internal/session"
+	"github.com/gastownhall/gascity/internal/workladder"
 )
 
 // The stop verb (CONTRACT v5 D3, D4, F2, F3; C6b2), A4's effect, under the
@@ -142,16 +143,6 @@ func stalledClaimOf(row session.Info, meta map[string]string) stalledClaim {
 	return stalledClaim{beadID: beadID, row: row, started: started}
 }
 
-// workLadderOn reports whether w's city runs the work-progress ladder
-// ([daemon] work_ladder, PHASE1-2 W3). With it on, an execution-stalled stop
-// gives back no claim. Until W3 ships the lane step and the switch, no city
-// runs it: W3 replaces this body with the config read.
-func workLadderOn(*World) bool { return workLadderDeployed }
-
-// workLadderDeployed is false until W3 lands; tests set it to exercise the
-// ladder-on guard. Tests that swap it MUST NOT call t.Parallel().
-var workLadderDeployed = false
-
 // corpseObject is the corpse a confirmed stop removes: its leaf and the
 // session object the read saw.
 type corpseObject struct {
@@ -182,7 +173,7 @@ func stopDecide(v txView) txStep {
 	}
 	name := strings.TrimSpace(v.Row.SessionName)
 	plan := stopPlan{name: name, names: processNamesFor(v.World, v.Row), now: v.Now, idle: isIdleReason(v.It.Reason), restart: v.It.Reason == decideRestartRequested}
-	if stopReason(v.It) == executionStalledDrainReason && !workLadderOn(v.World) {
+	if stopReason(v.It) == executionStalledDrainReason && x7Releases(v.World, v.Meta) {
 		plan.stalled = stalledClaimOf(v.Row, v.Meta)
 	}
 	switch rt := v.RT; rt.Class {
@@ -255,6 +246,34 @@ func stopCall(ctx context.Context, c txCaps, p stopPlan) (stopped, error) {
 	clearRestartMarker(sp, p)
 	releaseStalledClaim(c.release, p.stalled)
 	return stopped{Confirmed: true}, nil
+}
+
+// workLadderOn reports whether w's city runs the work ladder ([daemon]
+// work_ladder). With it on, an execution-stalled stop is the ladder's
+// recycle, which keeps a started claim on the seat (PHASE1-2 §6.5): the
+// ladder releases an unstarted claim itself, by a CAS proving it unstarted,
+// and never asks a stop to.
+func workLadderOn(w *World) bool {
+	return w == nil || w.Env == nil || w.Env.Cfg == nil || w.Env.Cfg.Daemon.WorkLadderEnabled()
+}
+
+// x7Releases reports whether an execution-stalled stop of the row whose
+// metadata is meta gives back the execution backstop's claim (X7): only
+// with the ladder rolled back, and only a marker the backstops wrote for the
+// row's own incarnation, and not when the row's work_ladder cell records a
+// recycle at the row's generation (the switch flipped mid-recycle), or is
+// unreadable: each way the stop is, or may be, the ladder's, which keeps the
+// claim.
+func x7Releases(w *World, meta map[string]string) bool {
+	token := strings.TrimSpace(meta["instance_token"])
+	if workLadderOn(w) || token == "" || strings.TrimSpace(meta[executionClaimNudgeTokenKey]) != token {
+		return false
+	}
+	// A recycle the ladder asked for at this generation, with the switch
+	// flipped to off before the stop landed, is still the ladder's; so is
+	// one a cell it cannot read might record (keep the work).
+	cell, err := workladder.DecodeLadder(meta[session.WorkLadderKey])
+	return err == nil && (cell.V == 0 || cell.RecycledGen != rowGeneration(meta))
 }
 
 // releaseStalledClaim gives back, after a confirmed stop, the claim an

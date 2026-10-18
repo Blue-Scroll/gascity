@@ -2803,6 +2803,14 @@ type DaemonConfig struct {
 	// deprecated aliases for "legacy". Boot-latched: a change applies at the next
 	// controller restart. Leave it unset.
 	SessionReconciler string `toml:"session_reconciler,omitempty" jsonschema:"default=legacy,enum=legacy,enum=v2,enum=off,enum=auto,enum=require"`
+	// WorkLadder selects how the v2 reconciler paces outstanding work on pool
+	// seats. "on" (default) runs the work-progress ladder: nudges back off from
+	// 3 to 60 minutes and never stop, a started claim is recycled at most once
+	// and then escalated, and an unstarted claim is released after its third
+	// unanswered nudge. "off" runs the three backstops it replaced (idle-claim,
+	// continuation, execution) instead: the rollback. Read on every pass, so a
+	// config reload applies. Legacy ignores it.
+	WorkLadder string `toml:"work_ladder,omitempty" jsonschema:"default=on,enum=on,enum=off"`
 	// AutoRestartOnDrift controls whether `gc start` automatically restarts
 	// the supervisor when it detects the running supervisor's binary or
 	// pack snapshot has drifted from on-disk state. Nil (unset) defaults
@@ -3010,6 +3018,27 @@ func (d *DaemonConfig) NudgeDispatcherMode() string {
 	default:
 		return "legacy"
 	}
+}
+
+// WorkLadderEnabled reports whether the v2 reconciler runs the work-progress
+// ladder ([daemon] work_ladder): every value but "off" does. An unknown value
+// keeps the ladder on, with a load warning (workLadderWarnings).
+func (d DaemonConfig) WorkLadderEnabled() bool {
+	return !strings.EqualFold(strings.TrimSpace(d.WorkLadder), "off")
+}
+
+// workLadderWarnings returns the load warning for one config layer's
+// [daemon] work_ladder when its value is neither "on" nor "off": "false" or
+// "disabled" would otherwise read as on without a word.
+func workLadderWarnings(cfg *City, source string) []string {
+	if cfg == nil {
+		return nil
+	}
+	switch strings.ToLower(strings.TrimSpace(cfg.Daemon.WorkLadder)) {
+	case "", "on", "off":
+		return nil
+	}
+	return []string{fmt.Sprintf(`%s: [daemon] work_ladder = %q is not a known value; the work ladder stays on (use "off" to run the backstops instead)`, source, cfg.Daemon.WorkLadder)}
 }
 
 // Session reconciler modes returned by SessionReconcilerMode.
