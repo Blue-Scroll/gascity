@@ -1389,3 +1389,116 @@ func TestEnsureSessionNameAvailable_RejectsNonReleasablePoolSlotShapes(t *testin
 		})
 	}
 }
+
+// listQueryRecordingStore records every List query so a test can pin which
+// lookups read closed rows.
+type listQueryRecordingStore struct {
+	*beads.MemStore
+	queries []beads.ListQuery
+}
+
+func (s *listQueryRecordingStore) List(query beads.ListQuery) ([]beads.Bead, error) {
+	s.queries = append(s.queries, query)
+	return s.MemStore.List(query)
+}
+
+// TestEnsureSessionNameAvailableReadsClosedRowsOnlyForSessionName pins the
+// cost cut from vn-8tupvb1. A lookup that reads closed rows is a full ledger
+// scan, so only session_name (the one field a closed bead still reserves) may
+// read them. The other four lookups are open-only and Live.
+func TestEnsureSessionNameAvailableReadsClosedRowsOnlyForSessionName(t *testing.T) {
+	store := &listQueryRecordingStore{MemStore: beads.NewMemStore()}
+	if err := ensureSessionNameAvailable(store, "sky"); err != nil {
+		t.Fatalf("ensureSessionNameAvailable(empty store) = %v, want nil", err)
+	}
+	var closedKeys, liveKeys []string
+	for _, q := range store.queries {
+		if len(q.Metadata) != 1 {
+			t.Fatalf("query %+v: want exactly one metadata filter", q)
+		}
+		for key := range q.Metadata {
+			switch {
+			case q.IncludeClosed:
+				closedKeys = append(closedKeys, key)
+			case q.Live:
+				liveKeys = append(liveKeys, key)
+			default:
+				t.Fatalf("query on %q is open-only but not Live: a bead another process just opened would be missed", key)
+			}
+		}
+	}
+	if strings.Join(closedKeys, ",") != "session_name" {
+		t.Fatalf("closed-row lookups = %v, want only session_name", closedKeys)
+	}
+	if got, want := strings.Join(liveKeys, ","), "alias,agent_name,template,common_name"; got != want {
+		t.Fatalf("live open lookups = %q, want %q", got, want)
+	}
+}
+
+// TestEnsureSessionNameAvailableClosedHoldersAfterSplit proves the split read
+// gives the same answers: a closed bead still reserves its session_name, and a
+// closed bead that only matches through alias, agent_name, template or
+// common_name still does not.
+func TestEnsureSessionNameAvailableClosedHoldersAfterSplit(t *testing.T) {
+	for _, field := range []string{"session_name", "alias", "agent_name", "template", "common_name"} {
+		t.Run(field, func(t *testing.T) {
+			store := beads.NewMemStore()
+			b, err := store.Create(beads.Bead{
+				Type:     BeadType,
+				Labels:   []string{LabelSession},
+				Metadata: map[string]string{field: "sky"},
+			})
+			if err != nil {
+				t.Fatalf("Create: %v", err)
+			}
+			if err := store.Close(b.ID); err != nil {
+				t.Fatalf("Close: %v", err)
+			}
+			err = ensureSessionNameAvailable(store, "sky")
+			if field == "session_name" {
+				if !errors.Is(err, ErrSessionNameExists) {
+					t.Fatalf("closed session_name holder: err = %v, want ErrSessionNameExists", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("closed %s holder: err = %v, want nil", field, err)
+			}
+		})
+	}
+}
+
+// TestNoLiveSessionNameCollisionsReadsNoClosedRows pins the legacy-bypass
+// check to open, Live lookups: it can only ever be failed by an open bead.
+func TestNoLiveSessionNameCollisionsReadsNoClosedRows(t *testing.T) {
+	store := &listQueryRecordingStore{MemStore: beads.NewMemStore()}
+	closed, err := store.Create(beads.Bead{
+		Type:     BeadType,
+		Labels:   []string{LabelSession},
+		Metadata: map[string]string{"session_name": "sky"},
+	})
+	if err != nil {
+		t.Fatalf("Create(closed): %v", err)
+	}
+	if err := store.Close(closed.ID); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if !noLiveSessionNameCollisions(store, "sky", "", "") {
+		t.Fatal("closed session_name holder counted as a live collision")
+	}
+	for _, q := range store.queries {
+		if q.IncludeClosed || !q.Live {
+			t.Fatalf("query %+v: want open-only and Live", q)
+		}
+	}
+	if _, err := store.Create(beads.Bead{
+		Type:     BeadType,
+		Labels:   []string{LabelSession},
+		Metadata: map[string]string{"alias": "sky"},
+	}); err != nil {
+		t.Fatalf("Create(open): %v", err)
+	}
+	if noLiveSessionNameCollisions(store, "sky", "", "") {
+		t.Fatal("open alias holder not counted as a live collision")
+	}
+}

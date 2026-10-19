@@ -343,13 +343,7 @@ func ensureSessionNameAvailableForSelfAndOwner(store beads.Store, name, selfID, 
 	if name == "" {
 		return nil
 	}
-	all, err := ExactMetadataSessionCandidates(store, true,
-		map[string]string{"session_name": name},
-		map[string]string{"alias": name},
-		map[string]string{"agent_name": name},
-		map[string]string{"template": name},
-		map[string]string{"common_name": name},
-	)
+	all, err := sessionNameClaimCandidates(store, name)
 	if err != nil {
 		return fmt.Errorf("listing sessions: %w", err)
 	}
@@ -398,6 +392,10 @@ func ensureSessionNameAvailableForSelfAndOwner(store beads.Store, name, selfID, 
 			}
 			return fmt.Errorf("%w: %q already belongs to %s", ErrSessionNameExists, name, b.ID)
 		}
+		// Only session_name reserves a name from a closed bead, which is why
+		// sessionNameClaimCandidates reads closed rows for session_name alone.
+		// A closed bead that should block through any other field needs that
+		// field's lookup widened there too, or it is never read.
 		if b.Status == "closed" {
 			continue
 		}
@@ -564,13 +562,7 @@ func isConfiguredNamedSessionRuntimeName(cfg *config.City, name, owner string) b
 // ensureSessionNameAvailableForSelf so the legacy-bypass path cannot
 // suppress rejections from live alias or identifier collisions.
 func noLiveSessionNameCollisions(store beads.Store, name, selfID, selfOwner string) bool {
-	all, err := ExactMetadataSessionCandidates(store, true,
-		map[string]string{"session_name": name},
-		map[string]string{"alias": name},
-		map[string]string{"agent_name": name},
-		map[string]string{"template": name},
-		map[string]string{"common_name": name},
-	)
+	all, err := liveOpenSessionNameCandidates(store, name)
 	if err != nil {
 		return false
 	}

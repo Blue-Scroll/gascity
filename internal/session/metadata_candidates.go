@@ -37,13 +37,85 @@ func ExactMetadataSessionCandidatesInfo(store beads.Store, includeClosed bool, f
 	return out, nil
 }
 
+// sessionNameClaimCandidates returns the session beads that can bear on
+// whether a session may claim name: every bead whose session_name is name,
+// closed ones included (an explicit session_name stays reserved after its bead
+// closes), plus every OPEN bead whose alias, agent_name, template or
+// common_name is name. A closed bead matched only by one of those four never
+// reserves the name, so they are not read for closed rows.
+//
+// Keep it that way. A lookup that reads closed rows cannot be answered from
+// the CachingStore's open rows, so it is a JSON scan of the whole ledger:
+// about 3 s each on hq (13,851 rows) at load 150. The name check used to run
+// five of them per name, and that was most of a pool session create's 28 s to
+// 45 s inside the demand tick (vn-8tupvb1). The four open-only lookups are
+// Live, so a bead another process opened after the cache last refreshed still
+// counts: the same freshness the closed-inclusive reads had, since those
+// always reached the backing store.
+func sessionNameClaimCandidates(store beads.Store, name string) ([]beads.Bead, error) {
+	set := newSessionCandidateSet(store)
+	if err := set.add(beads.ListQuery{IncludeClosed: true}, map[string]string{"session_name": name}); err != nil {
+		return nil, err
+	}
+	if err := set.add(beads.ListQuery{Live: true},
+		map[string]string{"alias": name},
+		map[string]string{"agent_name": name},
+		map[string]string{"template": name},
+		map[string]string{"common_name": name},
+	); err != nil {
+		return nil, err
+	}
+	return set.candidates, nil
+}
+
+// liveOpenSessionNameCandidates is sessionNameClaimCandidates for a check that
+// only open beads can fail: every field, session_name too, is read open-only
+// and Live.
+func liveOpenSessionNameCandidates(store beads.Store, name string) ([]beads.Bead, error) {
+	set := newSessionCandidateSet(store)
+	if err := set.add(beads.ListQuery{Live: true},
+		map[string]string{"session_name": name},
+		map[string]string{"alias": name},
+		map[string]string{"agent_name": name},
+		map[string]string{"template": name},
+		map[string]string{"common_name": name},
+	); err != nil {
+		return nil, err
+	}
+	return set.candidates, nil
+}
+
 func exactMetadataSessionCandidates(store beads.Store, includeClosed bool, status string, filters ...map[string]string) ([]beads.Bead, error) {
-	if store == nil {
-		return nil, nil
+	base := beads.ListQuery{IncludeClosed: includeClosed}
+	if status != "" {
+		base = beads.ListQuery{Status: status}
+	}
+	set := newSessionCandidateSet(store)
+	if err := set.add(base, filters...); err != nil {
+		return nil, err
+	}
+	return set.candidates, nil
+}
+
+// sessionCandidateSet collects session beads from one or more exact metadata
+// lookups, deduplicated by bead ID in query order.
+type sessionCandidateSet struct {
+	store      beads.Store
+	seenBeads  map[string]bool
+	candidates []beads.Bead
+}
+
+func newSessionCandidateSet(store beads.Store) *sessionCandidateSet {
+	return &sessionCandidateSet{store: store, seenBeads: make(map[string]bool)}
+}
+
+// add runs one store.List per filter, each being base plus that filter's one
+// metadata key/value pair. Empty and repeated filters are skipped.
+func (s *sessionCandidateSet) add(base beads.ListQuery, filters ...map[string]string) error {
+	if s.store == nil {
+		return nil
 	}
 	seenQueries := make(map[string]bool, len(filters))
-	seenBeads := make(map[string]bool)
-	candidates := make([]beads.Bead, 0, len(filters))
 	for _, filter := range filters {
 		if len(filter) != 1 {
 			continue
@@ -61,26 +133,20 @@ func exactMetadataSessionCandidates(store beads.Store, includeClosed bool, statu
 			continue
 		}
 		seenQueries[queryKey] = true
-		query := beads.ListQuery{
-			Metadata: map[string]string{key: value},
-		}
-		if status != "" {
-			query.Status = status
-		} else {
-			query.IncludeClosed = includeClosed
-		}
-		items, err := store.List(query)
+		query := base
+		query.Metadata = map[string]string{key: value}
+		items, err := s.store.List(query)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		for _, b := range items {
-			if seenBeads[b.ID] || !IsSessionBeadOrRepairable(b) {
+			if s.seenBeads[b.ID] || !IsSessionBeadOrRepairable(b) {
 				continue
 			}
-			RepairEmptyType(store, &b)
-			seenBeads[b.ID] = true
-			candidates = append(candidates, b)
+			RepairEmptyType(s.store, &b)
+			s.seenBeads[b.ID] = true
+			s.candidates = append(s.candidates, b)
 		}
 	}
-	return candidates, nil
+	return nil
 }
