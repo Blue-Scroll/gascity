@@ -158,6 +158,12 @@ type agentBuildParams struct {
 	// (see resolveTemplateForSessionBeadInfo) still adds to the same total.
 	// Nil records nothing.
 	resolveCost *templateResolveCost
+
+	// resolveMemo remembers the scope-level reads resolveTemplate repeats for
+	// every agent (session backend env, beads provider, git default branch),
+	// for this build only. A pointer, so copies share it. Nil computes every
+	// call. See templateResolveMemo for what is remembered and why.
+	resolveMemo *templateResolveMemo
 }
 
 // hasCompleteSessionSnapshot reports whether a store-backed build has a
@@ -290,6 +296,9 @@ func baseAgentBuildParams(cityName, cityPath string, cfg *config.City, sp runtim
 		// (see resolveTemplateForSessionBeadInfo), so the demand sub-phase
 		// records sum every resolveTemplatePrepared call of the build.
 		resolveCost: &templateResolveCost{},
+		// One memo per build, for the same reason: never across builds, so a
+		// changed Dolt target reaches the next tick.
+		resolveMemo: newTemplateResolveMemo(),
 	}
 }
 
