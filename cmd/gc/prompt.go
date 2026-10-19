@@ -112,6 +112,14 @@ func renderPrompt(fs fsys.FS, cityPath, cityName, templatePath string, ctx Promp
 // Callers persisting prompt provenance (session metadata, WorkerOperation
 // payloads) should use this entry point.
 func renderPromptWithMeta(fs fsys.FS, cityPath, cityName, templatePath string, ctx PromptContext, sessionTemplate string, stderr io.Writer, packDirs []string, injectFragments []string, store beads.Store) PromptRenderResult {
+	return renderPromptWithFragments(nil, fs, cityPath, cityName, templatePath, ctx, sessionTemplate, stderr, packDirs, injectFragments, store)
+}
+
+// renderPromptWithFragments is renderPromptWithMeta reading its shared
+// fragments through fragments, the build's promptFragmentCache. A caller that
+// renders many agents in one pass (resolveTemplate, per build) passes one
+// cache to every call; nil parses every fragment fresh.
+func renderPromptWithFragments(fragments *promptFragmentCache, fs fsys.FS, cityPath, cityName, templatePath string, ctx PromptContext, sessionTemplate string, stderr io.Writer, packDirs []string, injectFragments []string, store beads.Store) PromptRenderResult {
 	if templatePath == "" {
 		return PromptRenderResult{}
 	}
@@ -134,55 +142,21 @@ func renderPromptWithMeta(fs fsys.FS, cityPath, cityName, templatePath string, c
 		}
 	}
 
-	// templateFirst (registered via promptFuncMap) needs to call tmpl.Lookup
-	// at execute time. The closure captures &tmpl by reference so the func
-	// observes the parsed template (with all fragments registered) rather
-	// than nil at funcmap-construction time.
-	var tmpl *template.Template
-	tmpl = template.New("prompt").
-		Funcs(promptFuncMap(cityName, sessionTemplate, store, func() *template.Template { return tmpl })).
-		Option("missingkey=zero")
-
-	// Load shared templates from pack dirs (lower priority).
-	// Each pack directory may contain prompts/shared/ and/or
-	// template-fragments/ subdirectories.
-	loadedPackFragmentRoots := make(map[string]struct{}, len(packDirs)+1)
-	for _, dir := range packDirs {
-		cleanDir := filepath.Clean(dir)
-		loadedPackFragmentRoots[cleanDir] = struct{}{}
-		sharedDir := filepath.Join(dir, "prompts", "shared")
-		loadSharedTemplates(fs, tmpl, sharedDir, stderr)
-		// V2: template-fragments/ at pack level.
-		fragDir := filepath.Join(dir, "template-fragments")
-		loadSharedTemplates(fs, tmpl, fragDir, stderr)
-	}
-	if sourcePackRoot := promptSourcePackRoot(cityPath, sourcePath); sourcePackRoot != "" {
-		if _, ok := loadedPackFragmentRoots[sourcePackRoot]; !ok {
-			loadSharedTemplates(fs, tmpl, filepath.Join(sourcePackRoot, "prompts", "shared"), stderr)
-			loadSharedTemplates(fs, tmpl, filepath.Join(sourcePackRoot, "template-fragments"), stderr)
+	tmpl, err := fragments.fragmentSet(fs, promptFragmentDirs(cityPath, sourcePath, packDirs), stderr)
+	if err != nil {
+		fmt.Fprintf(stderr, "gc: prompt template %q: %v\n", templatePath, err) //nolint:errcheck // best-effort stderr
+		return PromptRenderResult{
+			Text:    body,
+			Version: fm.Version,
+			SHA:     promptmeta.SHA(body),
 		}
 	}
-
-	// Load shared templates from the city root itself. cfg.PackDirs is
-	// populated only from imported packs, so a root city pack with no
-	// [imports.*] blocks would otherwise silently ignore its own
-	// prompts/shared/ and template-fragments/ directories. Loaded after
-	// imported-pack fragments (so city-root wins on name collision with
-	// imports) but before sibling shared/ and per-agent fragments below
-	// (which keep their existing higher precedence).
-	loadSharedTemplates(fs, tmpl, filepath.Join(cityPath, "prompts", "shared"), stderr)
-	loadSharedTemplates(fs, tmpl, filepath.Join(cityPath, "template-fragments"), stderr)
-
-	// Load shared templates from sibling shared/ directory (highest priority —
-	// wins on name collision with cross-pack templates).
-	sharedDir := filepath.Join(filepath.Dir(sourcePath), "shared")
-	loadSharedTemplates(fs, tmpl, sharedDir, stderr)
-
-	// V2: per-agent template-fragments/ (if the prompt lives in agents/<name>/).
-	// Load from agents/<name>/template-fragments/ so per-agent fragments
-	// are available alongside pack-level ones.
-	agentFragDir := filepath.Join(filepath.Dir(sourcePath), "template-fragments")
-	loadSharedTemplates(fs, tmpl, agentFragDir, stderr)
+	// templateFirst (registered via promptFuncMap) needs to call tmpl.Lookup
+	// at execute time. The closure reads tmpl by reference so the func
+	// observes the final template (with the body parsed in) rather than the
+	// fragment set. These funcs replace the set's placeholders for this
+	// render only: tmpl is this render's own clone.
+	tmpl.Funcs(promptFuncMap(cityName, sessionTemplate, store, func() *template.Template { return tmpl }))
 
 	// Parse main template last — its body becomes the "prompt" template.
 	// Frontmatter is stripped before parsing so it doesn't appear in
@@ -230,6 +204,38 @@ func renderPromptWithMeta(fs fsys.FS, cityPath, cityName, templatePath string, c
 		Version: fm.Version,
 		SHA:     promptmeta.SHA(rendered),
 	}
+}
+
+// promptFragmentDirs lists the dirs whose fragments a prompt at sourcePath
+// can use, lowest precedence first (a later dir wins a name collision):
+//
+//  1. each pack dir's prompts/shared/ and template-fragments/
+//  2. the same two under the pack the prompt lives in, when that pack is not
+//     already in packDirs
+//  3. the same two under the city root. cfg.PackDirs holds imported packs
+//     only, so a root city pack with no [imports.*] would otherwise ignore
+//     its own fragments. After the imports, so the city root wins over them.
+//  4. the prompt's sibling shared/ (it wins over every pack)
+//  5. the prompt's sibling template-fragments/ (agents/<name>/ fragments)
+//
+// Dirs that do not exist are kept: loading one is a no-op, and keeping them
+// keeps the list the same shape for every agent of a pack, which is what
+// lets promptFragmentCache share the parsed prefix.
+func promptFragmentDirs(cityPath, sourcePath string, packDirs []string) []string {
+	dirs := make([]string, 0, 2*len(packDirs)+8)
+	loadedPackFragmentRoots := make(map[string]struct{}, len(packDirs)+1)
+	for _, dir := range packDirs {
+		loadedPackFragmentRoots[filepath.Clean(dir)] = struct{}{}
+		dirs = append(dirs, filepath.Join(dir, "prompts", "shared"), filepath.Join(dir, "template-fragments"))
+	}
+	if sourcePackRoot := promptSourcePackRoot(cityPath, sourcePath); sourcePackRoot != "" {
+		if _, ok := loadedPackFragmentRoots[sourcePackRoot]; !ok {
+			dirs = append(dirs, filepath.Join(sourcePackRoot, "prompts", "shared"), filepath.Join(sourcePackRoot, "template-fragments"))
+		}
+	}
+	dirs = append(dirs, filepath.Join(cityPath, "prompts", "shared"), filepath.Join(cityPath, "template-fragments"))
+	sourceDir := filepath.Dir(sourcePath)
+	return append(dirs, filepath.Join(sourceDir, "shared"), filepath.Join(sourceDir, "template-fragments"))
 }
 
 func promptTemplateSourcePath(cityPath, templatePath string) string {

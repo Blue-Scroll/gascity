@@ -39,6 +39,12 @@ type agentBuildParams struct {
 	appendFragments []string // V2: city-level [agents].append_fragments / [agent_defaults].append_fragments
 	stderr          io.Writer
 
+	// promptFragments holds the prompt fragments this build has parsed, so
+	// every agent of a pack reuses one parse (vn-qn7f49h). A pointer, so
+	// copies share it. Per build only: an edited fragment reaches the next
+	// tick. Nil parses fresh on every render.
+	promptFragments *promptFragmentCache
+
 	// beadStore is the city-level bead store for session bead lookups.
 	// When non-nil, session names are derived from bead IDs ("s-{beadID}")
 	// instead of the legacy SessionNameFor function.
@@ -288,6 +294,7 @@ func baseAgentBuildParams(cityName, cityPath string, cfg *config.City, sp runtim
 		rigOverlayDirs:  cfg.RigOverlayDirs,
 		globalFragments: cfg.Workspace.GlobalFragments,
 		appendFragments: mergeFragmentLists(cfg.AgentDefaults.AppendFragments, cfg.AgentsDefaults.AppendFragments),
+		promptFragments: newPromptFragmentCache(),
 		beadStore:       store,
 		beadNames:       make(map[string]string),
 		stderr:          stderr,

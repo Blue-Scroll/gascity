@@ -409,7 +409,7 @@ func resolveTemplate(p *agentBuildParams, cfgAgent *config.Agent, qualifiedName 
 	// The controller's own routes are the right source; threading them into
 	// this plumbing is a change to controller wiring, not part of swapping
 	// the reader, so it stays with the claim-routing slice (ga-601v2).
-	prompt = renderPrompt(p.fs, p.cityPath, p.cityName, cfgAgent.PromptTemplate, PromptContext{
+	prompt = renderPromptWithFragments(p.promptFragments, p.fs, p.cityPath, p.cityName, cfgAgent.PromptTemplate, PromptContext{
 		CityRoot:                p.cityPath,
 		AgentName:               qualifiedName,
 		TemplateName:            cfgAgent.Name,
@@ -430,7 +430,7 @@ func resolveTemplate(p *agentBuildParams, cfgAgent *config.Agent, qualifiedName 
 		InstructionsFile:        instructionsFileForAgent(cfgAgent, p.workspace, p.providers),
 		ConfigDir:               configDir,
 		Env:                     cfgAgent.Env,
-	}, p.sessionTemplate, p.stderr, packDirs, fragments, p.beadStore)
+	}, p.sessionTemplate, p.stderr, packDirs, fragments, p.beadStore).Text
 	hasHooks := config.AgentHasHooks(cfgAgent, p.workspace, resolved.Name, p.providers)
 	suppressStartupPrompt := suppressStartupPromptForAgent(cfgAgent)
 	// The prime instruction tells a non-hook agent to go fetch its context.
