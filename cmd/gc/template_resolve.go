@@ -347,11 +347,11 @@ func resolveTemplate(p *agentBuildParams, cfgAgent *config.Agent, qualifiedName 
 			qualifiedName,
 		)
 	}
-	agentEnv["GC_BEADS"] = rawBeadsProviderForScope(rigRoot, p.cityPath)
+	agentEnv["GC_BEADS"] = p.resolveMemo.rawBeadsProvider(rigRoot, p.cityPath)
 	if exe, err := os.Executable(); err == nil && exe != "" {
 		agentEnv["GC_BIN"] = exe
 	}
-	sessionBackendEnv, err := sessionBackendEnvWithError(p.cityPath, rigRoot, p.rigs)
+	sessionBackendEnv, err := p.resolveMemo.sessionBackendEnv(p.cityPath, rigRoot, p.rigs)
 	if err != nil {
 		return TemplateParams{}, fmt.Errorf("agent %q: building session backend env: %w", qualifiedName, err)
 	}
@@ -394,7 +394,7 @@ func resolveTemplate(p *agentBuildParams, cfgAgent *config.Agent, qualifiedName 
 	// prompt template to render.
 	defaultBranch := ""
 	if cfgAgent.PromptTemplate != "" {
-		defaultBranch = defaultBranchForRig(rigName, p.rigs, workDir)
+		defaultBranch = p.resolveMemo.defaultBranchForRig(rigName, p.rigs, workDir)
 	}
 	topo := config.QueryTopology{}
 	if p.city != nil {

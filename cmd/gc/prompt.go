@@ -390,17 +390,24 @@ func defaultBranchFor(dir string) string {
 // rendering so polecats and the refinery target the rig's true mainline
 // even when origin/HEAD is unset on the local clone.
 func defaultBranchForRig(rigName string, rigs []config.Rig, dir string) string {
-	if rigName != "" {
-		for i := range rigs {
-			if rigs[i].Name == rigName {
-				if branch := rigs[i].EffectiveDefaultBranch(); branch != "" {
-					return branch
-				}
-				break
-			}
-		}
+	if branch := recordedRigDefaultBranch(rigName, rigs); branch != "" {
+		return branch
 	}
 	return defaultBranchFor(dir)
+}
+
+// recordedRigDefaultBranch returns the default branch the named rig records,
+// or "" when the rig is unknown or records none (the caller then probes git).
+func recordedRigDefaultBranch(rigName string, rigs []config.Rig) string {
+	if rigName == "" {
+		return ""
+	}
+	for i := range rigs {
+		if rigs[i].Name == rigName {
+			return rigs[i].EffectiveDefaultBranch()
+		}
+	}
+	return ""
 }
 
 // promptFuncMap returns template functions available in prompt templates.
