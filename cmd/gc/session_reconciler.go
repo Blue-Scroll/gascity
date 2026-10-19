@@ -2031,10 +2031,12 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 		return batch
 	}
 	phaseStart = startTickPhase()
+	var forwardLaps tickPhaseLaps
 	for i := range orderedRows {
 		if ctx != nil && ctx.Err() != nil {
 			return 0
 		}
+		forwardLaps.enter("prelude")
 		// The tick iterates the typed row feed by ID (§2.3): there is no raw *session
 		// pointer any more. infoByID is the coherent snapshot, refreshed by
 		// write-returns-Info folds after every mutation; every decision read and
@@ -2063,6 +2065,7 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 			continue
 		}
 
+		forwardLaps.enter("drain_stop_pending")
 		if handled, result := reconcileDrainAckStopPending(cityPath, cfg, sp, store, rigStores, info, tp, desired, dops, dt, asyncStopTracker, clk, rec, stderr); handled {
 			// finalizeDrainAckStoppedSession (inside reconcileDrainAckStopPending)
 			// may close the bead in memory (Status=closed) on this true/continue
@@ -2078,6 +2081,7 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 			continue
 		}
 
+		forwardLaps.enter("pool_slot_retire")
 		// Bound a pool slot stuck in drain (ga-rxhu2). Runs AFTER the drain-ack
 		// stop-pending handler above, which owns the state=draining population
 		// outright and continues before this point. What reaches here is the
@@ -2094,6 +2098,7 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 			continue
 		}
 
+		forwardLaps.enter("unknown_state")
 		// Skip beads with unrecognized states. This enables forward-compatible
 		// rollback: if a newer version writes "draining" or "archived", the
 		// older reconciler ignores those beads rather than crashing. The skip is
@@ -2117,6 +2122,7 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 			tick.apply(id, fold)
 		}
 
+		forwardLaps.enter("not_desired")
 		// Orphan/suspended: bead exists but not in desired state.
 		// Handle BEFORE heal/stability to avoid false crash detection —
 		// a running session that leaves the desired set is not a crash.
@@ -2811,6 +2817,7 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 			}
 		}
 
+		forwardLaps.enter("liveness")
 		// Liveness includes zombie detection: tmux session exists AND
 		// the expected child process is alive (when ProcessNames configured).
 		// The desired-session fast path only needs running/alive; attachment
@@ -2834,6 +2841,7 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 		}
 		recordResetStallIfDue(cityPath, store, sp, cfg, infoByID[id], tp.TemplateName, name, running, alive, startupTimeout, clk.Now().UTC(), dt, rec, stderr, trace)
 
+		forwardLaps.enter("zombie_and_pending_create")
 		// Zombie capture: session exists but process dead — grab scrollback for forensics.
 		// markProviderTerminalError persists + folds its write onto the snapshot in one
 		// step (write-returns-Info); on a persist error or empty reason it returns the
@@ -2964,6 +2972,7 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 			}
 		}
 
+		forwardLaps.enter("drain_ack")
 		// Drain-ack: agent signaled it's done (gc runtime drain-ack).
 		// Honor the ack even if the agent exited before this tick; otherwise
 		// the session falls through to orphan handling and can block the next
@@ -3167,6 +3176,7 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 			}
 		}
 
+		forwardLaps.enter("progress_stall")
 		// Progress-aware recycle (ADR-0013 Amendment A1, move 3b): a desired,
 		// alive session that has stopped progressing has likely parked (e.g. its
 		// turn ended on a provider auth error) and will not self-recover. Opt-in
@@ -3305,6 +3315,7 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 			}
 		}
 
+		forwardLaps.enter("restart_request")
 		// Restart-requested: agent asked for a fresh session
 		// (gc runtime request-restart / gc handoff). This runs after
 		// drain-ack handling, but before autonomous rate-limit,
@@ -3426,6 +3437,7 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 			}
 		}
 
+		forwardLaps.enter("heal_and_stability")
 		policy := resolveSessionSleepPolicyInfo(infoByID[id], cfg, sp)
 
 		rlNextFwd, rateLimitHit, rateLimitErr := checkRateLimitStability(infoByID[id], cfg, alive, dt, sessFront, clk, peek)
@@ -3556,6 +3568,7 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 			tick.apply(id, commitBatch)
 		}
 
+		forwardLaps.enter("config_drift")
 		// driftRestartedInPlace tracks whether the alive-restart branch ran
 		// the named-session in-place restart on this tick. Hoisted out of
 		// the inner block so the downstream asleep-named-session drift
@@ -3877,6 +3890,7 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 			}
 		}
 
+		forwardLaps.enter("asleep_drift_repair")
 		// Asleep-named-session drift repair. Skipped while an in-place
 		// restart is still leased in creating: the preserved
 		// started_config_hash intentionally points at the previous runtime
@@ -3942,6 +3956,7 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 			}
 		}
 
+		forwardLaps.enter("max_session_age")
 		// Preemptive max session age: restart sessions whose wall-clock age
 		// exceeds the agent's max_session_age threshold. Motivation: provider
 		// SDKs that cache credentials at session start (e.g., Claude Code via
@@ -4035,6 +4050,7 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 			}
 		}
 
+		forwardLaps.enter("idle_timeout")
 		// Idle timeout: restart sessions idle longer than configured threshold.
 		// Pass the agent template so the tracker can fall back to a per-template
 		// timeout for pool sessions whose bead-derived runtime names are not
@@ -4201,13 +4217,15 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 		// such writer's fold ahead of the append (or refresh the twin) if one is added.
 		wakeTargets = append(wakeTargets, wakeTarget{info: infoByID[id], tp: tp, alive: alive})
 	}
-	trace.RecordTickPhase(TraceSiteSessionReconcileForwardPass, "session_reconcile.forward_pass", phaseStart, map[string]any{
+	forwardFields := tickPhaseParts{
 		"ordered_session_count":  len(orderedRows),
 		"wake_target_count":      len(wakeTargets),
 		"rollback_count":         rollbacksThisTick,
 		"start_candidate_count":  len(startCandidates),
 		"assigned_work_bead_cnt": len(assignedWorkBeads),
-	})
+	}
+	forwardLaps.addTo(forwardFields)
+	trace.RecordTickPhase(TraceSiteSessionReconcileForwardPass, "session_reconcile.forward_pass", phaseStart, forwardFields)
 
 	if ctx != nil && ctx.Err() != nil {
 		return 0
@@ -4220,6 +4238,8 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 	// snapshot via write-returns-Info (STEP6-PREPASS-AUDIT groups 1-12), so the
 	// snapshot is already coherent here without re-projecting the raw beads.
 	phaseStart = startTickPhase()
+	var awakeLaps tickPhaseLaps
+	awakeLaps.enter("build_awake_input")
 	// Build the awake-scan domain from the coherent typed snapshot in orderedIDs
 	// (topo) order — load-bearing: ComputeAwakeSet resolves SessionName
 	// last-write-wins over a non-unique key, so map iteration order must not leak
@@ -4233,6 +4253,7 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 		cfg, cityPath, sessionInfos, poolDesired, namedSessionDemand, namedRoutedDemand, workSet, readyWaitSet,
 		assignedWorkBeads, reconcileOpts.readyAssignedFlags, wakeTargets, sp, clk.Now(),
 	)
+	awakeLaps.enter("compute_awake_set")
 	awakeDecisions := ComputeAwakeSet(awakeInput)
 	wakeEvals := awakeSetToWakeEvals(awakeDecisions, awakeInput.SessionBeads)
 
@@ -4242,6 +4263,7 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 	// This pass updates wakeEvals so selectIdleProbeTargets sees the correct
 	// ConfigSuppressed and Policy fields.
 	for _, target := range wakeTargets {
+		awakeLaps.enter("sleep_policy")
 		eval := wakeEvals[target.info.ID]
 		// Typed projection for this iteration's decision reads (session_name,
 		// pin_awake, template, sleep_intent). Refreshed from the snapshot: this is
@@ -4259,6 +4281,7 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 			wakeEvals[target.info.ID] = eval
 			continue
 		}
+		awakeLaps.enter("wake_suppression")
 		decision := awakeDecisions[name]
 		// Only a live runtime can raise an interaction, so a dead target never
 		// skips config suppression on a probe that could not answer.
@@ -4297,20 +4320,24 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 		wakeEvals[target.info.ID] = eval
 	}
 
+	awakeLaps.enter("select_idle_probes")
 	idleProbeTargets := selectIdleProbeTargets(wakeTargets, wakeEvals, dt, infoByID, clk.Now())
 	for _, target := range wakeTargets {
 		if _, deferred := runtimeObservationErrors[infoByID[target.info.ID].SessionNameMetadata]; deferred {
 			delete(idleProbeTargets, target.info.ID)
 		}
 	}
+	awakeLaps.enter("launch_idle_probes")
 	launchIdleProbes(ctx, idleProbeTargets, wakeTargets, dt, sp, clk, infoByID)
-	trace.RecordTickPhase(TraceSiteSessionReconcileAwakeSet, "session_reconcile.compute_awake_set_and_idle_probes", phaseStart, map[string]any{
+	awakeFields := tickPhaseParts{
 		"wake_target_count":      len(wakeTargets),
 		"idle_probe_target_cnt":  len(idleProbeTargets),
 		"awake_decision_count":   len(awakeDecisions),
 		"awake_eval_count":       len(wakeEvals),
 		"assigned_work_bead_cnt": len(assignedWorkBeads),
-	})
+	}
+	awakeLaps.addTo(awakeFields)
+	trace.RecordTickPhase(TraceSiteSessionReconcileAwakeSet, "session_reconcile.compute_awake_set_and_idle_probes", phaseStart, awakeFields)
 
 	phaseStart = startTickPhase()
 	for _, target := range wakeTargets {

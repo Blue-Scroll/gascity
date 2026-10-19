@@ -75,3 +75,70 @@ func (p tickPhaseParts) record(name string, start tickPhaseStart) {
 	p[name+"_ms"] = start.elapsed().Milliseconds()
 	p[name+"_bd_calls"] = beads.ReadBDExecTotals().Since(start.bd).Calls
 }
+
+// tickPhaseLaps splits a tick phase into named regions when the phase is a
+// loop that leaves its turns early. Call enter(name) where each region
+// begins: it closes the region that was open and opens the new one. Call
+// addTo once after the loop to close the last region and write the totals.
+//
+// Each region adds three fields, summed over every turn of the loop:
+// <name>_ms, <name>_bd_calls, and <name>_max_ms, the slowest single turn
+// spent in it. So a slow phase says which region was slow, whether it was
+// paying for bd calls, and whether one session or all of them made it slow.
+//
+// Use it instead of tickPhaseParts when a turn can `continue` out of the
+// middle. A `continue` needs no extra call: the time stays charged to the
+// region the turn was in, and the next turn's first enter closes it. No time
+// in the phase goes uncounted. The forward pass is the first user: one loop
+// of about 2,000 lines, with a `continue` in most of its blocks, timed as one
+// 8 s median number with bd_ms near 0 (vn-m4h54cp).
+//
+// Durations add up in nanoseconds and become milliseconds only in addTo, so
+// a region run 100 times at 0.4 ms each reads 40, not 0.
+type tickPhaseLaps struct {
+	open    string
+	start   tickPhaseStart
+	regions map[string]*tickPhaseLap
+}
+
+type tickPhaseLap struct {
+	elapsed time.Duration
+	slowest time.Duration
+	bdCalls int64
+}
+
+// enter closes the open region, if any, and opens the region called name.
+func (l *tickPhaseLaps) enter(name string) {
+	l.closeOpen()
+	l.open = name
+	l.start = startTickPhase()
+}
+
+func (l *tickPhaseLaps) closeOpen() {
+	if l.open == "" {
+		return
+	}
+	if l.regions == nil {
+		l.regions = map[string]*tickPhaseLap{}
+	}
+	lap := l.regions[l.open]
+	if lap == nil {
+		lap = &tickPhaseLap{}
+		l.regions[l.open] = lap
+	}
+	elapsed := l.start.elapsed()
+	lap.elapsed += elapsed
+	lap.slowest = max(lap.slowest, elapsed)
+	lap.bdCalls += beads.ReadBDExecTotals().Since(l.start.bd).Calls
+	l.open = ""
+}
+
+// addTo closes the open region and writes every region's totals into fields.
+func (l *tickPhaseLaps) addTo(fields tickPhaseParts) {
+	l.closeOpen()
+	for name, lap := range l.regions {
+		fields[name+"_ms"] = lap.elapsed.Milliseconds()
+		fields[name+"_max_ms"] = lap.slowest.Milliseconds()
+		fields[name+"_bd_calls"] = lap.bdCalls
+	}
+}

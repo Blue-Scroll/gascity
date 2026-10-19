@@ -64,3 +64,66 @@ func TestTickPhasePartsTimesEachPart(t *testing.T) {
 		}
 	}
 }
+
+// TestTickPhaseLapsChargesAContinueToItsRegion proves a turn that leaves the
+// loop early keeps its time and its bd calls in the region it was in, that
+// each region sums over every turn, and that the slowest turn is kept apart.
+func TestTickPhaseLapsChargesAContinueToItsRegion(t *testing.T) {
+	t.Setenv("GC_BD_TRACE_JSON", "")
+	var laps tickPhaseLaps
+	for i := range 3 {
+		laps.enter("prelude")
+		laps.enter("slow")
+		beads.TraceBDCall("go:test", t.TempDir(), []string{"list"}, time.Now(), 0, nil)
+		time.Sleep(2 * time.Millisecond)
+		if i < 2 {
+			continue
+		}
+		laps.enter("tail")
+	}
+	fields := tickPhaseParts{"ordered_session_count": 3}
+	laps.addTo(fields)
+
+	if ms, _ := fields["slow_ms"].(int64); ms < 6 {
+		t.Fatalf("slow_ms = %v, want at least 6 (3 turns of 2ms, 2 of them via continue)", fields["slow_ms"])
+	}
+	if ms, _ := fields["slow_max_ms"].(int64); ms < 2 {
+		t.Fatalf("slow_max_ms = %v, want at least 2", fields["slow_max_ms"])
+	}
+	if calls, _ := fields["slow_bd_calls"].(int64); calls < 3 {
+		t.Fatalf("slow_bd_calls = %v, want at least 3", fields["slow_bd_calls"])
+	}
+	for _, key := range []string{"prelude_ms", "prelude_max_ms", "prelude_bd_calls", "tail_ms", "tail_max_ms", "tail_bd_calls"} {
+		if _, ok := fields[key].(int64); !ok {
+			t.Fatalf("%s missing or not int64: %#v", key, fields)
+		}
+	}
+	if fields["ordered_session_count"] != 3 {
+		t.Fatalf("caller field lost: %#v", fields)
+	}
+}
+
+// TestTickPhaseLapsSumsBeforeRounding proves many sub-millisecond laps add up
+// instead of each rounding down to 0 ms.
+func TestTickPhaseLapsSumsBeforeRounding(t *testing.T) {
+	var laps tickPhaseLaps
+	for range 10 {
+		laps.enter("short")
+		time.Sleep(300 * time.Microsecond)
+	}
+	fields := tickPhaseParts{}
+	laps.addTo(fields)
+	if ms, _ := fields["short_ms"].(int64); ms < 3 {
+		t.Fatalf("short_ms = %v, want at least 3 (10 laps of 0.3ms)", fields["short_ms"])
+	}
+}
+
+// TestTickPhaseLapsWithNoRegions proves a loop that never ran writes nothing.
+func TestTickPhaseLapsWithNoRegions(t *testing.T) {
+	var laps tickPhaseLaps
+	fields := tickPhaseParts{"wake_target_count": 0}
+	laps.addTo(fields)
+	if len(fields) != 1 {
+		t.Fatalf("empty laps wrote fields: %#v", fields)
+	}
+}
