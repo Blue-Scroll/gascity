@@ -88,6 +88,11 @@ type poolLimits struct {
 }
 
 type sessionInfo struct {
+	// ID is the session bead id that every /session/{id} route takes. A
+	// client uses it to open a session straight from an agent row, with no
+	// sessions list in between. Empty when the runtime session carries no
+	// GC_SESSION_ID.
+	ID           string     `json:"id,omitempty"`
 	Name         string     `json:"name"`
 	LastActivity *time.Time `json:"last_activity,omitempty"`
 	Attached     bool       `json:"attached"`

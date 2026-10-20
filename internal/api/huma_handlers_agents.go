@@ -212,6 +212,7 @@ func (s *Server) humaHandleAgentList(ctx context.Context, input *AgentListInput)
 				} else if id, err := sp.GetMeta(sessionName, "GC_SESSION_ID"); err == nil {
 					sessionID = strings.TrimSpace(id)
 				}
+				si.ID = sessionID
 			}
 
 			resp.ActiveBead = activeBeads.lookup(ea.rig, sessionID, sessionName, ea.qualifiedName)
@@ -357,6 +358,7 @@ func (s *Server) agentByName(name string) (*IndexOutput[agentResponse], error) {
 		if id, err := sp.GetMeta(sessionName, "GC_SESSION_ID"); err == nil {
 			sessionID = strings.TrimSpace(id)
 		}
+		si.ID = sessionID
 	}
 
 	resp.ActiveBead = s.findLiveActiveBeadForAssignees(agentCfg.Dir, sessionID, sessionName, name)
