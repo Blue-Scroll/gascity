@@ -17,38 +17,31 @@ import (
 	"github.com/gastownhall/gascity/internal/runtime"
 )
 
-// humaHandleAgentList is the Huma-typed handler for GET /v0/agents.
-// Overlapping identical requests share one build (shareListBuild). The
-// response cache below only helps a request that arrives after a build has
-// finished; on a busy city a crowd of requests arrived together, missed it,
-// and each built its own list for minutes.
+// humaHandleAgentList is the Huma-typed handler for GET /v0/agents. It
+// answers through boundedListBuild, so a slow bead store never holds the
+// roster back: a dashboard shows who is running at once, and the bead
+// details fill in when the store read lands. Overlapping identical requests
+// share one build. The response cache in buildAgentList only helps a request
+// that arrives after a build has finished; on a busy city a crowd of requests
+// arrived together, missed it, and each built its own list for minutes.
 func (s *Server) humaHandleAgentList(ctx context.Context, input *AgentListInput) (*ListOutput[agentResponse], error) {
 	bp := input.toBlockingParams()
 	if bp.isBlocking() {
 		waitForChange(ctx, s.state.EventProvider(), bp)
 	}
-	return shareListBuild(&s.listBuildFlight, cacheKeyFor("agents", input), func() (*ListOutput[agentResponse], error) {
-		return s.buildAgentList(input), nil
-	})
+	return boundedListBuild(&s.listBuilds, cacheKeyFor("agents", input),
+		func() (*ListOutput[agentResponse], error) { return s.buildAgentList(input), nil },
+		func() *ListOutput[agentResponse] { return s.agentListFromRuntime(input) })
 }
 
-// buildAgentList does the work of one GET /agents request.
+// buildAgentList does the work of one full GET /agents request. It reads the
+// bead store, so call it through boundedListBuild.
 func (s *Server) buildAgentList(input *AgentListInput) *ListOutput[agentResponse] {
 	index := s.latestIndex()
-
 	cfg := s.state.Config()
-	sp := s.state.SessionProvider()
-	cityName := s.state.CityName()
-	sessTmpl := cfg.Workspace.SessionTemplate
-	wantPeek := input.Peek
-
-	// Raw config drives accurate provenance detection (pack-derived vs.
-	// city-native). Optional capability: when absent, agentOrigin falls
-	// back to the patch-presence heuristic.
-	rawCfg := s.rawConfig()
 
 	cacheKey := ""
-	if !wantPeek {
+	if !input.Peek {
 		// Cache key derived from input struct tags — adding a new query
 		// param to AgentListInput automatically participates in the key.
 		// The list projects the config, whose swaps do not advance the
@@ -67,10 +60,60 @@ func (s *Server) buildAgentList(input *AgentListInput) *ListOutput[agentResponse
 		}
 	}
 
-	// Active graph-resident work, indexed once per request by agent session
-	// name (nil on a single-store city). Computed after the cache-hit return
-	// so a cached response never pays for the graph-store list.
-	graphWork := s.graphActiveWorkBySession()
+	// Computed after the cache-hit return so a cached response never pays
+	// for the store reads.
+	body := s.agentListBody(input, cfg, &agentStoreReads{
+		graphWork:   s.graphActiveWorkBySession(),
+		activeBeads: s.newActiveBeadIndex(),
+	})
+	// A partial list reflects a transient backend failure; don't serve it
+	// from cache once the backend recovers.
+	if cacheKey != "" && !body.Partial {
+		s.storeResponse(cacheKey, index, body)
+	}
+	return &ListOutput[agentResponse]{
+		Index: index,
+		Body:  body,
+	}
+}
+
+// agentListFromRuntime is GET /agents built from config and the runtime
+// alone. It never reads the bead store, so it is what boundedListBuild
+// answers while the store is slow. It is never put in the response cache: it
+// is missing details a full list has.
+func (s *Server) agentListFromRuntime(input *AgentListInput) *ListOutput[agentResponse] {
+	return &ListOutput[agentResponse]{
+		Index: s.latestIndex(),
+		Body:  s.agentListBody(input, s.state.Config(), nil),
+	}
+}
+
+// agentStoreReads is what the agent rows read from the bead store: active
+// graph-resident work by session name (nil on a single-store city), and each
+// rig's in-progress beads. A nil *agentStoreReads builds the rows without the
+// store; see agentListFromRuntime.
+type agentStoreReads struct {
+	graphWork   map[string]graphAgentWork
+	activeBeads *activeBeadIndex
+}
+
+// agentListBody builds the GET /agents rows. reads is nil for the store-free
+// list, and then it makes no bead store call at all.
+func (s *Server) agentListBody(input *AgentListInput, cfg *config.City, reads *agentStoreReads) ListBody[agentResponse] {
+	sp := s.state.SessionProvider()
+	cityName := s.state.CityName()
+	sessTmpl := cfg.Workspace.SessionTemplate
+	wantPeek := input.Peek
+
+	// Raw config drives accurate provenance detection (pack-derived vs.
+	// city-native). Optional capability: when absent, agentOrigin falls
+	// back to the patch-presence heuristic.
+	rawCfg := s.rawConfig()
+
+	var graphWork map[string]graphAgentWork
+	if reads != nil {
+		graphWork = reads.graphWork
+	}
 
 	// Optional batch extensions: providers whose per-session attribute reads
 	// are otherwise expensive (e.g. one subprocess fork per call, per agent)
@@ -87,8 +130,6 @@ func (s *Server) buildAgentList(input *AgentListInput) *ListOutput[agentResponse
 	}
 	envBatch, _ := sp.(runtime.EnvironmentBatchProvider)
 
-	// One read per bead store for the whole list, not one per row.
-	activeBeads := s.newActiveBeadIndex()
 	// Every unlimited pool shares one session listing per request.
 	runningSessions := &runningSessionsOnce{sp: sp}
 
@@ -226,7 +267,10 @@ func (s *Server) buildAgentList(input *AgentListInput) *ListOutput[agentResponse
 				si.ID = sessionID
 			}
 
-			resp.ActiveBead = activeBeads.lookup(ea.rig, sessionID, sessionName, ea.qualifiedName)
+			// One read per bead store for the whole list, not one per row.
+			if reads != nil {
+				resp.ActiveBead = reads.activeBeads.lookup(ea.rig, sessionID, sessionName, ea.qualifiedName)
+			}
 			// A relocated-graph wisp names its assignee after the session, not
 			// the work store, so the work-store lookup above misses it. Fall
 			// back to the graph bead and use its timestamp as the activity
@@ -242,6 +286,12 @@ func (s *Server) buildAgentList(input *AgentListInput) *ListOutput[agentResponse
 			}
 			quarantined := s.state.IsQuarantined(sessionName)
 			resp.State = computeAgentState(suspended, quarantined, effectiveRunning, resp.ActiveBead, lastActivity)
+			if reads == nil && resp.State == "idle" {
+				// computeAgentState reads "no active bead" as idle. Without a
+				// store read the bead is unknown, not absent, so a live agent
+				// says "running": true, and it makes no claim about its work.
+				resp.State = "running"
+			}
 
 			if wantPeek && running {
 				if output, err := sp.Peek(sessionName, 5); err == nil {
@@ -249,7 +299,10 @@ func (s *Server) buildAgentList(input *AgentListInput) *ListOutput[agentResponse
 				}
 			}
 
-			if running && provider == "claude" && canAttributeSession(a, ea.qualifiedName, cfg, s.state.CityPath()) {
+			// enrichSessionMeta resolves the session id through the bead
+			// store, so the store-free list leaves model and context for the
+			// full list.
+			if reads != nil && running && provider == "claude" && canAttributeSession(a, ea.qualifiedName, cfg, s.state.CityPath()) {
 				s.enrichSessionMeta(&resp, a, ea.qualifiedName)
 			}
 
@@ -261,21 +314,11 @@ func (s *Server) buildAgentList(input *AgentListInput) *ListOutput[agentResponse
 		agents = []agentResponse{}
 	}
 
-	body := ListBody[agentResponse]{
+	return ListBody[agentResponse]{
 		Items:         agents,
 		Total:         len(agents),
 		Partial:       len(partialErrors) > 0,
 		PartialErrors: partialErrors,
-	}
-	// A partial list reflects a transient backend failure; don't serve it
-	// from cache once the backend recovers.
-	if cacheKey != "" && !body.Partial {
-		s.storeResponse(cacheKey, index, body)
-	}
-
-	return &ListOutput[agentResponse]{
-		Index: index,
-		Body:  body,
 	}
 }
 
