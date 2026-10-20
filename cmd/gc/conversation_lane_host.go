@@ -300,6 +300,12 @@ type conversationLaneHost struct {
 	lastErr      string
 	quarantined  map[string][]string
 	waits        map[string]laneConversationWaits
+	// noticeFailures tallies, per planner notice action (an attempt's
+	// proposal or a reminder's read, plannerNoticeTallyKey), its failures in
+	// a row; nil until the first. An entry is deleted when its action
+	// succeeds or its attempt is spent; one whose reminder is dropped before
+	// either stays for the host's life, a few bytes.
+	noticeFailures map[string]*laneNoticeFailures
 }
 
 // laneWorker is one conversation's slot; poke wakes its worker.
