@@ -78,6 +78,8 @@ func (s *Server) humaHandleAgentList(ctx context.Context, input *AgentListInput)
 
 	// One read per bead store for the whole list, not one per row.
 	activeBeads := s.newActiveBeadIndex()
+	// Every unlimited pool shares one session listing per request.
+	runningSessions := &runningSessionsOnce{sp: sp}
 
 	var agents []agentResponse
 	var partialErrors []string
@@ -85,7 +87,7 @@ func (s *Server) humaHandleAgentList(ctx context.Context, input *AgentListInput)
 		// Provenance is a property of the declared agent, shared by every
 		// pool-expanded instance, so compute it once per source agent.
 		pack, packDerived := agentPackProvenance(a, rawCfg, cfg)
-		expanded, expandErr := expandAgentChecked(a, cityName, sessTmpl, sp, cfg.NamedSessions)
+		expanded, expandErr := expandAgentChecked(a, cityName, sessTmpl, runningSessions, cfg.NamedSessions)
 		// A runtime server that is not running at all (tmux before its first
 		// session) has no sessions; that is a complete answer, not a failure.
 		if runtime.IsRuntimeServerAbsent(expandErr) {
