@@ -3,9 +3,9 @@ import type {
   PendingInteraction,
   RespondSessionResponse,
   SessionRespondInputBody,
+  SessionResponse,
 } from 'gas-city-dashboard-shared/gc-supervisor';
 import { activeCityOrThrow } from '../api/cityBase';
-import { agentSessionId } from './agentReads';
 import { supervisorApi } from './client';
 
 export interface AgentPendingInteraction {
@@ -15,19 +15,18 @@ export interface AgentPendingInteraction {
   pending: PendingInteraction;
 }
 
-/**
- * Ask each live agent's session whether it waits on the operator.
- * `sessionIdsByName` is agentSessionId's fallback; most rows carry their id.
- */
 export async function listAgentPendingInteractions(
   agents: readonly AgentResponse[],
-  sessionIdsByName?: ReadonlyMap<string, string>,
+  sessions: readonly SessionResponse[],
 ): Promise<AgentPendingInteraction[]> {
   const cityName = activeCityOrThrow('list agent pending interactions');
+  const sessionIdsByName = sessionIdByName(sessions);
   const candidates = agents.flatMap((agent) => {
-    const sessionId = agentSessionId(agent, sessionIdsByName);
-    if (agent.session === undefined || sessionId === undefined) return [];
-    return [{ agentName: agent.name, sessionId, sessionName: agent.session.name }];
+    const sessionName = agent.session?.name;
+    if (sessionName === undefined) return [];
+    const sessionId = sessionIdsByName.get(sessionName);
+    if (sessionId === undefined) return [];
+    return [{ agentName: agent.name, sessionId, sessionName }];
   });
 
   const pending = await Promise.all(
@@ -52,6 +51,15 @@ export function attachCommand(agentName: string): string {
   return `gc agent attach ${shellToken(agentName)}`;
 }
 
+function sessionIdByName(sessions: readonly SessionResponse[]): Map<string, string> {
+  const out = new Map<string, string>();
+  for (const session of sessions) {
+    if (session.session_name !== undefined) {
+      out.set(session.session_name, session.id);
+    }
+  }
+  return out;
+}
 function shellToken(value: string): string {
   if (/^[A-Za-z0-9_./:-]+$/.test(value)) return value;
   return `'${value.replaceAll("'", "'\\''")}'`;

@@ -116,58 +116,51 @@ jobs:
 
   dashboard:
     # The dashboard gc embeds (internal/api/dashboardspa). Since phone dashboard
-    # F1 (vn-9kvo79d) the page is FROZEN on this fork. It moved to its own repo,
-    # Blue-Scroll/gascity-dashboard, so web/ and dist/ must not change here.
+    # D1 (vn-1aqg3z8) this fork embeds UPSTREAM's page, unchanged. The town's
+    # phone page lives in its own repo, Blue-Scroll/gascity-dashboard, so web/
+    # and dist/ must not change here.
     #
     # This job checks two things:
-    #   1. web/ and dist/ still have the git tree hashes PAGE_FROZEN pins.
+    #   1. web/ and dist/ are exactly upstream's, at the commit this branch
+    #      shares with upstream main (its merge base).
     #   2. The Go around the page still passes: the embedded handler (and its
     #      helper-path 404) and the BFF.
     #
-    # It used to also run npm ci, vitest and `make dashboard-ci`. They were
-    # dropped on purpose (design T45). `make dashboard-ci` fails when the page's
-    # generated API client differs from one made fresh from openapi.json. With
-    # the page frozen, the only fix for that is an edit under web/, which check 1
-    # refuses. So every gc change to the API spec, and every upstream merge,
-    # would go red with no way to go green. Do not add them back while
-    # PAGE_FROZEN exists.
+    # Check 1 needs no pinned file. A clean upstream merge moves the merge base
+    # and brings upstream's page with it, so it stays green with no re-pin. Any
+    # page edit made on this fork goes red. (Before D1 the page was frozen at
+    # town's own trees by a PAGE_FROZEN file; D1 deleted it.)
     #
-    # The cost, said plainly: while frozen, a gc API change leaves gc's own
-    # embedded page one change behind. The page in gascity-dashboard is the one
-    # that keeps up.
-    #
-    # D1 deletes PAGE_FROZEN and swaps check 1 for a merge-base diff against
-    # upstream, in the same commit.
+    # It does not run npm ci, vitest or `make dashboard-ci` (design T45). Those
+    # test the page, and the page is upstream's: upstream's own CI tests it.
+    # The fork's ci.yml is left exactly as upstream wrote it. Here,
+    # `make dashboard-ci` would go red whenever a gc API change on town
+    # leaves upstream's generated client behind, and the only fix would be the
+    # page edit check 1 refuses.
     if: ${{ github.repository != 'gastownhall/gascity' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
-      - name: The page is frozen (web/ and dist/ match PAGE_FROZEN, vn-9kvo79d)
-        # No history is needed: `git rev-parse HEAD:<path>` reads the tree hash
-        # straight from the checked-out commit.
+        with:
+          # The merge base needs history. blob:none keeps it to commits and
+          # trees, so the clone stays small.
+          fetch-depth: 0
+          filter: blob:none
+      - name: The page is upstream's (web/ and dist/ match the upstream merge base, vn-1aqg3z8)
+        # Write both paths out. An unquoted $var holding two paths splits in
+        # bash but not in zsh, where the same line pasted by hand passes on any
+        # tree (phone dashboard SP1, vn-rsalas6).
         run: |
-          pin=internal/api/dashboardspa/PAGE_FROZEN
-          if [ ! -f "$pin" ]; then
-            echo "::error file=$pin::$pin is missing. Only D1 may delete it, in the same commit that replaces this step."
-            exit 1
+          git remote add upstream https://github.com/gastownhall/gascity.git
+          git fetch --quiet --filter=blob:none upstream main
+          base=$(git merge-base HEAD upstream/main)
+          if git diff --quiet "$base" HEAD -- internal/api/dashboardspa/web internal/api/dashboardspa/dist; then
+            echo "ok: web/ and dist/ match upstream at the merge base $base"
+            exit 0
           fi
-          fail=0
-          for key in web dist; do
-            want=$(awk -v k="$key" '$1 == k && $2 == "=" { print $3 }' "$pin")
-            if ! printf '%s' "$want" | grep -Eq '^[0-9a-f]{40}$'; then
-              echo "::error file=$pin::$pin must have exactly one '$key = <40 hex>' line."
-              fail=1
-              continue
-            fi
-            have=$(git rev-parse "HEAD:internal/api/dashboardspa/$key")
-            if [ "$have" = "$want" ]; then
-              echo "ok: $key/ is still the frozen tree $want"
-            else
-              echo "::error::internal/api/dashboardspa/$key/ changed (tree $have, frozen at $want). The page is frozen on this fork: make page changes in Blue-Scroll/gascity-dashboard, and keep town's $key/ as it is when taking upstream."
-              fail=1
-            fi
-          done
-          exit "$fail"
+          echo "::error::internal/api/dashboardspa/web/ or dist/ differs from upstream at the merge base $base. This fork embeds upstream's page unchanged: make page changes in Blue-Scroll/gascity-dashboard, and take upstream's web/ and dist/ as they are when merging upstream."
+          git diff --stat "$base" HEAD -- internal/api/dashboardspa/web internal/api/dashboardspa/dist | tail -20
+          exit 1
       - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
         with:
           go-version-file: go.mod

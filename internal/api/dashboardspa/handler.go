@@ -81,6 +81,16 @@ func NewStaticHandler() (http.Handler, error) {
 	if err != nil {
 		return nil, fmt.Errorf("dashboardspa: sub fs: %w", err)
 	}
+	return newStaticHandler(sub)
+}
+
+// newStaticHandler serves the page from any file tree shaped like dist/.
+// NewStaticHandler passes the embedded bundle. A test passes a small fixture
+// when it needs a file the embedded bundle does not have: upstream's dist/ has
+// no manifest.webmanifest, and this fork embeds upstream's dist/ since phone
+// dashboard D1 (vn-1aqg3z8). The phone page now ships from
+// Blue-Scroll/gascity-dashboard.
+func newStaticHandler(sub fs.FS) (http.Handler, error) {
 	indexBytes, err := fs.ReadFile(sub, "index.html")
 	if err != nil {
 		return nil, fmt.Errorf("dashboardspa: read index.html: %w", err)

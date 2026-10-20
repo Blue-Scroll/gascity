@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"testing/fstest"
 )
 
 func newHandler(t *testing.T) http.Handler {
@@ -94,10 +95,21 @@ func TestPhoneClientRoutesServeTheShell(t *testing.T) {
 	}
 }
 
+// The embedded dist/ is upstream's since phone dashboard D1 (vn-1aqg3z8), and
+// it has no manifest.webmanifest. So this test builds the handler on a fixture
+// that has one. It still covers the handler's .webmanifest branch, which Go's
+// own type table would otherwise send as text/plain.
 func TestManifestIsServedAsAManifest(t *testing.T) {
-	rec := get(t, newHandler(t), "/manifest.webmanifest")
+	h, err := newStaticHandler(fstest.MapFS{
+		"index.html":           {Data: []byte(`<html><body><div id="root"></div></body></html>`)},
+		"manifest.webmanifest": {Data: []byte(`{"name":"Gas City"}`)},
+	})
+	if err != nil {
+		t.Fatalf("newStaticHandler: %v", err)
+	}
+	rec := get(t, h, "/manifest.webmanifest")
 	if rec.Code != http.StatusOK {
-		t.Fatalf("GET /manifest.webmanifest: status = %d, want 200 (is dist/ rebuilt?)", rec.Code)
+		t.Fatalf("GET /manifest.webmanifest: status = %d, want 200", rec.Code)
 	}
 	if ct := rec.Header().Get("Content-Type"); ct != "application/manifest+json" {
 		t.Errorf("manifest Content-Type = %q, want application/manifest+json", ct)
