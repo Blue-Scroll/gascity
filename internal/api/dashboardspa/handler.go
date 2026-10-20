@@ -32,13 +32,14 @@ var reservedPrefixes = []string{
 
 // sidecarPaths are never served by gc. A deployment can put its own reverse
 // proxy in front of gc and send these paths to small local helpers instead:
-// /upload, /pane, /keys and /file to an attachment and pane service, and
-// /term/ to a browser terminal. A request for one of them only reaches gc
-// when nothing in front of gc serves it.
+// /upload, /pane, /keys, /file and /commands to an attachment and pane
+// service, and /term/ to a browser terminal. A request for one of them only
+// reaches gc when nothing in front of gc serves it.
 //
 // gc answers those with 404 so a page can probe for a helper: it asks for the
-// path once and hides the matching control (attach, live pane, terminal link)
-// when the answer is not a success. If gc handed back the SPA shell instead
+// path once and hides the matching control (attach, live pane, terminal link),
+// or for /commands offers its built-in slash commands alone, when the answer
+// is not a success. If gc handed back the SPA shell instead
 // (200, HTML), every probe would read as "served", and a plain supervisor
 // with no proxy would show controls that can only fail.
 //
@@ -49,6 +50,7 @@ var sidecarPaths = []string{
 	"/pane",
 	"/keys",
 	"/file",
+	"/commands",
 	"/term",
 }
 
