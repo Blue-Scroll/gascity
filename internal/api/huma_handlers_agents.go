@@ -76,6 +76,9 @@ func (s *Server) humaHandleAgentList(ctx context.Context, input *AgentListInput)
 	}
 	envBatch, _ := sp.(runtime.EnvironmentBatchProvider)
 
+	// One read per bead store for the whole list, not one per row.
+	activeBeads := s.newActiveBeadIndex()
+
 	var agents []agentResponse
 	var partialErrors []string
 	for _, a := range cfg.Agents {
@@ -209,7 +212,7 @@ func (s *Server) humaHandleAgentList(ctx context.Context, input *AgentListInput)
 				}
 			}
 
-			resp.ActiveBead = s.findActiveBeadForAssignees(ea.rig, sessionID, sessionName, ea.qualifiedName)
+			resp.ActiveBead = activeBeads.lookup(ea.rig, sessionID, sessionName, ea.qualifiedName)
 			// A relocated-graph wisp names its assignee after the session, not
 			// the work store, so the work-store lookup above misses it. Fall
 			// back to the graph bead and use its timestamp as the activity
