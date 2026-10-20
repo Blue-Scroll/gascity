@@ -1392,7 +1392,7 @@ func (e *opsEnv) seedOpAt(t *testing.T, conv, key, text string, executor opjourn
 	op, created, err := st.Propose(opjournal.Request{
 		Conversation: conv, Kind: opjournal.KindMessage, Executor: executor, ClientKey: key,
 		Producer: opjournal.Producer{Principal: legacyop.PrincipalOperator, Actor: opjournal.ActorOperator},
-		Payload:  text, Policy: messageOpPolicy(session.SubmitIntentDefault),
+		Payload:  text, Policy: MessageOpPolicy(session.SubmitIntentDefault),
 		StartBy: now.Add(legacyop.ExecutionBound), FinishBy: now.Add(legacyop.ExecutionBound),
 	})
 	if err != nil || !created {
@@ -1782,18 +1782,19 @@ func TestMessageOpOutcomesMapBothWays(t *testing.T) {
 		{"interrupt unsupported", false, fmt.Errorf("x: %w", session.ErrTurnInterruptUnsupported), opjournal.ArmFailed, opjournal.ReasonUnsupported, "", turnInterruptUnsupportedCode, turnInterruptUnsupportedCode},
 		{"closed", false, fmt.Errorf("x: %w", session.ErrSessionClosed), opjournal.ArmSkipped, opjournal.ReasonConversationClosed, "", "resolve_failed", "resolve_failed"},
 		{"gone", false, fmt.Errorf("x: %w", session.ErrSessionNotFound), opjournal.ArmFailed, opjournal.ReasonSessionGone, "", "resolve_failed", "resolve_failed"},
+		{"runtime gone", false, fmt.Errorf("x: %w", runtime.ErrSessionNotFound), opjournal.ArmFailed, opjournal.ReasonSessionGone, "", "resolve_failed", "resolve_failed"},
 		{"runtime unavailable", false, fmt.Errorf("x: %w", runtime.ErrRuntimeUnavailable), opjournal.ArmFailed, opjournal.ReasonProviderUnavailable, "", "submit_failed", "message_failed"},
 		{"timeout", false, messageTimeoutError{}, opjournal.ArmFailed, opjournal.ReasonDeadlineInFlight, "", "timeout", "timeout"},
 		{"other", false, errors.New("boom"), opjournal.ArmFailed, opjournal.ReasonOther, "", "submit_failed", "message_failed"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			res := messageOpResult(tc.queued, tc.err, nil)
+			res := MessageOpResult(tc.queued, tc.err, nil)
 			if res.Outcome.Arm != tc.arm || res.Outcome.Reason != tc.reason || res.Outcome.Result.Via != tc.via || res.LeaveOpen {
 				t.Fatalf("result = %+v", res)
 			}
 			op := opjournal.Op{
 				ID: "gc-op-1", Conversation: "gc-1", Kind: opjournal.KindMessage, Status: opjournal.StatusClosed, Outcome: res.Outcome,
-				Policy: messageOpPolicy(session.SubmitIntentFollowUp),
+				Policy: MessageOpPolicy(session.SubmitIntentFollowUp),
 			}
 			for _, ep := range []struct{ operation, code, success string }{
 				{RequestOperationSessionSubmit, tc.submitCode, events.RequestResultSessionSubmit},
@@ -1836,10 +1837,10 @@ func TestMessageOpOutcomesMapBothWays(t *testing.T) {
 		})
 	}
 	unfenced := &session.TurnInterruptReport{Outcome: session.TurnInterruptSettled, Degradation: session.DegradationUnfencedInterrupt}
-	if res := messageOpResult(false, nil, unfenced); res.Outcome.Degradation != session.DegradationUnfencedInterrupt {
+	if res := MessageOpResult(false, nil, unfenced); res.Outcome.Degradation != session.DegradationUnfencedInterrupt {
 		t.Fatalf("unfenced interrupt outcome = %+v", res.Outcome)
 	}
-	if res := messageOpResult(false, errors.New("x"), unfenced); res.Outcome.Degradation != "" {
+	if res := MessageOpResult(false, errors.New("x"), unfenced); res.Outcome.Degradation != "" {
 		t.Fatalf("a failed delivery carries a degradation: %+v", res.Outcome)
 	}
 }
@@ -2664,13 +2665,14 @@ func TestClientSubmitSessionWithKeyAndReplays(t *testing.T) {
 		wantErr string
 		queued  bool
 		replay  string
+		opID    string
 	}{
 		{name: "no key", answer: map[string]any{"status": "accepted", "request_id": "req-1", "event_cursor": "3"}, stream: true},
-		{name: "keyed, live", key: "key-1", answer: map[string]any{
+		{name: "keyed, live", key: "key-1", opID: "gc-op-a", answer: map[string]any{
 			"status": "accepted", "request_id": "gc-op-a", "event_cursor": "3",
 			"idempotency_key": "key-1", "op": map[string]any{"id": "gc-op-a", "conversation": "sess-1", "kind": "message", "status": "submitted"},
 		}, stream: true},
-		{name: "keyed, replayed success", key: "key-2", queued: true, replay: "replayed: operation gc-op-b already closed succeeded; " + replayOptionsNote, answer: map[string]any{
+		{name: "keyed, replayed success", key: "key-2", queued: true, opID: "gc-op-b", replay: "replayed: operation gc-op-b already closed succeeded; " + replayOptionsNote, answer: map[string]any{
 			"status": "accepted", "request_id": "gc-op-b", "event_cursor": "3",
 			"replayed": true, "op": map[string]any{
 				"id": "gc-op-b", "conversation": "sess-1", "kind": "message", "status": "closed",
@@ -2737,6 +2739,9 @@ func TestClientSubmitSessionWithKeyAndReplays(t *testing.T) {
 			}
 			if resp.Replayed != (tc.replay != "") || resp.Message != tc.replay {
 				t.Fatalf("resp replayed %v with message %q, want %q", resp.Replayed, resp.Message, tc.replay)
+			}
+			if resp.OpID != tc.opID {
+				t.Fatalf("resp op id = %q, want %q", resp.OpID, tc.opID)
 			}
 		})
 	}
