@@ -980,6 +980,14 @@ func doEventsWatch(scope eventsAPIScope, typeFilter string, payloadMatch map[str
 	return streamCityEvents(ctx, client, scope.cityName, resumeSeq, typeFilter, payloadMatch, true, stdout, stderr)
 }
 
+// eventsRotateClientTimeout bounds the whole rotate request. With --wait the
+// server holds its reply for up to its own 30s compression wait
+// (eventRotateWaitTimeout in internal/api), so this must be longer than that
+// wait plus the rotation itself. When both were 30s, a slow gzip made the
+// client give up first every time, and the timeout read as "requires a running
+// supervisor" while the supervisor had in fact rotated (vn-15ab7tc).
+var eventsRotateClientTimeout = 90 * time.Second
+
 func doEventsRotate(scope eventsAPIScope, wait bool, stdout, stderr io.Writer) int {
 	if scope.localOnly || strings.TrimSpace(scope.apiURL) == "" {
 		printEventsRotateSupervisorRequired(stderr)
@@ -1004,7 +1012,7 @@ func doEventsRotate(scope eventsAPIScope, wait bool, stdout, stderr io.Writer) i
 		return 1
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), eventsRotateClientTimeout)
 	defer cancel()
 
 	resp, err := rotateCityEvents(ctx, client, scope.cityName, wait)
@@ -1055,6 +1063,13 @@ func cliRotateResponseFromGen(item genclient.EventRotateResponse) (cliEventsRota
 }
 
 func printEventsRotateError(scope eventsAPIScope, err error, stderr io.Writer) {
+	// A timeout is checked before the supervisor-required case because it is
+	// also a transport error. It means the supervisor took the request and did
+	// not answer in time, so the rotation may well have happened.
+	if errors.Is(err, context.DeadlineExceeded) {
+		fmt.Fprintf(stderr, "gc events: the supervisor did not answer within %s; it may still have rotated, so check with 'gc events --type events.rotated' before retrying\n", eventsRotateClientTimeout) //nolint:errcheck
+		return
+	}
 	if isEventsRotateSupervisorRequired(err) {
 		printEventsRotateSupervisorRequired(stderr)
 		return

@@ -1292,6 +1292,41 @@ func TestDoEventsRotateRequiresRunningSupervisor(t *testing.T) {
 	}
 }
 
+// A supervisor that takes the rotate request and answers too late has not
+// gone away. Reporting it as "requires a running supervisor" sent the mayor
+// hunting for a dead supervisor that had rotated the log (vn-15ab7tc).
+func TestDoEventsRotateTimeoutIsNotSupervisorRequired(t *testing.T) {
+	server := newEventsTestServer(t, testEventRoutes{
+		cityRotate: func(_ http.ResponseWriter, r *http.Request) {
+			<-r.Context().Done()
+		},
+	})
+	defer server.Close()
+
+	prev := eventsRotateClientTimeout
+	eventsRotateClientTimeout = 50 * time.Millisecond
+	t.Cleanup(func() { eventsRotateClientTimeout = prev })
+
+	var stdout, stderr bytes.Buffer
+	code := doEventsRotate(eventsAPIScope{apiURL: server.URL, cityName: "mc-city"}, true, &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("doEventsRotate slow supervisor = %d, want 1", code)
+	}
+	want := "gc events: the supervisor did not answer within 50ms; it may still have rotated, so check with 'gc events --type events.rotated' before retrying\n"
+	if stderr.String() != want {
+		t.Fatalf("stderr = %q, want %q", stderr.String(), want)
+	}
+}
+
+// The client must outwait the server's own --wait cap, or a slow gzip always
+// times the client out before the server can say "pending".
+func TestEventsRotateClientTimeoutOutlastsServerWait(t *testing.T) {
+	const serverWait = 30 * time.Second // eventRotateWaitTimeout in internal/api
+	if eventsRotateClientTimeout <= serverWait {
+		t.Fatalf("eventsRotateClientTimeout = %s, want more than the server's %s wait", eventsRotateClientTimeout, serverWait)
+	}
+}
+
 func TestDoEventsRotateCityNotFoundErrorIsPinned(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v0/city/missing-city/events/rotate" {
