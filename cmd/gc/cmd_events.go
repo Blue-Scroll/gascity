@@ -1164,11 +1164,16 @@ func fetchCityEventsPage(ctx context.Context, client *genclient.ClientWithRespon
 // A bounded --since window is drained across pages so the requested window is
 // reported in full — otherwise any window holding more than one page of events
 // silently under-reports (the bug this fixes). Without --since the request is
-// unbounded, so the fetch stays a single page: gc events means "recent
+// unbounded, so the fetch stops at one page's worth: gc events means "recent
 // activity", and a full descending drain of a 100 MB+ event history would blow
-// the command timeout for no user benefit. In that single-page case, when the
-// server signals more via next_cursor, an explicit truncation notice is written
-// to warn rather than silently dropping the older matches.
+// the command timeout for no user benefit. In that case, when the server
+// signals more via next_cursor, an explicit truncation notice is written to
+// warn rather than silently dropping the older matches.
+//
+// A page can come back short, even empty, and still carry next_cursor: the
+// server bounds how much of the log one page reads, so a rare --type stops on
+// that bound (vn-1sn13x0). Without --since the fetch follows such cursors until
+// it holds a full page, so a short page is never mistaken for all there is.
 func fetchCityEvents(ctx context.Context, client *genclient.ClientWithResponses, cityName, typeFilter, sinceFlag string, warn io.Writer) ([]cliWireEvent, error) {
 	paginate := strings.TrimSpace(sinceFlag) != ""
 	var all []cliWireEvent
@@ -1193,8 +1198,12 @@ func fetchCityEvents(ctx context.Context, client *genclient.ClientWithResponses,
 			// good data, and throwing it away is strictly worse than a short
 			// window the caller can see is short -- so report the truncation
 			// the same way the single-page cap below does, and return.
-			if paginate && len(all) > 0 && ctx.Err() != nil {
-				fmt.Fprintf(warn, "gc events: showing the newest %d events in the window; the walk ran out of time before reaching the older end. Use a narrower --since to fetch a full window.\n", len(all)) //nolint:errcheck
+			if len(all) > 0 && ctx.Err() != nil {
+				if paginate {
+					fmt.Fprintf(warn, "gc events: showing the newest %d events in the window; the walk ran out of time before reaching the older end. Use a narrower --since to fetch a full window.\n", len(all)) //nolint:errcheck
+				} else {
+					fmt.Fprintf(warn, "gc events: showing the newest %d events; the search ran out of time before finding more. Use --since <duration> to search a time window.\n", len(all)) //nolint:errcheck
+				}
 				break
 			}
 			return nil, err
@@ -1219,7 +1228,7 @@ func fetchCityEvents(ctx context.Context, client *genclient.ClientWithResponses,
 		if next == "" {
 			break // window (or the whole history) exhausted
 		}
-		if !paginate {
+		if !paginate && len(all) >= int(cityEventsPageLimit) {
 			fmt.Fprintf(warn, "gc events: showing the newest %d events; older matching events were omitted. Use --since <duration> to fetch a full time window.\n", len(all)) //nolint:errcheck
 			break
 		}

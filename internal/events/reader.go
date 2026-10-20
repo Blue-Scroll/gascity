@@ -33,12 +33,15 @@ type Filter struct {
 	BeforeSeq uint64
 	Limit     int // cap results at this count (0 or negative = unlimited)
 	// MaxScanBytes bounds how far a tail scan (ReadFilteredTail /
-	// TailProvider.ListTail) walks backward from EOF before giving up,
-	// even if Limit hasn't been reached (0 or negative = unbounded). It
-	// exists for callers where "no match within the recent window" is an
-	// acceptable, already-representable result — a rare or optional Type
-	// filter can otherwise force a full-file backward walk with the same
-	// cost as an unfiltered forward scan (#4418). It has no effect on
+	// TailProvider.ListTail / ScanFilteredTail) walks backward before giving
+	// up, even if Limit hasn't been reached (0 or negative = unbounded). The
+	// walk starts at EOF, or at BeforeSeq when that is set. A rare or
+	// optional Type filter can otherwise force a full-file backward walk
+	// with the same cost as an unfiltered forward scan (#4418). Callers for
+	// whom "no match within the recent window" is an acceptable answer just
+	// take the short result; a paging caller uses ScanFilteredTail, which
+	// says where the walk stopped so the next page can resume there. It has
+	// no effect on
 	// ReadFiltered's forward scan or on List/ListTail implementations
 	// that are not byte-scanning a file (e.g. Fake, Multiplexer).
 	MaxScanBytes int64
@@ -193,17 +196,33 @@ func seqLineAt(f *os.File, off int64) (seq uint64, start int64, ok bool) {
 // sub-linear check, cannot see an out-of-order run that both starts and ends
 // within the seq range the head and tail already imply.
 func activeScanStart(f *os.File, size int64, afterSeq uint64) int64 {
-	if afterSeq == 0 || size <= 0 {
+	start, ok := seqBoundary(f, size, afterSeq)
+	if !ok {
 		return 0
+	}
+	return start
+}
+
+// seqBoundary returns the byte offset of the first line in the active log
+// whose seq is above afterSeq: 0 when every line is, size when none is. ok is
+// false when the boundary cannot be established (see activeScanStart), and the
+// caller must then read the whole file. A forward scan reads from 0 and a
+// backward walk from size, so each caller picks its own safe default.
+func seqBoundary(f *os.File, size int64, afterSeq uint64) (int64, bool) {
+	if afterSeq == 0 || size <= 0 {
+		return 0, true
 	}
 	// Nothing to skip when the log's first line is already above the cursor.
 	first, _, ok := seqLineAt(f, 0)
-	if !ok || first > afterSeq {
-		return 0
+	if !ok {
+		return 0, false
+	}
+	if first > afterSeq {
+		return 0, true
 	}
 	tailSeq, err := readLatestSeqFromTail(f, size)
 	if err != nil || tailSeq < first {
-		return 0
+		return 0, false
 	}
 	i := sort.Search(int(size), func(i int) bool {
 		seq, _, ok := seqLineAt(f, int64(i))
@@ -214,12 +233,12 @@ func activeScanStart(f *os.File, size int64, afterSeq uint64) int64 {
 		if tailSeq > afterSeq {
 			// The file's actual last record contradicts "nothing left to
 			// see"; the search converged on a stale or corrupted region.
-			return 0
+			return 0, false
 		}
 		// Cursor is at or beyond the newest event: skip the file entirely.
-		return size
+		return size, true
 	}
-	return start
+	return start, true
 }
 
 // ReadFiltered reads events from path and sibling archives, returning
@@ -605,36 +624,99 @@ func LatestArchivedMatch(path string, filter Filter) (Event, bool, error) {
 
 // ReadFilteredTail reads the trailing matching events from path. A positive
 // limit returns at most that many events in chronological order; limit <= 0
-// falls back to ReadFiltered.
+// falls back to ReadFiltered. A walk cut short by Filter.MaxScanBytes returns
+// what it found; ScanFilteredTail also says where it stopped.
 func ReadFilteredTail(path string, filter Filter, limit int) ([]Event, error) {
 	if limit <= 0 {
 		return ReadFiltered(path, filter)
 	}
+	scan, err := ScanFilteredTail(path, filter, limit)
+	return scan.Events, err
+}
+
+// TailScan is what one backward walk of the active log found, and how it
+// ended.
+type TailScan struct {
+	// Events holds up to the asked-for number of the newest matches below
+	// Filter.BeforeSeq, oldest first.
+	Events []Event
+	// StoppedAt is set when the walk ran out of Filter.MaxScanBytes before it
+	// filled the page. It is the lowest seq the walk read: every match from
+	// there up to the boundary is in Events, and nothing older was read. Pass
+	// it as the next Filter.BeforeSeq to read on. It is 0 when the walk filled
+	// the page, reached the start of the file, or ended on Since (see
+	// ScanFilteredTail).
+	StoppedAt uint64
+	// ReachedStart is true when the walk read back to the first line of the
+	// file. Older matches, if any, are in the rotated archives.
+	ReachedStart bool
+}
+
+// ScanFilteredTail reads the newest limit matches from path, walking backward
+// from the end of the file, and reports how the walk ended. limit must be
+// positive.
+//
+// With Filter.BeforeSeq set, the walk starts at that seq, not at the end:
+// FileRecorder appends in seq order under its lock, so a binary search finds
+// the spot in a few short reads (seqBoundary, which AfterSeq reads use too).
+// Filter.MaxScanBytes counts from there, so a deep page of a keyset walk costs
+// no more than the first.
+//
+// A walk that runs out of MaxScanBytes stops with StoppedAt set, with one
+// exception. When Filter.Since is set and every line the walk read is older
+// than Since, the walk is done: events get their Ts when they are written, in
+// seq order, so the unread lines are older still. StoppedAt and ReachedStart
+// are then both unset. ReadNewestWithInFlight makes the same call for a whole
+// segment.
+func ScanFilteredTail(path string, filter Filter, limit int) (TailScan, error) {
+	if limit <= 0 {
+		return TailScan{}, fmt.Errorf("events: ScanFilteredTail needs a positive limit, got %d", limit)
+	}
 	f, err := os.Open(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, nil
+			return TailScan{ReachedStart: true}, nil
 		}
-		return nil, fmt.Errorf("reading events tail: %w", err)
+		return TailScan{}, fmt.Errorf("reading events tail: %w", err)
 	}
 	defer f.Close() //nolint:errcheck // read-only file
 
 	info, err := f.Stat()
 	if err != nil {
-		return nil, fmt.Errorf("stat events tail: %w", err)
+		return TailScan{}, fmt.Errorf("stat events tail: %w", err)
 	}
-	return readFilteredTailFromFile(f, info.Size(), filter, limit)
+	return scanFilteredTailFromFile(f, info.Size(), filter, limit)
 }
 
-func readFilteredTailFromFile(f *os.File, size int64, filter Filter, limit int) ([]Event, error) {
-	if size <= 0 {
-		return nil, nil
+func scanFilteredTailFromFile(f *os.File, size int64, filter Filter, limit int) (TailScan, error) {
+	end := tailWalkEnd(f, size, filter.BeforeSeq)
+	// lowest is the lowest seq read below the boundary, and newestTs the
+	// latest Ts among those lines. Lines at or above the boundary (all of them,
+	// when tailWalkEnd could not find it) do not count: a resume point must
+	// move down.
+	var (
+		lowest   uint64
+		newestTs time.Time
+	)
+	// budgetFrom is where MaxScanBytes starts counting: the end of the file,
+	// or with BeforeSeq the top of the chunk that holds the first line below
+	// the boundary. tailWalkEnd normally starts the walk right at the
+	// boundary, so the second case matters only when it could not.
+	//
+	// The walk does not stop on the budget until it has read a line with a
+	// seq below the boundary, so a stopped walk always has somewhere to
+	// resume from. Until then it reads whole chunks.
+	budgetFrom := int64(-1)
+	if filter.BeforeSeq == 0 {
+		budgetFrom = end
+	}
+	inBudget := func() bool {
+		return filter.MaxScanBytes <= 0 || lowest == 0 || budgetFrom-end < filter.MaxScanBytes
 	}
 	const chunkSize int64 = 64 * 1024
 	var reversed []Event
 	var pending []byte
-	end := size
-	for end > 0 && len(reversed) < limit && (filter.MaxScanBytes <= 0 || size-end < filter.MaxScanBytes) {
+	for end > 0 && len(reversed) < limit && inBudget() {
 		n := chunkSize
 		if end < n {
 			n = end
@@ -642,18 +724,17 @@ func readFilteredTailFromFile(f *os.File, size int64, filter Filter, limit int) 
 		// Clamp the read to what remains of the byte budget so a
 		// MaxScanBytes that is not a chunkSize multiple stops the walk
 		// mid-chunk rather than overscanning by up to one full chunk.
-		// The loop condition guarantees remaining > 0 on entry, and the
-		// chunk is read at start = end - n, so a smaller n simply moves
+		// The chunk is read at start = end - n, so a smaller n simply moves
 		// the walk's stopping point without misaligning pending.
-		if filter.MaxScanBytes > 0 {
-			if remaining := filter.MaxScanBytes - (size - end); remaining < n {
+		if filter.MaxScanBytes > 0 && budgetFrom >= 0 {
+			if remaining := filter.MaxScanBytes - (budgetFrom - end); remaining > 0 && remaining < n {
 				n = remaining
 			}
 		}
 		start := end - n
 		chunk := make([]byte, n)
 		if _, err := f.ReadAt(chunk, start); err != nil && err != io.EOF {
-			return nil, fmt.Errorf("reading events tail: %w", err)
+			return TailScan{}, fmt.Errorf("reading events tail: %w", err)
 		}
 		data := make([]byte, 0, len(chunk)+len(pending))
 		data = append(data, chunk...)
@@ -675,6 +756,17 @@ func readFilteredTailFromFile(f *os.File, size int64, filter Filter, limit int) 
 			if err := json.Unmarshal(line, &e); err != nil {
 				continue
 			}
+			if filter.BeforeSeq == 0 || e.Seq < filter.BeforeSeq {
+				if budgetFrom < 0 {
+					budgetFrom = end
+				}
+				if e.Seq > 0 && (lowest == 0 || e.Seq < lowest) {
+					lowest = e.Seq
+				}
+				if e.Ts.After(newestTs) {
+					newestTs = e.Ts
+				}
+			}
 			if matchesFilter(e, filter) {
 				reversed = append(reversed, e)
 			}
@@ -684,7 +776,32 @@ func readFilteredTailFromFile(f *os.File, size int64, filter Filter, limit int) 
 	for i, j := 0, len(reversed)-1; i < j; i, j = i+1, j-1 {
 		reversed[i], reversed[j] = reversed[j], reversed[i]
 	}
-	return reversed, nil
+	scan := TailScan{Events: reversed}
+	switch {
+	case len(reversed) >= limit:
+	case end <= 0:
+		scan.ReachedStart = true
+	case !filter.Since.IsZero() && newestTs.Before(filter.Since):
+		// Done: every line read is older than Since (see ScanFilteredTail).
+	default:
+		scan.StoppedAt = lowest
+	}
+	return scan, nil
+}
+
+// tailWalkEnd returns where a backward walk for seqs below beforeSeq starts:
+// the start of the first line at or above beforeSeq, found by seqBoundary's
+// binary search. When that search cannot trust the file's order, the walk
+// starts at the end of the file and reads the rest the slow way, which costs
+// time, never a skipped line.
+func tailWalkEnd(f *os.File, size int64, beforeSeq uint64) int64 {
+	if beforeSeq == 0 {
+		return size
+	}
+	if start, ok := seqBoundary(f, size, beforeSeq-1); ok {
+		return start
+	}
+	return size
 }
 
 // ReadLatestSeq returns the highest complete event Seq visible in the

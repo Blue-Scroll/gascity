@@ -860,6 +860,16 @@ func (r *FileRecorder) ListTail(filter Filter, limit int) ([]Event, error) {
 	return ReadFilteredTail(r.path, filter, limit)
 }
 
+// The /events page bounds its read only when its provider is a
+// TailScanProvider. Drift here would silently put the whole-file walk back.
+var _ TailScanProvider = (*FileRecorder)(nil)
+
+// ScanTail is ListTail that also says how the walk ended. It implements
+// [TailScanProvider].
+func (r *FileRecorder) ScanTail(filter Filter, limit int) (TailScan, error) {
+	return ScanFilteredTail(r.path, filter, limit)
+}
+
 // LatestSeq returns the highest sequence number in the event log.
 func (r *FileRecorder) LatestSeq() (uint64, error) {
 	seq, err := ReadLatestSeq(r.path)

@@ -638,6 +638,13 @@ type TailProvider interface {
 	ListTail(filter Filter, limit int) ([]Event, error)
 }
 
+// TailScanProvider is an optional extension for providers whose tail read can
+// stop on Filter.MaxScanBytes and say where it stopped (see [TailScan]), so a
+// paging caller can bound each page's read and resume the walk on the next.
+type TailScanProvider interface {
+	ScanTail(filter Filter, limit int) (TailScan, error)
+}
+
 // InFlightProvider is an optional extension for providers whose plain List can
 // momentarily miss events stranded in an in-flight rotation file. When a
 // file-backed provider rotates, the just-rotated segment lives only in the

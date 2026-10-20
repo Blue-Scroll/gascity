@@ -1729,25 +1729,26 @@ func newTestProvider(t *testing.T, dir string) *events.FileRecorder {
 
 // TestFetchCityEventsSinglePageChronological pins the S3 keyset contract on
 // the CLI: the server serves seq-DESC pages (newest first) with v1 sq
-// cursors; gc events fetches ONE page (recent activity, pre-S3 parity — a
+// cursors; gc events fetches ONE full page (recent activity, pre-S3 parity: a
 // full drain of a 100MB+ event history would blow the command timeout) and
-// prints it chronologically (ascending seq), never following next_cursor.
+// prints it chronologically (ascending seq), never following next_cursor past
+// a full page.
 func TestFetchCityEventsSinglePageChronological(t *testing.T) {
-	page1 := []cliWireEvent{
-		{Actor: "gc", Seq: 6, Type: "e.t", Ts: time.Unix(1700000060, 0).UTC()},
-		{Actor: "gc", Seq: 5, Type: "e.t", Ts: time.Unix(1700000050, 0).UTC()},
-		{Actor: "gc", Seq: 4, Type: "e.t", Ts: time.Unix(1700000040, 0).UTC()},
+	const newest = 600
+	page1 := make([]cliWireEvent, 0, cityEventsPageLimit)
+	for seq := int64(newest); len(page1) < int(cityEventsPageLimit); seq-- {
+		page1 = append(page1, cliWireEvent{Actor: "gc", Seq: seq, Type: "e.t", Ts: time.Unix(1700000000+seq, 0).UTC()})
 	}
 	server := newEventsTestServer(t, testEventRoutes{
 		cityEvents: func(w http.ResponseWriter, r *http.Request) {
 			if c := r.URL.Query().Get("cursor"); c != "" {
-				t.Errorf("gc events must not follow cursors, requested cursor %q", c)
+				t.Errorf("gc events must not follow cursors past a full page, requested cursor %q", c)
 				w.WriteHeader(http.StatusBadRequest)
 				return
 			}
-			w.Header().Set("X-GC-Index", "6")
+			w.Header().Set("X-GC-Index", strconv.Itoa(newest))
 			body := cityEventsListResponse(t, page1)
-			next := "v1:eyJrIjoic3EiLCJzIjo0fQ"
+			next := "v1:eyJrIjoic3EiLCJzIjoxMDF9"
 			body.NextCursor = &next
 			writeJSONResponse(t, w, body)
 		},
@@ -1763,18 +1764,70 @@ func TestFetchCityEventsSinglePageChronological(t *testing.T) {
 	if err != nil {
 		t.Fatalf("fetchCityEvents: %v", err)
 	}
-	if len(got) != 3 {
-		t.Fatalf("got %d events, want 3 (one page, cursor not followed)", len(got))
+	if len(got) != len(page1) {
+		t.Fatalf("got %d events, want %d (one page, cursor not followed)", len(got), len(page1))
 	}
+	first := int64(newest) - cityEventsPageLimit + 1
 	for i, item := range got {
-		if item.Seq != int64(i+4) {
-			t.Fatalf("event[%d].Seq = %d, want %d (chronological ascending)", i, item.Seq, i+4)
+		if item.Seq != first+int64(i) {
+			t.Fatalf("event[%d].Seq = %d, want %d (chronological ascending)", i, item.Seq, first+int64(i))
 		}
 	}
 	// The unbounded (no --since) fetch stays single-page, but a present
 	// next_cursor must surface an explicit truncation notice, never a silent drop.
 	if !strings.Contains(warn.String(), "omitted") {
 		t.Fatalf("expected truncation notice on stderr, got %q", warn.String())
+	}
+}
+
+// TestFetchCityEventsFollowsShortPagesWithoutSince: the server bounds how much
+// of the log one page reads, so a rare --type can come back short, even empty,
+// with a cursor (vn-1sn13x0). Without --since, gc events must follow those
+// cursors until it holds a full page or the cursors run out. Stopping at the
+// first short page would print "showing the newest 0 events" for a type that
+// has matches.
+func TestFetchCityEventsFollowsShortPagesWithoutSince(t *testing.T) {
+	pages := map[string]struct {
+		items []cliWireEvent
+		next  string
+	}{
+		"":   {items: nil, next: "p2"},
+		"p2": {items: []cliWireEvent{{Actor: "gc", Seq: 90, Type: "rare", Ts: time.Unix(1700000090, 0).UTC()}}, next: "p3"},
+		"p3": {items: []cliWireEvent{{Actor: "gc", Seq: 7, Type: "rare", Ts: time.Unix(1700000007, 0).UTC()}}},
+	}
+	server := newEventsTestServer(t, testEventRoutes{
+		cityEvents: func(w http.ResponseWriter, r *http.Request) {
+			page, ok := pages[r.URL.Query().Get("cursor")]
+			if !ok {
+				t.Errorf("unexpected cursor %q", r.URL.Query().Get("cursor"))
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			w.Header().Set("X-GC-Index", "100")
+			body := cityEventsListResponse(t, page.items)
+			if page.next != "" {
+				next := page.next
+				body.NextCursor = &next
+			}
+			writeJSONResponse(t, w, body)
+		},
+	})
+	defer server.Close()
+
+	client, err := genclient.NewClientWithResponses(server.URL)
+	if err != nil {
+		t.Fatalf("client: %v", err)
+	}
+	var warn bytes.Buffer
+	got, err := fetchCityEvents(context.Background(), client, "mc-city", "rare", "", &warn)
+	if err != nil {
+		t.Fatalf("fetchCityEvents: %v", err)
+	}
+	if len(got) != 2 || got[0].Seq != 7 || got[1].Seq != 90 {
+		t.Fatalf("got %+v, want seqs [7 90] from the short pages", got)
+	}
+	if warn.Len() != 0 {
+		t.Fatalf("warn = %q, want silence: the cursors ran out, nothing was omitted", warn.String())
 	}
 }
 

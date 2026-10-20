@@ -16,6 +16,14 @@ import (
 
 const eventRotateWaitTimeout = 30 * time.Second
 
+// eventListScanBudget caps how many bytes of the active event log one /events
+// page reads looking for matches. Without it a filter that matches almost
+// nothing walks the whole file: on 2026-10-20 that was most of 254 MB per
+// phone poll (vn-1sn13x0). A page that runs out returns the matches it found,
+// maybe none, with a cursor that resumes the walk where it stopped. A var so
+// tests can shrink it.
+var eventListScanBudget int64 = 16 << 20
+
 // humaHandleEventList is the Huma-typed handler for
 // GET /v0/city/{cityName}/events (the supervisor /v0/events list is a
 // separate handler on SupervisorMux).
@@ -68,13 +76,15 @@ func (s *Server) humaHandleEventList(ctx context.Context, input *EventListInput)
 	// page) the boundary, ascending; the extra row is the has-more signal.
 	scanFilter := filter
 	scanFilter.BeforeSeq = beforeSeq
-	evts, scanned, err := fetchEventPageAscending(ctx, ep, scanFilter, limit)
+	page, err := fetchEventPageAscending(ctx, ep, scanFilter, limit)
 	if err != nil {
 		return nil, apierr.Internal.Msg(err.Error())
 	}
+	evts := page.evts
 
 	// evts is ascending; the overfetched row (the oldest) signals more below.
-	hasMore := false
+	// A read that stopped on its budget has more below too, with no overfetch.
+	hasMore := page.resumeBefore > 0
 	if len(evts) > limit {
 		hasMore = true
 		evts = evts[len(evts)-limit:]
@@ -94,7 +104,7 @@ func (s *Server) humaHandleEventList(ctx context.Context, input *EventListInput)
 	// gap-free, so LatestSeq counts every event and stays constant across a
 	// walk). Filtered reads report a best-effort count — the matching rows
 	// this request's scan could see.
-	total := scanned
+	total := page.scanned
 	if filterIsEmpty(filter) {
 		if seq, seqErr := ep.LatestSeq(); seqErr == nil {
 			// LatestSeq is a uint64 counter; bound it before the int narrowing so
@@ -114,11 +124,17 @@ func (s *Server) humaHandleEventList(ctx context.Context, input *EventListInput)
 	// silently strand the rest of the walk. Anchoring on evts guarantees
 	// exactly `limit` seqs of progress per page regardless of projection
 	// failures — corrupt rows are skipped, never re-fetched, never wedge.
+	// A read that stopped on its budget resumes from where it stopped, which
+	// is below every event it fetched.
 	var nextCursor string
 	if hasMore {
+		boundary := page.resumeBefore
+		if boundary == 0 {
+			boundary = evts[0].Seq
+		}
 		nextCursor = encodeKeysetCursor(keysetCursor{
 			Kind: cursorKindSeq,
-			Seq:  evts[0].Seq,
+			Seq:  boundary,
 		})
 	}
 	return &ListOutput[WireEvent]{
@@ -144,19 +160,39 @@ func parseEventBeforeSeq(cursor string) (uint64, error) {
 	return c.Seq, nil
 }
 
-// fetchEventPageAscending fetches up to limit+1 matching events at or below the
-// filter's BeforeSeq boundary in ascending seq order; the extra row is the
-// has-more signal. It returns the fetched events and scanned — the best-effort
-// count of matching rows the read could see, used as the filtered Total.
+// eventPage is what fetchEventPageAscending read for one /events page.
+type eventPage struct {
+	// evts holds up to limit+1 matches in ascending seq order; the extra row
+	// is the has-more signal.
+	evts []events.Event
+	// scanned is the best-effort count of matching rows the read could see,
+	// used as the filtered Total.
+	scanned int
+	// resumeBefore is set when the read ran out of eventListScanBudget before
+	// it filled the page. evts then holds every match from there up to the
+	// boundary, and the next page starts strictly below it.
+	resumeBefore uint64
+}
+
+// fetchEventPageAscending fetches up to limit+1 matching events below the
+// filter's BeforeSeq boundary in ascending seq order.
 //
-// ListTail is the fast path: a backward scan of the ACTIVE events.jsonl only,
-// never the .gz archives, so its result is trusted ONLY when it yields a full
-// limit+1 rows. The active file holds the newest events, so a full tail page
-// there IS the newest page below the boundary. Anything short cannot
-// distinguish "log exhausted" from "active file exhausted, older matches in
-// archives/rotation" and MUST fall through to a read that also covers the
-// archives and any in-flight .rotating-* file — otherwise a rotation (or a
-// selective filter) strands the older history behind an unminted cursor.
+// The fast path is a backward scan of the ACTIVE events.jsonl only (ScanTail,
+// or ListTail on a provider without it). On a TailScanProvider the scan reads
+// at most eventListScanBudget bytes: a filter that matches almost nothing
+// would otherwise walk the whole file for one page (vn-1sn13x0). A scan that
+// stops on the budget returns a short page with resumeBefore set, and never
+// falls through to the archive read below.
+//
+// The scan never opens the .gz archives, so a short result is trusted only
+// when the scan says why it stopped: on the budget (resumeBefore), or on Since
+// (nothing older can match). A full limit+1 rows is the newest page below the
+// boundary, because the active file holds the newest events. A scan that read
+// back to the start of the active file cannot distinguish "log exhausted" from
+// "older matches in archives/rotation" and MUST fall through to a read that
+// also covers the archives and any in-flight .rotating-* file. Otherwise a
+// rotation (or a selective filter) strands the older history behind an
+// unminted cursor.
 //
 // That fall-through reads newest segment first and stops once it holds a page
 // (events.NewestProvider). Do not swap it for an oldest-first walk that keeps
@@ -164,29 +200,47 @@ func parseEventBeforeSeq(cursor string) (uint64, error) {
 // for over an hour after the phone gave up, and held the supervisor at
 // 160-640% CPU (hq-bshybj). ctx must be the request's, so a client that leaves
 // stops the read.
-func fetchEventPageAscending(ctx context.Context, ep events.Provider, filter events.Filter, limit int) ([]events.Event, int, error) {
+func fetchEventPageAscending(ctx context.Context, ep events.Provider, filter events.Filter, limit int) (eventPage, error) {
 	fetch := limit + 1
-	if tp, ok := ep.(events.TailProvider); ok {
+	if sp, ok := ep.(events.TailScanProvider); ok {
+		bounded := filter
+		bounded.MaxScanBytes = eventListScanBudget
+		scan, err := sp.ScanTail(bounded, fetch)
+		if err != nil {
+			return eventPage{}, err
+		}
+		switch {
+		case len(scan.Events) == fetch:
+			return eventPage{evts: scan.Events, scanned: limit}, nil
+		case scan.StoppedAt > 0:
+			return eventPage{evts: scan.Events, scanned: len(scan.Events), resumeBefore: scan.StoppedAt}, nil
+		case !scan.ReachedStart:
+			// Ended on Since: every line read was older, so no older match
+			// exists anywhere, the archives included.
+			return eventPage{evts: scan.Events, scanned: len(scan.Events)}, nil
+		}
+	} else if tp, ok := ep.(events.TailProvider); ok {
 		tail, err := tp.ListTail(filter, fetch)
 		if err != nil {
-			return nil, 0, err
+			return eventPage{}, err
 		}
 		if len(tail) == fetch {
-			return tail, limit, nil
+			return eventPage{evts: tail, scanned: limit}, nil
 		}
 	}
 	if np, ok := ep.(events.NewestProvider); ok {
-		return np.ListNewest(ctx, filter, fetch)
+		evts, seen, err := np.ListNewest(ctx, filter, fetch)
+		return eventPage{evts: evts, scanned: seen}, err
 	}
 	all, err := listWithInFlight(ep, filter)
 	if err != nil {
-		return nil, 0, err
+		return eventPage{}, err
 	}
 	scanned := len(all)
 	if len(all) > fetch {
 		all = all[len(all)-fetch:]
 	}
-	return all, scanned, nil
+	return eventPage{evts: all, scanned: scanned}, nil
 }
 
 // listWithInFlight returns all events matching filter, folding in events still

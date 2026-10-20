@@ -136,7 +136,11 @@ func readNewestWithInFlight(ctx context.Context, path string, filter Filter, kee
 
 	more := true
 	if active != nil {
-		r, err := activeSegmentReader(active, activeSize, filter.AfterSeq)
+		// Every active line at or above BeforeSeq is already covered, so the
+		// read ends at the first of them instead of reading on to EOF. On a
+		// keyset walk's later pages that was most of the active file per page.
+		activeEnd := tailWalkEnd(active, activeSize, filter.BeforeSeq)
+		r, err := activeSegmentReader(active, activeEnd, filter.AfterSeq)
 		if err != nil {
 			return nil, 0, fmt.Errorf("reading events: %w", err)
 		}
