@@ -2692,6 +2692,7 @@
               "urn:gascity:error:mail-not-found",
               "urn:gascity:error:method-not-allowed",
               "urn:gascity:error:not-implemented",
+              "urn:gascity:error:op-already-failed",
               "urn:gascity:error:op-journal-unavailable",
               "urn:gascity:error:operation-in-progress",
               "urn:gascity:error:order-not-found",
@@ -2745,6 +2746,7 @@
               "urn:gascity:error:mail-not-found",
               "urn:gascity:error:method-not-allowed",
               "urn:gascity:error:not-implemented",
+              "urn:gascity:error:op-already-failed",
               "urn:gascity:error:op-journal-unavailable",
               "urn:gascity:error:operation-in-progress",
               "urn:gascity:error:order-not-found",
@@ -5354,6 +5356,18 @@
           "id": {
             "description": "Resource ID.",
             "type": "string"
+          },
+          "idempotency_key": {
+            "description": "The key the request was recorded under: the client's Idempotency-Key, one the server minted when the request carried none, or, for a stop of a known turn, stop:\u003cgeneration\u003e:\u003cturn\u003e, so two stops of one turn are one operation. Retry with the Idempotency-Key to get this request's outcome instead of acting again.",
+            "type": "string"
+          },
+          "op": {
+            "$ref": "#/components/schemas/ConversationOp",
+            "description": "The operation the request was recorded as."
+          },
+          "replayed": {
+            "description": "True when this answers a retry of a request that already finished: nothing was executed again, and op carries the stored outcome. A replayed stop never interrupts a later turn.",
+            "type": "boolean"
           },
           "status": {
             "description": "Operation result.",
@@ -8129,6 +8143,34 @@
         ],
         "type": "object"
       },
+      "SessionCommandStatusBody": {
+        "additionalProperties": false,
+        "properties": {
+          "idempotency_key": {
+            "description": "The key the request was recorded under: the client's Idempotency-Key, or one the server minted when the request carried none. Retry with it to get this request's outcome instead of acting again.",
+            "type": "string"
+          },
+          "op": {
+            "$ref": "#/components/schemas/ConversationOp",
+            "description": "The operation the request was recorded as."
+          },
+          "replayed": {
+            "description": "True when this answers a retry of a request that already finished: nothing was executed again, and op carries the stored outcome.",
+            "type": "boolean"
+          },
+          "status": {
+            "description": "Operation result.",
+            "examples": [
+              "ok"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "status"
+        ],
+        "type": "object"
+      },
       "SessionCreateBody": {
         "additionalProperties": false,
         "properties": {
@@ -8614,6 +8656,18 @@
             "description": "Session ID.",
             "type": "string"
           },
+          "idempotency_key": {
+            "description": "The key the request was recorded under: the client's Idempotency-Key, or one the server minted when the request carried none. Retry with it to get this request's outcome instead of a second response.",
+            "type": "string"
+          },
+          "op": {
+            "$ref": "#/components/schemas/ConversationOp",
+            "description": "The operation the request was recorded as."
+          },
+          "replayed": {
+            "description": "True when this answers a retry of a request that already finished: nothing was executed again, and op carries the stored outcome.",
+            "type": "boolean"
+          },
           "status": {
             "description": "Operation result.",
             "examples": [
@@ -8738,6 +8792,17 @@
           "attached",
           "running"
         ],
+        "type": "object"
+      },
+      "SessionStopBody": {
+        "additionalProperties": true,
+        "properties": {
+          "turn": {
+            "description": "The turn to stop, as the client saw it (a turn id the session's runtime reported). Only that turn is interrupted: when another turn, or none, is running by then, nothing is sent and the request is refused with 409 turn_not_current. A runtime that does not record turn identity refuses a named turn with 501 turn_identity_unsupported. Omit it to stop whatever turn is running.",
+            "maxLength": 128,
+            "type": "string"
+          }
+        },
         "type": "object"
       },
       "SessionStrandedClaimsPayload": {
@@ -49093,13 +49158,22 @@
             }
           },
           {
-            "description": "Permanently delete bead after closing.",
+            "description": "Permanently delete bead after closing. Part of the request an Idempotency-Key names: a same-key retry that changes it is 422, after an API restart too while the close is recorded as an operation, and a replay never deletes. After a restart a same-key retry finds the recorded close by the session ID only: by an alias or session_name, or after a completed delete, it is 404.",
             "explode": false,
             "in": "query",
             "name": "delete",
             "schema": {
-              "description": "Permanently delete bead after closing.",
+              "description": "Permanently delete bead after closing. Part of the request an Idempotency-Key names: a same-key retry that changes it is 422, after an API restart too while the close is recorded as an operation, and a replay never deletes. After a restart a same-key retry finds the recorded close by the session ID only: by an alias or session_name, or after a completed delete, it is 404.",
               "type": "boolean"
+            }
+          },
+          {
+            "description": "Idempotency key for safe retries.",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "schema": {
+              "description": "Idempotency key for safe retries.",
+              "type": "string"
             }
           }
         ],
@@ -49108,7 +49182,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/OKResponseBody"
+                  "$ref": "#/components/schemas/SessionCommandStatusBody"
                 }
               }
             },
@@ -49262,6 +49336,15 @@
             "required": true,
             "schema": {
               "description": "Session ID, alias, or runtime session_name.",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Idempotency key for safe retries.",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "schema": {
+              "description": "Idempotency key for safe retries.",
               "type": "string"
             }
           }
@@ -50362,6 +50445,15 @@
               "description": "Session ID, alias, or runtime session_name.",
               "type": "string"
             }
+          },
+          {
+            "description": "Idempotency key for safe retries.",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "schema": {
+              "description": "Idempotency key for safe retries.",
+              "type": "string"
+            }
           }
         ],
         "responses": {
@@ -50733,6 +50825,15 @@
             }
           }
         ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SessionStopBody"
+              }
+            }
+          }
+        },
         "responses": {
           "200": {
             "content": {
@@ -51401,6 +51502,15 @@
               "description": "Session ID, alias, or runtime session_name.",
               "type": "string"
             }
+          },
+          {
+            "description": "Idempotency key for safe retries.",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "schema": {
+              "description": "Idempotency key for safe retries.",
+              "type": "string"
+            }
           }
         ],
         "responses": {
@@ -51408,7 +51518,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/OKResponseBody"
+                  "$ref": "#/components/schemas/SessionCommandStatusBody"
                 }
               }
             },

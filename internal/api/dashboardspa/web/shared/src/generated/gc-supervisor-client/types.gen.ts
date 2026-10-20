@@ -2160,6 +2160,18 @@ export type OkWithIdResponseBody = {
      */
     id?: string;
     /**
+     * The key the request was recorded under: the client's Idempotency-Key, one the server minted when the request carried none, or, for a stop of a known turn, stop:<generation>:<turn>, so two stops of one turn are one operation. Retry with the Idempotency-Key to get this request's outcome instead of acting again.
+     */
+    idempotency_key?: string;
+    /**
+     * The operation the request was recorded as.
+     */
+    op?: ConversationOp;
+    /**
+     * True when this answers a retry of a request that already finished: nothing was executed again, and op carries the stored outcome. A replayed stop never interrupts a later turn.
+     */
+    replayed?: boolean;
+    /**
      * Operation result.
      */
     status: string;
@@ -3362,6 +3374,25 @@ export type SessionBindingRecord = {
     Status: BindingStatus;
 };
 
+export type SessionCommandStatusBody = {
+    /**
+     * The key the request was recorded under: the client's Idempotency-Key, or one the server minted when the request carried none. Retry with it to get this request's outcome instead of acting again.
+     */
+    idempotency_key?: string;
+    /**
+     * The operation the request was recorded as.
+     */
+    op?: ConversationOp;
+    /**
+     * True when this answers a retry of a request that already finished: nothing was executed again, and op carries the stored outcome.
+     */
+    replayed?: boolean;
+    /**
+     * Operation result.
+     */
+    status: string;
+};
+
 export type SessionCreateBody = {
     /**
      * Optional session alias.
@@ -3674,6 +3705,18 @@ export type SessionRespondOutputBody = {
      */
     id: string;
     /**
+     * The key the request was recorded under: the client's Idempotency-Key, or one the server minted when the request carried none. Retry with it to get this request's outcome instead of a second response.
+     */
+    idempotency_key?: string;
+    /**
+     * The operation the request was recorded as.
+     */
+    op?: ConversationOp;
+    /**
+     * True when this answers a retry of a request that already finished: nothing was executed again, and op carries the stored outcome.
+     */
+    replayed?: boolean;
+    /**
      * Operation result.
      */
     status: string;
@@ -3713,6 +3756,14 @@ export type SessionResponse = {
     template: string;
     title: string;
     work_dir?: string;
+};
+
+export type SessionStopBody = {
+    /**
+     * The turn to stop, as the client saw it (a turn id the session's runtime reported). Only that turn is interrupted: when another turn, or none, is running by then, nothing is sent and the request is refused with 409 turn_not_current. A runtime that does not record turn identity refuses a named turn with 501 turn_identity_unsupported. Omit it to stop whatever turn is running.
+     */
+    turn?: string;
+    [key: string]: unknown;
 };
 
 export type SessionStrandedClaimsPayload = {
@@ -18804,6 +18855,10 @@ export type PostV0CityByCityNameSessionByIdCloseData = {
          * Anti-CSRF header required on mutation requests. Any non-empty value is accepted; the header's presence is what the server checks.
          */
         'X-GC-Request': string;
+        /**
+         * Idempotency key for safe retries.
+         */
+        'Idempotency-Key'?: string;
     };
     path: {
         /**
@@ -18817,7 +18872,7 @@ export type PostV0CityByCityNameSessionByIdCloseData = {
     };
     query?: {
         /**
-         * Permanently delete bead after closing.
+         * Permanently delete bead after closing. Part of the request an Idempotency-Key names: a same-key retry that changes it is 422, after an API restart too while the close is recorded as an operation, and a replay never deletes. After a restart a same-key retry finds the recorded close by the session ID only: by an alias or session_name, or after a completed delete, it is 404.
          */
         delete?: boolean;
     };
@@ -18861,7 +18916,7 @@ export type PostV0CityByCityNameSessionByIdCloseResponses = {
     /**
      * OK
      */
-    200: OkResponseBody;
+    200: SessionCommandStatusBody;
 };
 
 export type PostV0CityByCityNameSessionByIdCloseResponse = PostV0CityByCityNameSessionByIdCloseResponses[keyof PostV0CityByCityNameSessionByIdCloseResponses];
@@ -18873,6 +18928,10 @@ export type PostV0CityByCityNameSessionByIdKillData = {
          * Anti-CSRF header required on mutation requests. Any non-empty value is accepted; the header's presence is what the server checks.
          */
         'X-GC-Request': string;
+        /**
+         * Idempotency key for safe retries.
+         */
+        'Idempotency-Key'?: string;
     };
     path: {
         /**
@@ -19263,6 +19322,10 @@ export type PostV0CityByCityNameSessionByIdResetData = {
          * Anti-CSRF header required on mutation requests. Any non-empty value is accepted; the header's presence is what the server checks.
          */
         'X-GC-Request': string;
+        /**
+         * Idempotency key for safe retries.
+         */
+        'Idempotency-Key'?: string;
     };
     path: {
         /**
@@ -19393,7 +19456,7 @@ export type RespondSessionResponses = {
 export type RespondSessionResponse = RespondSessionResponses[keyof RespondSessionResponses];
 
 export type PostV0CityByCityNameSessionByIdStopData = {
-    body?: never;
+    body?: SessionStopBody;
     headers: {
         /**
          * Anti-CSRF header required on mutation requests. Any non-empty value is accepted; the header's presence is what the server checks.
@@ -19692,6 +19755,10 @@ export type PostV0CityByCityNameSessionByIdSuspendData = {
          * Anti-CSRF header required on mutation requests. Any non-empty value is accepted; the header's presence is what the server checks.
          */
         'X-GC-Request': string;
+        /**
+         * Idempotency key for safe retries.
+         */
+        'Idempotency-Key'?: string;
     };
     path: {
         /**
@@ -19744,7 +19811,7 @@ export type PostV0CityByCityNameSessionByIdSuspendResponses = {
     /**
      * OK
      */
-    200: OkResponseBody;
+    200: SessionCommandStatusBody;
 };
 
 export type PostV0CityByCityNameSessionByIdSuspendResponse = PostV0CityByCityNameSessionByIdSuspendResponses[keyof PostV0CityByCityNameSessionByIdSuspendResponses];
