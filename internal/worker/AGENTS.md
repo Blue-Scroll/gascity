@@ -308,3 +308,9 @@ as the city's, which `gc events` refuses (`refuseLocalEventsOnWorkerSite`):
 
 Worker sites exist in production only once the sidecar is written (CN-2),
 which waits for CN-1b2.
+
+## Injected lookups
+
+The worker reads work beads and other state it does not own through lookups
+injected as func values (for example `FactoryConfig.ResolveBead`), and never
+enumerates stores itself.
