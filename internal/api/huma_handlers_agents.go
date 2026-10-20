@@ -18,11 +18,22 @@ import (
 )
 
 // humaHandleAgentList is the Huma-typed handler for GET /v0/agents.
+// Overlapping identical requests share one build (shareListBuild). The
+// response cache below only helps a request that arrives after a build has
+// finished; on a busy city a crowd of requests arrived together, missed it,
+// and each built its own list for minutes.
 func (s *Server) humaHandleAgentList(ctx context.Context, input *AgentListInput) (*ListOutput[agentResponse], error) {
 	bp := input.toBlockingParams()
 	if bp.isBlocking() {
 		waitForChange(ctx, s.state.EventProvider(), bp)
 	}
+	return shareListBuild(&s.listBuildFlight, cacheKeyFor("agents", input), func() (*ListOutput[agentResponse], error) {
+		return s.buildAgentList(input), nil
+	})
+}
+
+// buildAgentList does the work of one GET /agents request.
+func (s *Server) buildAgentList(input *AgentListInput) *ListOutput[agentResponse] {
 	index := s.latestIndex()
 
 	cfg := s.state.Config()
@@ -52,7 +63,7 @@ func (s *Server) humaHandleAgentList(ctx context.Context, input *AgentListInput)
 			return &ListOutput[agentResponse]{
 				Index: index,
 				Body:  body,
-			}, nil
+			}
 		}
 	}
 
@@ -265,7 +276,7 @@ func (s *Server) humaHandleAgentList(ctx context.Context, input *AgentListInput)
 	return &ListOutput[agentResponse]{
 		Index: index,
 		Body:  body,
-	}, nil
+	}
 }
 
 // humaHandleAgent is the Huma-typed handler for
