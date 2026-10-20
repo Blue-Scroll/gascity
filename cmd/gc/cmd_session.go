@@ -2787,7 +2787,20 @@ The message is delivered as text content to the session's input. This is
 equivalent to typing the message into the session's terminal.
 
 Accepts a session ID or session alias. Multi-word messages are
-joined automatically.`,
+joined automatically.
+
+When [ops] authoritative lists message, a nudge to a session a conversation
+lane can type into is recorded as a lane op instead. wait-idle delivers it
+as a prompt at an idle boundary only, never into a running turn. immediate
+delivers it as a prompt at an idle boundary or, when the session's runtime
+can steer, into its running turn; a busy session whose runtime cannot steer
+gets it at the next boundary. queue delivers it as a notice at the next
+boundary and never wakes the session. When this process can type into the
+session, wait-idle and immediate deliver at once what their mode allows
+now, with or without a running controller; otherwise the nudge is reported
+queued, and the lane host serving the session delivers it as its mode
+says. The [ops] content gate does not govern such a nudge, and one whose op
+cannot be written is refused.`,
 		Args: cobra.MinimumNArgs(2),
 		RunE: func(_ *cobra.Command, args []string) error {
 			mode, err := parseNudgeDeliveryMode(delivery)
@@ -2804,9 +2817,15 @@ joined automatically.`,
 	}
 	cmd.Flags().StringVar(&delivery, "delivery", string(nudgeDeliveryWaitIdle), "delivery mode: immediate, wait-idle, or queue")
 	cmd.Flags().BoolVar(&jsonOutput, "json", false, "JSON output")
-	addOpKeyFlag(cmd, &key, "")
+	cmd.Flags().StringVar(&key, "key", "", sessionNudgeKeyUsage)
 	return cmd
 }
+
+// sessionNudgeKeyUsage is gc session nudge's --key help: the op journal also
+// records the nudge when [ops] authoritative lists message. The lane and the
+// legacy path record different policies for one nudge, so a key does not
+// carry across a change to that list.
+const sessionNudgeKeyUsage = "idempotency key: while the op journal records this command (its [ops] content gate is auto or require, or [ops] authoritative lists message), rerunning with the same key reports the first run's outcome instead of acting again, except across a change to whether [ops] authoritative lists message, which refuses the rerun as a different request; ignored otherwise (default: a new key each run)"
 
 func parseSessionSubmitIntent(raw string) (session.SubmitIntent, error) {
 	switch strings.TrimSpace(raw) {
@@ -3056,7 +3075,8 @@ type sessionNudgeJSON struct {
 // under the op key key (empty mints one). A worker site refuses before it
 // resolves the target or writes anything
 // (errWorkerSiteDeliveryNeedsController), and so does a require gate whose op
-// journal cannot record (resolveMessageOpTarget).
+// journal cannot record, or, when [ops] authoritative lists message, a lane
+// op that cannot be written (resolveSessionNudgeTarget).
 func cmdSessionNudge(args []string, delivery nudgeDeliveryMode, key string, jsonOutput bool, stdout, stderr io.Writer) int {
 	target := args[0]
 	message := strings.Join(args[1:], " ")
@@ -3070,7 +3090,7 @@ func cmdSessionNudge(args []string, delivery nudgeDeliveryMode, key string, json
 		fmt.Fprintf(stderr, "gc session nudge: %v\n", errWorkerSiteDeliveryNeedsController) //nolint:errcheck // best-effort stderr
 		return 1
 	}
-	targetInfo, err := resolveMessageOpTarget(target, sessionNudgeOpRequest(message, delivery, key, jsonOutput, stdout, stderr))
+	targetInfo, err := resolveSessionNudgeTarget(target, sessionNudgeOpRequest(message, delivery, key, jsonOutput, stdout, stderr))
 	if errors.Is(err, errMessageOpRefused) {
 		return 1
 	}
