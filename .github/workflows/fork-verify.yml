@@ -85,6 +85,16 @@ jobs:
           # than letting every row fail for a reason the log does not name.
           jq --version
           go test ./examples/gastown/ -run 'TestSpawnStorm' -count=1 -v
+      - name: Unit tests, a killed jsonl-export leaves nothing behind and a stale archive goes red (vn-glc19kd)
+        # Every run killed at the order timeout left a 276 MB export in the
+        # archive's work tree, and the next commit staged some of them: 48 GB
+        # by 2026-10-18, while gc doctor stayed green. These pin the cleanup on
+        # TERM, the sweep after a SIGKILL, the run lock, and the doctor's
+        # full-export stamp. The script needs jq.
+        run: |
+          jq --version
+          go test ./examples/gastown/ -run 'TestJsonlExport' -count=1 -v
+          go test ./cmd/gc/ -run 'TestJsonlArchiveDoctorCheck' -count=1 -v
       - name: Unit tests, a limited transcript read comes from the end of the log (vn-t7v7fm4)
         # The phone opens the mayor with limit=60, and gc parsed all 6 MB of
         # his log to keep 60 entries: 10 to 67 s under load. These pin that the

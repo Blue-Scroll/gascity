@@ -297,6 +297,19 @@ record_archive_push_success() {
     )"
 }
 
+# record_full_export stamps a run that exported every scope it found and got
+# the result into the archive. `gc doctor` (jsonl-archive) reads the stamp: a
+# killed run never reaches it, so a stamp that stops moving is the alarm that
+# was missing while runs died at the timeout for days (vn-glc19kd).
+record_full_export() {
+    if [ "$TOTAL_DBS" -eq 0 ] || [ "$FAILED_DB_COUNT" -gt 0 ]; then
+        return 0
+    fi
+    write_state_json "$(
+        read_state_json | jq -c --arg now "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '.last_full_export_at = $now'
+    )"
+}
+
 set_pending_archive_push() {
     write_state_json "$(read_state_json | jq -c '.pending_archive_push = true')"
 }
@@ -778,6 +791,134 @@ fi
 STATE_FILE_BACKUP="${STATE_FILE}.bak"
 mkdir -p "$(dirname "$STATE_FILE")"
 
+# Ensure archive repo exists.
+if [ ! -d "$ARCHIVE_REPO/.git" ]; then
+    mkdir -p "$ARCHIVE_REPO"
+    git -C "$ARCHIVE_REPO" init -q 2>/dev/null || true
+fi
+
+# ---- One run at a time, and a killed run leaves nothing behind ----
+#
+# A full export of a busy scope can outlast the order's timeout. gc then sends
+# the run's process group SIGTERM and, 2s later, SIGKILL. Before vn-glc19kd
+# each killed run left its raw export (276 MB for one busy rig) inside the
+# archive's work tree, where the next commit's `git add -A` picked them up: 636
+# leftovers, 48 GB, on 2026-10-18, and 268 of them committed. So:
+#   - this run's temp files live in EXPORT_TMP_DIR, inside .git, where no
+#     `git add` can see them;
+#   - TERM/INT/HUP become an exit, so the EXIT trap empties EXPORT_TMP_DIR on a
+#     timeout kill too;
+#   - SIGKILL skips every trap, so the next run empties EXPORT_TMP_DIR before it
+#     exports. It may: it holds EXPORT_LOCK, so nothing in there is live.
+ARCHIVE_GIT_DIR=$(git -C "$ARCHIVE_REPO" rev-parse --absolute-git-dir)
+EXPORT_TMP_DIR="$ARCHIVE_GIT_DIR/jsonl-export-tmp"
+# A symlink whose target is the holder's pid: `ln -s` is atomic, and this Mac
+# has no flock(1).
+EXPORT_LOCK="$ARCHIVE_GIT_DIR/jsonl-export.lock"
+EXPORT_LOCK_HELD=0
+EXPORT_LOCK_HOLDER=""
+
+on_export_exit() {
+    if [ "$EXPORT_LOCK_HELD" -eq 1 ]; then
+        rm -rf "${EXPORT_TMP_DIR:?}"
+        rm -f "$EXPORT_LOCK"
+    fi
+    order_outcome_write
+}
+trap on_export_exit EXIT
+trap 'exit 143' TERM
+trap 'exit 130' INT
+trap 'exit 129' HUP
+
+# export_lock_holder_is_live: the pid is alive AND is a jsonl-export run, so a
+# pid the OS has handed to some other program does not hold the lock for ever.
+export_lock_holder_is_live() {
+    local pid="$1"
+    local command
+
+    case "$pid" in
+        '' | *[!0-9]*) return 1 ;;
+    esac
+    kill -0 "$pid" 2>/dev/null || return 1
+    command=$(ps -p "$pid" -o command= 2>/dev/null) || return 1
+    case "$command" in
+        *jsonl-export*) return 0 ;;
+    esac
+    return 1
+}
+
+# acquire_export_lock returns 1, with EXPORT_LOCK_HOLDER set, when a live run
+# holds the lock. gc already runs one instance of an order at a time; this
+# covers what it cannot see, such as a run that outlived a supervisor restart
+# or a manual run.
+acquire_export_lock() {
+    if ln -s "$$" "$EXPORT_LOCK" 2>/dev/null; then
+        EXPORT_LOCK_HELD=1
+        return 0
+    fi
+    EXPORT_LOCK_HOLDER=$(readlink "$EXPORT_LOCK" 2>/dev/null || true)
+    if export_lock_holder_is_live "$EXPORT_LOCK_HOLDER"; then
+        return 1
+    fi
+    echo "jsonl-export: clearing the lock of a run that is gone (pid ${EXPORT_LOCK_HOLDER:-unknown})" >&2
+    rm -f "$EXPORT_LOCK"
+    if ln -s "$$" "$EXPORT_LOCK" 2>/dev/null; then
+        EXPORT_LOCK_HELD=1
+        return 0
+    fi
+    # Another run took it between the rm and the ln.
+    EXPORT_LOCK_HOLDER=$(readlink "$EXPORT_LOCK" 2>/dev/null || true)
+    return 1
+}
+
+# sweep_dead_run_leftovers removes what killed runs left. Call it only while
+# holding the lock.
+sweep_dead_run_leftovers() {
+    local swept
+
+    rm -rf "${EXPORT_TMP_DIR:?}"
+    mkdir -p "$EXPORT_TMP_DIR"
+    # Before vn-glc19kd the temps lived in the scope directories. A run of the
+    # old script can outlive a binary swap by its 900s timeout and does not
+    # take the lock, so only leftovers older than an hour go.
+    swept=$(find "$ARCHIVE_REPO" -mindepth 2 -maxdepth 2 -type f \
+        \( -name 'export.jsonl.tmp.*' -o -name 'issues.jsonl.tmp.*' -o -name '.~export.jsonl.tmp.*' \) \
+        -mmin +60 -print -delete 2>/dev/null | wc -l | tr -d ' ') || swept=0
+    if [ "$swept" -gt 0 ]; then
+        echo "jsonl-export: removed $swept temp file(s) that killed runs left in the archive" >&2
+    fi
+    # A run killed inside `git add` or `git commit` leaves index.lock, and
+    # then every later run fails to stage. No git step here takes an hour.
+    if [ -n "$(find "$ARCHIVE_GIT_DIR/index.lock" -mmin +60 2>/dev/null)" ]; then
+        rm -f "$ARCHIVE_GIT_DIR/index.lock"
+        echo "jsonl-export: removed an index.lock a killed run left behind" >&2
+    fi
+}
+
+# ensure_archive_ignores_temps keeps `git add -A` from staging any temp file
+# that still lands in the work tree (the old script's, or bd's own). The
+# exclude file hides only UNTRACKED files, so a temp an older run committed is
+# still recorded as deleted once it is gone.
+ensure_archive_ignores_temps() {
+    local exclude="$ARCHIVE_GIT_DIR/info/exclude"
+    local pattern
+
+    mkdir -p "$ARCHIVE_GIT_DIR/info"
+    for pattern in '*.tmp.*' '.~*'; do
+        if ! grep -qxF "$pattern" "$exclude" 2>/dev/null; then
+            printf '%s\n' "$pattern" >> "$exclude"
+        fi
+    done
+}
+
+if ! acquire_export_lock; then
+    echo "jsonl-export: run $EXPORT_LOCK_HOLDER is still exporting; skipping this one"
+    order_outcome_set skipped "another jsonl-export run is still live (pid $EXPORT_LOCK_HOLDER)"
+    exit 0
+fi
+sweep_dead_run_leftovers
+ensure_archive_ignores_temps
+
 log_archive_mode_if_needed
 retry_pending_spike_alert
 
@@ -823,12 +964,6 @@ move_legacy_snapshot_files() {
         echo "jsonl-export: moved the pre-bd-export snapshot of $db to $db/legacy/" >&2
     fi
 }
-
-# Ensure archive repo exists.
-if [ ! -d "$ARCHIVE_REPO/.git" ]; then
-    mkdir -p "$ARCHIVE_REPO"
-    git -C "$ARCHIVE_REPO" init -q 2>/dev/null || true
-fi
 
 TOTAL_EXPORTED=0
 TOTAL_DBS=0
@@ -943,7 +1078,9 @@ export_scope() {
     mkdir -p "$db_dir"
 
     # Step 1: gc bd export of the whole scope (read-only; one consistent snapshot).
-    raw_tmp=$(mktemp "$db_dir/export.jsonl.tmp.XXXXXX")
+    # Both temps go in EXPORT_TMP_DIR, never the scope directory: see the lock
+    # block above. It is on the archive's filesystem, so the mv is a rename.
+    raw_tmp=$(mktemp "$EXPORT_TMP_DIR/$DB.export.XXXXXX")
     wisp_plane_flag=$(scope_export_wisp_plane_flag)
     if ! out=$(scope_bd export --all -o "$raw_tmp" ${wisp_plane_flag:+"$wisp_plane_flag"} 2>&1); then
         echo "jsonl-export: gc bd export failed for $SCOPE_LABEL ($DB): $out" >&2
@@ -954,7 +1091,7 @@ export_scope() {
 
     # Step 2: keep the archived records (see select_archived_records). A
     # malformed export fails the scope so it cannot become the new baseline.
-    filtered_tmp=$(mktemp "$db_dir/issues.jsonl.tmp.XXXXXX")
+    filtered_tmp=$(mktemp "$EXPORT_TMP_DIR/$DB.issues.XXXXXX")
     if ! select_archived_records "$SCRUB" <"$raw_tmp" >"$filtered_tmp"; then
         echo "jsonl-export: gc bd export for $SCOPE_LABEL ($DB) is not valid JSONL" >&2
         rm -f "$raw_tmp" "$filtered_tmp"
@@ -985,7 +1122,6 @@ else
     echo "jsonl-export: gc rig list failed; exporting the city scope only" >&2
     order_outcome_scope_skipped "rigs" "rig list unavailable"
 fi
-trap order_outcome_write EXIT
 
 VISITED_DBS=""
 while IFS= read -r SCOPE_SPEC; do
@@ -1091,6 +1227,7 @@ if [ "$HALTED" -eq 1 ]; then
         }
         set_pending_archive_push
     fi
+    record_full_export
     set_pending_spike_alert "$HALT_DB" "$HALT_PREV_COUNT" "$HALT_CURRENT_COUNT" "$HALT_DELTA" "$SPIKE_THRESHOLD"
     if send_spike_alert "$HALT_DB" "$HALT_PREV_COUNT" "$HALT_CURRENT_COUNT" "$HALT_DELTA" "$SPIKE_THRESHOLD"; then
         clear_pending_spike_alert "$HALT_DB"
@@ -1102,6 +1239,7 @@ if [ "$HALTED" -eq 1 ]; then
 fi
 
 if git diff --cached --quiet 2>/dev/null; then
+    record_full_export
     if has_pending_archive_push || archive_has_local_only_commits; then
         if should_attempt_push; then
             PUSH_STATUS="ok"
@@ -1140,6 +1278,7 @@ commit_archive_snapshot \
     discard_staged_archive_outputs
     exit 1
 }
+record_full_export
 set_pending_archive_push
 
 if should_attempt_push; then

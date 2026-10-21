@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/doctor"
@@ -532,5 +533,75 @@ func TestFormatArchivePushFailureMessage(t *testing.T) {
 		if got != tt.want {
 			t.Errorf("formatArchivePushFailureMessage(%d, %q) = %q, want %q", tt.count, tt.stderr, got, tt.want)
 		}
+	}
+}
+
+// runJsonlArchiveCheckAt runs the check with its clock pinned to now.
+func runJsonlArchiveCheckAt(t *testing.T, cityPath string, env map[string]string, now time.Time) *doctor.CheckResult {
+	t.Helper()
+	check := newJsonlArchiveDoctorCheck(cityPath)
+	check.getenv = stubArchiveEnv{vars: env}.get
+	check.now = func() time.Time { return now }
+	return check.Run(&doctor.CheckContext{CityPath: cityPath})
+}
+
+// The vn-glc19kd shape: runs die at the order timeout, so no full export
+// lands, while the push fields still read healthy.
+func TestJsonlArchiveDoctorCheck_StaleFullExportIsError(t *testing.T) {
+	cityDir := t.TempDir()
+	stateDir := t.TempDir()
+	archiveDir := filepath.Join(cityDir, "archive")
+	initBareArchiveRepo(t, archiveDir, true)
+	writeArchiveState(t, stateDir, `{"consecutive_push_failures":0,"last_push_at":"2026-10-15T04:45:21Z","last_full_export_at":"2026-10-15T04:45:21Z"}`)
+
+	env := map[string]string{
+		"GC_PACK_STATE_DIR":     stateDir,
+		"GC_JSONL_ARCHIVE_REPO": archiveDir,
+	}
+	now := time.Date(2026, 10, 15, 10, 46, 0, 0, time.UTC) // 6h01m later
+	result := runJsonlArchiveCheckAt(t, cityDir, env, now)
+	if result.Status != doctor.StatusError {
+		t.Fatalf("status = %v, want Error; result=%#v", result.Status, result)
+	}
+	if !strings.Contains(result.Message, "no full export since 2026-10-15T04:45:21Z (6h1m0s ago)") {
+		t.Fatalf("message = %q", result.Message)
+	}
+	if !strings.Contains(result.FixHint, "order.failed") {
+		t.Fatalf("fix hint = %q, want it to name the order.failed events", result.FixHint)
+	}
+}
+
+func TestJsonlArchiveDoctorCheck_FreshFullExportFallsThroughToModeVerdict(t *testing.T) {
+	cityDir := t.TempDir()
+	stateDir := t.TempDir()
+	archiveDir := filepath.Join(cityDir, "archive")
+	initBareArchiveRepo(t, archiveDir, false)
+	writeArchiveState(t, stateDir, `{"last_full_export_at":"2026-10-15T04:45:21Z"}`)
+
+	env := map[string]string{
+		"GC_PACK_STATE_DIR":     stateDir,
+		"GC_JSONL_ARCHIVE_REPO": archiveDir,
+	}
+	now := time.Date(2026, 10, 15, 10, 45, 21, 0, time.UTC) // exactly 6h: not yet stale
+	result := runJsonlArchiveCheckAt(t, cityDir, env, now)
+	if result.Status != doctor.StatusWarning || !strings.Contains(result.Message, "local-only mode") {
+		t.Fatalf("result = %#v, want the local-only warning", result)
+	}
+}
+
+func TestJsonlArchiveDoctorCheck_UnreadableFullExportStampIsError(t *testing.T) {
+	cityDir := t.TempDir()
+	stateDir := t.TempDir()
+	archiveDir := filepath.Join(cityDir, "archive")
+	initBareArchiveRepo(t, archiveDir, true)
+	writeArchiveState(t, stateDir, `{"last_full_export_at":"yesterday"}`)
+
+	env := map[string]string{
+		"GC_PACK_STATE_DIR":     stateDir,
+		"GC_JSONL_ARCHIVE_REPO": archiveDir,
+	}
+	result := runJsonlArchiveCheckAt(t, cityDir, env, time.Now())
+	if result.Status != doctor.StatusError || !strings.Contains(result.Message, `"yesterday"`) {
+		t.Fatalf("result = %#v, want an Error naming the bad stamp", result)
 	}
 }

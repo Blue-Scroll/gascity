@@ -7,20 +7,32 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/gastownhall/gascity/internal/doctor"
 	"github.com/gastownhall/gascity/internal/git"
 )
 
 // jsonlArchiveState mirrors the keys the jsonl-export.sh script persists in
-// its state file. Only the push-health fields are read here; other keys
-// (pending spike alerts, etc.) are intentionally ignored so this check stays
-// a narrow projection of "is the archive being backed up off-box?".
+// its state file. Only the push-health fields and the full-export stamp are
+// read here; other keys (pending spike alerts, etc.) are intentionally ignored
+// so this check stays a narrow projection of "is the archive being kept
+// current, and backed up off-box?".
 type jsonlArchiveState struct {
 	ConsecutivePushFailures int    `json:"consecutive_push_failures,omitempty"`
 	LastPushAt              string `json:"last_push_at,omitempty"`
 	LastPushStderr          string `json:"last_push_stderr,omitempty"`
+	// LastFullExportAt is stamped only by a run that exported every scope
+	// and got the result into the archive. A run killed at the order timeout
+	// never stamps it.
+	LastFullExportAt string `json:"last_full_export_at,omitempty"`
 }
+
+// jsonlArchiveStaleAfter is how long the archive may go without a full
+// export before the check fails. The order runs every 15 minutes, so 6 hours
+// is many missed runs, not one slow one. Without this, runs died at the
+// timeout for days and the check stayed green (vn-glc19kd).
+const jsonlArchiveStaleAfter = 6 * time.Hour
 
 type jsonlArchiveDoctorCheck struct {
 	cityPath string
@@ -28,6 +40,8 @@ type jsonlArchiveDoctorCheck struct {
 	getenv func(string) string
 	// git command override for tests. nil means use exec.Command("git", ...).
 	runGit func(dir string, args ...string) ([]byte, error)
+	// clock override for tests. nil means time.Now.
+	now func() time.Time
 }
 
 func newJsonlArchiveDoctorCheck(cityPath string) *jsonlArchiveDoctorCheck {
@@ -195,6 +209,15 @@ func (c *jsonlArchiveDoctorCheck) Run(_ *doctor.CheckContext) *doctor.CheckResul
 		return r
 	}
 
+	// Staleness outranks the push-mode verdicts below: an archive that stopped
+	// taking snapshots is broken whether or not it has an origin.
+	if msg, stale := c.staleExportMessage(state); stale {
+		r.Status = doctor.StatusError
+		r.Message = msg
+		r.FixHint = `run "gc events --type order.failed --since 12h" and look for jsonl-export; "context deadline exceeded" means a run outlasts the order timeout`
+		return r
+	}
+
 	hasOrigin, err := c.archiveHasOrigin(archiveRepo)
 	if err != nil {
 		r.Status = doctor.StatusError
@@ -224,6 +247,29 @@ func (c *jsonlArchiveDoctorCheck) Run(_ *doctor.CheckContext) *doctor.CheckResul
 		r.Message = "push mode, no pushes attempted yet"
 	}
 	return r
+}
+
+// staleExportMessage reports whether the last full export is older than
+// jsonlArchiveStaleAfter. A state with no stamp is not stale: it was written
+// by a script that predates the stamp, or by a city whose first full run has
+// not finished yet.
+func (c *jsonlArchiveDoctorCheck) staleExportMessage(state jsonlArchiveState) (string, bool) {
+	if state.LastFullExportAt == "" {
+		return "", false
+	}
+	last, err := time.Parse(time.RFC3339, state.LastFullExportAt)
+	if err != nil {
+		return fmt.Sprintf("last_full_export_at %q in the state file is not a time", state.LastFullExportAt), true
+	}
+	now := time.Now
+	if c.now != nil {
+		now = c.now
+	}
+	age := now().Sub(last)
+	if age <= jsonlArchiveStaleAfter {
+		return "", false
+	}
+	return fmt.Sprintf("no full export since %s (%s ago); jsonl-export runs are not finishing", state.LastFullExportAt, age.Round(time.Minute)), true
 }
 
 func formatArchivePushFailureMessage(count int, stderr string) string {

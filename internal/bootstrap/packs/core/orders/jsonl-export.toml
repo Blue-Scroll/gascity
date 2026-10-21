@@ -1,10 +1,19 @@
 # Converted from formula+pool to exec. All JSONL export operations are
 # deterministic: gc bd export per bead scope, jq record-count comparisons, git
 # push. No LLM judgment needed — runs inline in the controller.
+#
+# timeout: one run exports every scope, then commits once, so a run killed at
+# the timeout commits nothing at all. At 900s a busy city never finished:
+# measured 2026-10-20, a 284 MB rig spent 12 minutes in its export queries
+# alone, the city scope took 3 more, and every run from 18:29 to 22:37 CDT but
+# one ended "context deadline exceeded" (vn-glc19kd). An hour leaves room for
+# load. The script holds a lock, so a run that outlives the interval is never
+# doubled, and a killed run's temp files are removed by the run itself or the
+# next one.
 [order]
 description = "Export bead scopes to a JSONL git archive"
 exec = "$PACK_DIR/assets/scripts/jsonl-export.sh"
 trigger = "cooldown"
 interval = "15m"
-timeout = "900s"
+timeout = "3600s"
 skip_aliases = ["mol-dog-jsonl"]

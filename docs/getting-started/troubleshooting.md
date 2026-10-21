@@ -730,6 +730,23 @@ failure. It continues recording `consecutive_push_failures` and
 every tick. A successful push or a switch back to local-only mode clears
 the escalation marker.
 
+### Reading a `no full export since` doctor error
+
+Each run exports every scope and then commits once, so a run killed at the
+order timeout commits nothing. A run that exports every scope and gets the
+result into the archive writes `last_full_export_at` to its state file.
+`gc doctor` fails the `jsonl-archive` check when that time is more than 6
+hours old. Look for the killed runs:
+
+```bash
+gc events --type order.failed --since 12h | grep jsonl-export
+```
+
+`context deadline exceeded` means a full export takes longer than the
+order's `timeout`. A killed run cleans up its own temp files on SIGTERM;
+after a SIGKILL the next run removes them. Runs never overlap: a run that
+finds another live one skips with an `order.skipped` event.
+
 ### Maintenance escalation and completion routing
 
 Core maintenance scripts route alerts through a generic escalation hook
