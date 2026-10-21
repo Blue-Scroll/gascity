@@ -46,6 +46,13 @@ package main
 // can lose it, and a latch that outlives its drain would otherwise silence the
 // backstop for the rest of the seat's life.
 //
+// # A nudge the seat answered does not count toward the drain
+//
+// The attempt count belongs to one stall, not to the whole claim. A seat that
+// kept working for the backoff window after a nudge answered it, so the count
+// goes back to zero (resetIfAnswered). Only quiet nudges in a row, with no
+// real work between them, reach the cap.
+//
 // # Holds are named
 //
 // Every hold leaves a breadcrumb on the session bead (executionClaimHoldKey), so
@@ -107,6 +114,14 @@ const (
 // tracker is in-memory and a supervisor restart discards it). Re-requesting is
 // safe: beginSessionDrainInfo is a no-op for a session already draining.
 const executionStalledLatchRetryAfter = 30 * time.Minute
+
+// executionClaimNudgeAnsweredSpan is how long a seat must keep showing
+// activity after a nudge for that nudge to count as answered, which resets the
+// attempt count (resetIfAnswered). It equals the backoff: a seat that stayed
+// busy for the whole window the backstop would otherwise wait before its next
+// retry is working, not stalled. A turn that only answers the nudge and ends is
+// shorter than this, so it still counts toward the drain.
+const executionClaimNudgeAnsweredSpan = idleClaimNudgeBackoff
 
 // nudgeStalledPoolExecution re-delivers the configured claim nudge to a pool slot
 // that HOLDS an in-progress claim it never started executing, and escalates once
@@ -257,11 +272,15 @@ func (p poolExecutionBackstop) resolve(s beads.Bead, _ map[string]beads.Bead, se
 		p.observeHold(p.store, &s, executionHoldMultiClaim, p.stdout)
 		return backstopTarget{}, backstopResolutionHold
 	}
-	if !p.sessionIsQuiet(sessName) {
+	claim := claims[0]
+	last, known := p.lastActivity(sessName)
+	if known {
+		p.resetIfAnswered(&s, claim, last)
+	}
+	if !known || p.now.Sub(last) < idleClaimNudgeGrace {
 		p.observeHold(p.store, &s, executionHoldNotQuiet, p.stdout)
 		return backstopTarget{}, backstopResolutionHold
 	}
-	claim := claims[0]
 	return backstopTarget{
 		ID:       claim.BeadID,
 		RootID:   claim.RootID,
@@ -271,16 +290,56 @@ func (p poolExecutionBackstop) resolve(s beads.Bead, _ map[string]beads.Bead, se
 	}, backstopResolutionOutstanding
 }
 
-// sessionIsQuiet reports whether the runtime has observed no activity for at
-// least the grace window. An unreadable or unset activity signal is NOT quiet: a
+// lastActivity reads the runtime's last observed activity. known is false for
+// an unreadable or unset signal, and resolve treats that as NOT quiet: a
 // backstop that treats "unknown" as "idle" nudges working agents, which is
 // exactly how the reverted idle-session nudger produced restart storms.
-func (p poolExecutionBackstop) sessionIsQuiet(sessName string) bool {
+func (p poolExecutionBackstop) lastActivity(sessName string) (last time.Time, known bool) {
 	last, err := p.sp.GetLastActivity(sessName)
 	if err != nil || last.IsZero() {
-		return false
+		return time.Time{}, false
 	}
-	return p.now.Sub(last) >= idleClaimNudgeGrace
+	return last, true
+}
+
+// resetIfAnswered sets the attempt count back to zero once the seat has kept
+// working for executionClaimNudgeAnsweredSpan past the last nudge on this
+// claim. Such a seat answered and is not stalled, so its next quiet moment
+// starts a fresh observe -> nudge -> drain sequence. Without this the count
+// only ever grew for as long as the claim was held, so a long-running seat
+// (a squad captain, say) that was nudged at three quiet moments hours apart
+// was drained mid-wave at the third (vn-uipx0q0).
+//
+// A brief answer does not count. The nudge itself makes the seat take a turn,
+// so "any activity after the nudge" would reset the count of the very seat
+// this backstop exists for (one that answers `gc hook --claim` and ends its
+// turn again), and the bounded drain would become a nudge every few minutes,
+// forever. Activity must outlast the backoff window instead.
+//
+// A seat whose drain is already latched for this incarnation keeps its count:
+// the drain is in flight, and resetting would not stop it.
+func (p poolExecutionBackstop) resetIfAnswered(s *beads.Bead, claim executionClaim, last time.Time) {
+	if strings.TrimSpace(s.Metadata[executionClaimNudgeWorkKey]) != claim.BeadID ||
+		strings.TrimSpace(s.Metadata[executionClaimNudgeStoreRefKey]) != claim.StoreRef {
+		return
+	}
+	attempts := atoiOr0(s.Metadata[executionClaimNudgeCountKey])
+	if attempts == 0 || p.stalledLatchHolds(s) {
+		return
+	}
+	nudgedAt := parseRFC3339OrZero(s.Metadata[executionClaimNudgeAtKey])
+	if nudgedAt.IsZero() || last.Sub(nudgedAt) < executionClaimNudgeAnsweredSpan {
+		return
+	}
+	if !writeSessionMetadata(p.store, s, map[string]string{
+		executionClaimNudgeCountKey: "0",
+		executionClaimNudgeAtKey:    p.now.UTC().Format(time.RFC3339),
+	}, "execution-claim-nudge", p.stdout) {
+		return
+	}
+	fmt.Fprintf(p.stdout, //nolint:errcheck // best-effort
+		"execution-claim-nudge: %s kept working on %s after nudge %d/%d; attempts reset\n",
+		strings.TrimSpace(s.Metadata["session_name"]), claim.BeadID, attempts, idleClaimNudgeMaxAttempts)
 }
 
 func (p poolExecutionBackstop) state(s beads.Bead, target backstopTarget) (same bool, attempts int, last time.Time) {

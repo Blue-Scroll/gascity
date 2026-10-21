@@ -461,11 +461,15 @@ func TestExecutionBackstopReEscalatesWhenARestartLostTheLatchedDrain(t *testing.
 	f.setInstanceToken(t, "incarnation-1")
 	driveToEscalation(t, f)
 	latchedAt := f.now
+	// The seat is silent from here on: its activity stays where it was. A clock
+	// that moves its activity forward would be a seat that kept working, and
+	// that answers the nudges (resetIfAnswered) rather than losing a drain.
+	quietSince := f.now.Add(-10 * time.Minute)
 
 	// Same incarnation, inside the window: latched on every tick.
 	for f.now.Add(idleClaimNudgeBackoff).Before(latchedAt.Add(executionStalledLatchRetryAfter)) {
 		f.now = f.now.Add(idleClaimNudgeBackoff)
-		f.idleFor(t, 10*time.Minute)
+		f.sp.SetActivity(f.sessName, quietSince)
 		f.tick(t)
 	}
 	if len(f.drained) != 1 {
@@ -474,7 +478,7 @@ func TestExecutionBackstopReEscalatesWhenARestartLostTheLatchedDrain(t *testing.
 
 	// The window has passed with the claim still held: the drain was lost.
 	f.now = latchedAt.Add(executionStalledLatchRetryAfter)
-	f.idleFor(t, 10*time.Minute)
+	f.sp.SetActivity(f.sessName, quietSince)
 	f.tick(t)
 	if len(f.drained) != 2 {
 		t.Fatalf("drain requests once the latch outlived its window = %v, want a second escalation", f.drained)
@@ -485,7 +489,7 @@ func TestExecutionBackstopReEscalatesWhenARestartLostTheLatchedDrain(t *testing.
 
 	// The re-written latch restarts the window.
 	f.now = f.now.Add(2 * time.Minute)
-	f.idleFor(t, 10*time.Minute)
+	f.sp.SetActivity(f.sessName, quietSince)
 	f.tick(t)
 	if len(f.drained) != 2 {
 		t.Fatalf("drain requests right after re-latching = %v, want still 2", f.drained)
@@ -650,5 +654,91 @@ func TestExecutionBackstopRecordsARevalidateHoldWithoutFlapping(t *testing.T) {
 	}
 	if got := f.sessionMeta(t, executionClaimHoldKey); got != "" {
 		t.Fatalf("hold breadcrumb after delivery = %q, want cleared", got)
+	}
+}
+
+// workFor advances the clock in one-minute ticks while the seat keeps showing
+// activity, the way a seat that answered a nudge and went on working looks.
+func (f *executionBackstopFixture) workFor(t *testing.T, d time.Duration) {
+	t.Helper()
+	for end := f.now.Add(d); f.now.Before(end); {
+		f.now = f.now.Add(time.Minute)
+		f.idleFor(t, time.Second)
+		f.tick(t)
+	}
+}
+
+// quietUntilNudged lets the seat go quiet and ticks until the backstop
+// delivers one more nudge, failing if none comes within the backoff plus the
+// grace.
+func (f *executionBackstopFixture) quietUntilNudged(t *testing.T) {
+	t.Helper()
+	want := f.nudgeCount() + 1
+	lastActive := f.now
+	for deadline := f.now.Add(idleClaimNudgeGrace + idleClaimNudgeBackoff + time.Minute); f.nudgeCount() < want; {
+		if f.now.After(deadline) {
+			t.Fatalf("no nudge %d within the backoff once the seat went quiet; stdout=%s", want, f.stdout.String())
+		}
+		f.now = f.now.Add(30 * time.Second)
+		f.sp.SetActivity(f.sessName, lastActive)
+		f.tick(t)
+	}
+}
+
+// TestExecutionBackstopNeverDrainsASeatThatAnswersAndKeepsWorking is the
+// vn-uipx0q0 row. A long-running seat (a squad captain waiting on its squad)
+// is quiet now and then, so it is nudged now and then, and each time it answers
+// and works on. The count used to grow for as long as the claim was held, so
+// the THIRD such quiet moment, hours apart from the first, drained the seat
+// mid-wave. A nudge the seat answered with real work is not part of a stall.
+func TestExecutionBackstopNeverDrainsASeatThatAnswersAndKeepsWorking(t *testing.T) {
+	f := newExecutionBackstopFixture(t)
+	f.idleFor(t, 10*time.Minute)
+	f.tick(t) // observe
+
+	for i := 0; i < 2*idleClaimNudgeMaxAttempts; i++ {
+		f.quietUntilNudged(t)
+		f.workFor(t, 20*time.Minute)
+		if got := f.sessionMeta(t, executionClaimNudgeCountKey); got != "0" {
+			t.Fatalf("attempt count after the seat answered nudge %d and kept working = %q, want 0; stdout=%s", i+1, got, f.stdout.String())
+		}
+	}
+
+	if got := f.nudgeCount(); got != 2*idleClaimNudgeMaxAttempts {
+		t.Fatalf("delivered nudges = %d, want one per quiet moment (%d)", got, 2*idleClaimNudgeMaxAttempts)
+	}
+	if len(f.drained) != 0 {
+		t.Fatalf("drain requests = %v, want none for a seat that answered every nudge; stdout=%s", f.drained, f.stdout.String())
+	}
+	if got := f.stalledEvents(); got != 0 {
+		t.Fatalf("execution.step_stalled events = %d, want 0", got)
+	}
+}
+
+// TestExecutionBackstopStillDrainsASeatThatOnlyAnswersBriefly: the nudge
+// itself makes the seat take a turn, so a turn that answers and ends is not
+// "kept working". That seat is the one this backstop was built for (it runs
+// the claim command and stops again), and it must still reach the drain after
+// the attempt cap, not be nudged every few minutes for ever.
+func TestExecutionBackstopStillDrainsASeatThatOnlyAnswersBriefly(t *testing.T) {
+	f := newExecutionBackstopFixture(t)
+	f.idleFor(t, 10*time.Minute)
+	f.tick(t) // observe
+
+	for i := 0; i < idleClaimNudgeMaxAttempts; i++ {
+		f.quietUntilNudged(t)
+		// A 30-second turn in answer, then quiet again.
+		f.now = f.now.Add(30 * time.Second)
+		f.idleFor(t, 0)
+		f.tick(t)
+	}
+	if got := f.sessionMeta(t, executionClaimNudgeCountKey); got != "3" {
+		t.Fatalf("attempt count after %d brief answers = %q, want %d; stdout=%s", idleClaimNudgeMaxAttempts, got, idleClaimNudgeMaxAttempts, f.stdout.String())
+	}
+
+	f.now = f.now.Add(idleClaimNudgeBackoff)
+	f.tick(t)
+	if len(f.drained) != 1 || f.drained[0] != f.sessName {
+		t.Fatalf("drain requests = %v, want exactly one for %s; stdout=%s", f.drained, f.sessName, f.stdout.String())
 	}
 }
