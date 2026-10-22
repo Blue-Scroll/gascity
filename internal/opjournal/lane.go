@@ -110,8 +110,11 @@ type Caps struct {
 	// Live can start a turn from this process.
 	Live bool
 	// InBand injects into a starting turn (the hook).
-	InBand  bool
-	Steer   bool
+	InBand bool
+	Steer  bool
+	// Respond answers pending interactions (the runtime is an
+	// InteractionProvider). Without it a respond closes failed{unsupported}
+	// (a respond is at most once, so none waiting may have answered).
 	Respond bool
 	// Dedup deduplicates deliveries by delivery key: a send under a key the
 	// runtime already applied is answered Delivered and not applied again,
@@ -179,8 +182,10 @@ type Probe struct {
 	TurnLive Tri
 	// KnownTurns are the turn ids the probe's read returned.
 	KnownTurns []string
-	// Pending is a pending interaction's request id; "?" for one the
-	// runtime names no id for. A failed look is a Probe error, not Pending.
+	// Pending is a pending interaction's request id; PendingUnknown for one
+	// the runtime names no id for. A failed look is a Probe error, not
+	// Pending. A pass that sees a request id records its raising
+	// (Store.RecordRaising).
 	Pending string
 	// ContentBlock is why content may not start now (I7), or "".
 	ContentBlock string
@@ -253,12 +258,24 @@ type InterruptCall struct {
 }
 
 // RespondCall is one respond effect. It carries no delivery key: Op.ID is
-// the idempotency key, the same on every re-take of the op.
+// the idempotency key, the same on every re-take of the op. The lane calls
+// it only when the probe showed RequestID pending and Interaction, the
+// occurrence the op answers, is its latest raising, still unresolved; the
+// executor answers only that request (RequestID is always set), and reports
+// Rejected skipped{stale} when the runtime shows another or none, or when
+// Interaction has ended since (Store.Raising): an identical prompt raised
+// later shares the request id. A respond
+// is at most once: after an Unknown result, or a lease that expired over its
+// attempt, it closes failed{ambiguous_delivery} and is never called again.
 type RespondCall struct {
-	Fence       Fence
-	Op          Op
+	Fence Fence
+	Op    Op
+	// Interaction is the occurrence the op answers, <request id>#<n>.
 	Interaction string
-	Payload     string
+	// RequestID is the runtime request id of the occurrence.
+	RequestID string
+	// Response is the op's decoded payload.
+	Response RespondPayload
 	// Seq is this attempt's lane_seq; every Take assigns a new one.
 	Seq uint64
 }
@@ -393,10 +410,9 @@ const (
 	// Caps.MaxText: it waits for a runtime with room and, as a blocking
 	// waiter, holds the content behind it.
 	WaitTextTooLong WaitReason = "text_too_long"
-	// WaitUnsupported is a respond the runtime cannot perform now, one
-	// attempt of which may already have reached it: closing it
-	// failed{unsupported} would record that it never ran.
-	WaitUnsupported WaitReason = "unsupported"
+	// WaitInteractionUnknown is a respond whose occurrence could not be read,
+	// or whose runtime could not be looked at: it retries on a timer.
+	WaitInteractionUnknown WaitReason = "interaction_unknown"
 	// WaitReplayGroup is the head of a maybe-delivered group that a
 	// deduplicating runtime must get whole: another open member of the group
 	// is not eligible yet, and a part sent under the group's key would make
@@ -575,6 +591,13 @@ func (l *ConversationLane) Pass(ctx context.Context, conv ConversationView, exec
 		}
 		if err != nil {
 			return res, fmt.Errorf("probing conversation %s: %w", conv.ID, err)
+		}
+		var moved bool
+		switch probe, rp.raisings, moved, err = l.noteRaisings(ctx, &snap, rp, probe, conv); {
+		case err != nil:
+			return res, err
+		case moved:
+			continue
 		}
 		tp, err := planTake(rp, probe, conv, now)
 		if err != nil {

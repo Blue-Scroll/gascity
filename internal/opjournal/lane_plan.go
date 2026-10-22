@@ -92,6 +92,13 @@ type rulesPlan struct {
 	// that the rules leave open and not in flight, in a class or not: a
 	// member waiting on its after target is still in its replay group.
 	groups map[string][]Op
+	// raisings holds, by op id, the occurrence of each respond candidate as
+	// the pass read it after its probe (noteRaisings).
+	raisings map[string]raisingState
+	// responds are the open respond ops the rules leave open and not in
+	// flight, candidates or waiting: a look that shows a prompt gone ends
+	// their occurrences (clearGone).
+	responds []Op
 }
 
 // isUrgent reports urgent content precedence: steer (OJ-17 adds now and the
@@ -276,6 +283,7 @@ func planRules(snap laneSnapshot, conv ConversationView, now time.Time, by strin
 	orderEntries(rp.control)
 	orderEntries(rp.content)
 	rp.groups = replayGroups(past, rp.closes)
+	rp.responds = openResponds(past, rp.closes)
 	rp.closeRow = conv.Closed && remaining == 0 && rowOK && !rt.row.Closed
 	rp.takePossible = rp.decideTake(conv, rt, rowOK, inFlight, now)
 	return rp
@@ -305,6 +313,18 @@ func replayGroups(ops []Op, closes []ruleClose) map[string][]Op {
 		}
 	}
 	return groups
+}
+
+// openResponds returns the respond ops among ops, less the ones closes
+// close.
+func openResponds(ops []Op, closes []ruleClose) []Op {
+	var out []Op
+	for _, op := range ops {
+		if op.Kind == KindRespond && !slices.ContainsFunc(closes, func(c ruleClose) bool { return c.cur.ID == op.ID }) {
+			out = append(out, op)
+		}
+	}
+	return out
 }
 
 // decideTake reports whether a Take is possible and, when it is not because
@@ -466,7 +486,7 @@ func planTake(rp rulesPlan, probe Probe, conv ConversationView, now time.Time) (
 		return tp, err
 	}
 	caps := probe.Caps
-	if f := probe.Fence; f != (Fence{}) && (f.Conversation != conv.ID || f.Generation != conv.Generation || f.Epoch != conv.Epoch) {
+	if fenceDisagrees(probe, conv) {
 		// Nothing rings when the runtime and the view agree again: retry on
 		// a timer.
 		tp.next = now.Add(TransientBackoffBase)
@@ -533,13 +553,18 @@ func (tp *takePlan) wait(op Op, r WaitReason, detail string) {
 	tp.waits = append(tp.waits, OpWait{ID: op.ID, Reason: r, Detail: detail})
 }
 
+// waitUntil is wait with a timer: the wait ends by itself at until.
+func (tp *takePlan) waitUntil(op Op, r WaitReason, detail string, until time.Time) {
+	tp.waits = append(tp.waits, OpWait{ID: op.ID, Reason: r, Detail: detail, Until: until})
+	tp.next = minTime(tp.next, until)
+}
+
 func (tp *takePlan) close(rp rulesPlan, e entry, o Outcome, now time.Time) {
 	tp.closes = append(tp.closes, ruleClose{cur: e.op, next: closedAt(e.cur, o, rp.by, now)})
 }
 
 // planControl picks the first takeable control op (I10), closing a respond
-// the runtime cannot perform unless it may have been delivered (that one
-// waits). Control takes one op.
+// the runtime cannot perform. Control takes one op.
 func (tp *takePlan) planControl(rp rulesPlan, probe Probe, now time.Time) *entry {
 	var picked *entry
 	blocked := false
@@ -553,14 +578,18 @@ func (tp *takePlan) planControl(rp rulesPlan, probe Probe, now time.Time) *entry
 			continue
 		case blocked:
 			tp.wait(e.op, WaitBlocked, "")
+		case e.op.Kind == KindRespond && rp.raisings[e.op.ID].over():
+			// Its occurrence ended (another answer, or a look that saw its
+			// prompt gone): whatever the runtime shows, it answers nothing.
+			tp.close(rp, e, Outcome{Arm: ArmSkipped, Reason: ReasonStale}, now)
 		case !probe.Caps.Live:
 			tp.wait(e.op, WaitNotLive, "")
 		case !probe.Running:
 			tp.wait(e.op, WaitNotRunning, "")
-		case e.op.Kind == KindRespond && !probe.Caps.Respond && e.maybeDelivered():
-			tp.wait(e.op, WaitUnsupported, "")
 		case e.op.Kind == KindRespond && !probe.Caps.Respond:
 			tp.close(rp, e, Outcome{Arm: ArmFailed, Reason: ReasonUnsupported}, now)
+		case e.op.Kind == KindRespond && !tp.respondReady(rp, e, probe, now):
+			// respondReady recorded its wait or close.
 		case picked == nil:
 			picked = &e
 		default:
