@@ -32,6 +32,7 @@ func (a incarnation) cmp(b incarnation) int {
 const (
 	lastErrorLeaseExpired = "lease_expired"
 	lastErrorTransient    = "transient"
+	lastErrorUnavailable  = "unavailable"
 	lastErrorNotDelivered = "not_delivered"
 	lastErrorUnknown      = "unknown"
 	lastErrorKeyRejected  = "key_rejected"
@@ -208,11 +209,7 @@ func planRules(snap laneSnapshot, conv ConversationView, now time.Time, by strin
 			closeOp(op, cur, canceled)
 			continue
 		case !executing && now.After(op.StartBy):
-			reason := ReasonExpiredBeforeStart
-			if op.MaybeDelivered > 0 {
-				reason = ReasonDeadlineInFlight
-			}
-			closeOp(op, cur, Outcome{Arm: ArmFailed, Reason: reason})
+			closeOp(op, cur, Outcome{Arm: ArmFailed, Reason: startByReason(op)})
 			continue
 		}
 		past = append(past, cur)
