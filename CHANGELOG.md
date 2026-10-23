@@ -461,6 +461,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Usage was read only from the rollout tail, so older turns (and older
   history pages) lost it once the session grew (thanks @csells).
 
+- **The run API lists a formula-v1 run's steps and reports the run active once
+  a step starts.** Formula-v1 instantiation types each untyped or `task`-typed
+  non-root step `step`, and the run projection dropped that type. For a v1
+  run, `GET /v0/city/{city}/runs/{id}/steps` returned no steps, and the run
+  list, `GET /runs/{id}` and the run census kept the run `pending` while its
+  steps were claimed and closed.
+
+- **`GET /v0/city/{city}/sessions?state=closed` and `?state=all` list closed
+  sessions.** The session list read only open sessions, whatever the filter,
+  so a filter naming `closed` matched nothing. A filter that can match a
+  closed session (`all`, or a list naming `closed`) now reads closed sessions
+  too, reported with state `closed`; they come from the bead store rather than
+  the cache. The default and every other filter still read open sessions from
+  the cache. `gc session list --state closed` and `--state all` list them too
+  when the city's supervisor answers the command.
+
 - **Stopping a Claude turn that is waiting on a permission prompt now cancels
   the prompt.** The tmux interrupt sent Ctrl-C, which leaves Claude's prompt
   up; it now sends Escape (the prompt's own cancel key) when a prompt is on
