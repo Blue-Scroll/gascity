@@ -483,6 +483,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   screen, never a numbered option. When it cannot read the pane it logs a
   warning and sends Ctrl-C as before. (thanks @csells)
 
+- **`GET /v0/city/{city}/agents` reports a live bounded-pool worker as
+  running, and no provider for the control dispatcher.** The agent list, the
+  agent read and the rig counts probed a pool slot (`<pool>-1`) on a session
+  name derived from the slot, but the controller runs an unaliased pool
+  session under a name carrying its session bead id (`<template>-<beadID>`).
+  Every worker of a pool with `max_active_sessions` set read `stopped` while
+  `/sessions` showed it active, `?running=true` listed none of them, and a
+  rig's `running_count` left them out. When a slot's derived name is not
+  live, these endpoints now find the slot's session the way `/status` does
+  and probe that one. A session whose bead still says active but whose
+  runtime is gone still reads stopped, and a session store that cannot be
+  read makes the list partial. The SDK's control dispatcher, which runs
+  `gc convoy control --serve` and has no provider, was reported under the
+  workspace provider, marked unavailable when that provider's binary was not
+  on `PATH`, and could take its session's model and context from another
+  agent's transcript in a shared work dir. It now reports no provider, its
+  session reads no transcript, and a Claude agent sharing its work dir no
+  longer loses its model and context on its account. (#4703, thanks
+  @remuscazacu)
+
 - **A Claude API failure now shows as a provider error in structured session
   history, not as an assistant reply.** Entries Claude flags with
   `isApiErrorMessage` carry a `provider_error` system event (with Claude's
