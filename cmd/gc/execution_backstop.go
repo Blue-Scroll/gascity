@@ -73,13 +73,17 @@ import (
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/events"
 	"github.com/gastownhall/gascity/internal/runtime"
+	sessionpkg "github.com/gastownhall/gascity/internal/session"
 )
 
 // Session-bead metadata keys for the execution backstop. Persisted for the same
 // reason the sibling backstops persist theirs: a controller restart must resume
 // the state machine, never replay it (test-5il).
 const (
-	executionClaimNudgeWorkKey     = "execution_claim_nudge_work"
+	// executionClaimNudgeWorkKey is declared in the session package because the
+	// drain-ack finalize reads it off the projected Info (it carries no raw bead)
+	// to give the claim back after an execution-stalled stop.
+	executionClaimNudgeWorkKey     = sessionpkg.ExecutionClaimNudgeWorkMetadataKey
 	executionClaimNudgeRootKey     = "execution_claim_nudge_root"
 	executionClaimNudgeStoreRefKey = "execution_claim_nudge_store_ref"
 	executionClaimNudgeCountKey    = "execution_claim_nudge_count"

@@ -725,6 +725,15 @@ const (
 	DrainCancelCountMetadataKey = "drain_cancel_count"
 )
 
+// ExecutionClaimNudgeWorkMetadataKey names the in_progress claim the execution
+// backstop is nudging this session about, and at exhaustion drains it for
+// (cmd/gc/execution_backstop.go owns the marker's whole lifecycle; this is its
+// key, declared here so the codec can project it). It is projected onto Info
+// for one reader: the drain-ack finalize, which carries no raw bead and must
+// know WHICH claim an execution-stalled stop gives back. Everything else keeps
+// reading the raw session bead, as the backstop does.
+const ExecutionClaimNudgeWorkMetadataKey = "execution_claim_nudge_work"
+
 // DrainInitiatorReconciler marks a drain the controller asked for. It is the
 // only value ever written, and that is deliberate: the controller is the only
 // actor that can write a city-store bead at drain time. The agent's own drain

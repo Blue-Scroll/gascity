@@ -86,6 +86,7 @@ func infoFromPersistedBeadFrozen(b beads.Bead) Info {
 		DrainRequestedAtMetadata: b.Metadata[DrainRequestedAtMetadataKey],
 		DrainCanceledAtMetadata:  b.Metadata[DrainCanceledAtMetadataKey],
 		DrainCancelCountMetadata: b.Metadata[DrainCancelCountMetadataKey],
+		ExecutionClaimNudgeWork:  b.Metadata[ExecutionClaimNudgeWorkMetadataKey],
 		MCPIdentity:              b.Metadata[MCPIdentityMetadataKey],
 		MCPServersSnapshot:       b.Metadata[MCPServersSnapshotMetadataKey],
 

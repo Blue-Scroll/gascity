@@ -126,6 +126,7 @@ var infoKeyCodec = []infoKeySpec{
 	{DrainRequestedAtMetadataKey, func(i *Info, v string) { i.DrainRequestedAtMetadata = v }},
 	{DrainCanceledAtMetadataKey, func(i *Info, v string) { i.DrainCanceledAtMetadata = v }},
 	{DrainCancelCountMetadataKey, func(i *Info, v string) { i.DrainCancelCountMetadata = v }},
+	{ExecutionClaimNudgeWorkMetadataKey, func(i *Info, v string) { i.ExecutionClaimNudgeWork = v }},
 
 	{MCPIdentityMetadataKey, func(i *Info, v string) { i.MCPIdentity = v }},
 	{MCPServersSnapshotMetadataKey, func(i *Info, v string) { i.MCPServersSnapshot = v }},

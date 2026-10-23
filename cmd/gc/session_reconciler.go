@@ -955,6 +955,13 @@ func finalizeDrainAckStoppedSession(
 			Payload:   api.SessionLifecyclePayloadJSON(info.ID, template, "drain acknowledged"),
 		})
 	}
+	// A confirmed execution-stalled stop gives back the claim the backstop
+	// drained this seat for, BEFORE the assigned-work gate below reads: with the
+	// claim gone the gate finds the seat free and closes it, and a fresh seat
+	// takes the claim. Without this the seat slept on its claim, and the
+	// assigned-work wake restarted it while the fresh-mode pool minted a second
+	// seat for the same bead (see releaseExecutionStalledClaim).
+	releaseExecutionStalledClaim(cityPath, cfg, store, rigStores, info, clk.Now().UTC(), rec, stderr)
 	hasAssignedWork, assignedErr := sessionHasOpenAssignedWorkForReachableStoreForCloseGate(cityPath, cfg, store, rigStores, info)
 	if assignedErr != nil {
 		fmt.Fprintf(stderr, "session reconciler: checking assigned work for drain-acked %s: %v\n", name, assignedErr) //nolint:errcheck

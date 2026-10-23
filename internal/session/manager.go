@@ -191,6 +191,11 @@ type Info struct {
 	DrainRequestedAtMetadata string // drain_requested_at (raw RFC3339)
 	DrainCanceledAtMetadata  string // drain_canceled_at (raw RFC3339)
 	DrainCancelCountMetadata string // drain_cancel_count (raw integer)
+	// ExecutionClaimNudgeWork mirrors execution_claim_nudge_work verbatim: the
+	// claim the execution backstop drained this session for. Read by the
+	// drain-ack finalize to give that one claim back after an execution-stalled
+	// stop (see ExecutionClaimNudgeWorkMetadataKey).
+	ExecutionClaimNudgeWork string
 
 	// MCPIdentity / MCPServersSnapshot mirror the raw mcp_identity and
 	// mcp_servers_snapshot metadata (verbatim). The ACP-transport classifier

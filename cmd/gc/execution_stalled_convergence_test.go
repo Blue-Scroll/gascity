@@ -8,6 +8,7 @@ import (
 	"github.com/gastownhall/gascity/internal/beadmeta"
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
+	"github.com/gastownhall/gascity/internal/events"
 	sessionpkg "github.com/gastownhall/gascity/internal/session"
 	"github.com/gastownhall/gascity/internal/session/sessiontest"
 )
@@ -21,10 +22,14 @@ import (
 // fires for them. If the backstop's exhaustion did not converge, this branch
 // would trade an accidental recovery for none at all.
 //
-// The chain: exhaustion -> TRACKED drain (non-cancelable reason) -> reconciler
-// advances it -> runtime stops -> session bead closes -> the dead-assignee
-// reopen lane releases the claim -> the row is demand again -> a fresh seat
-// claims it.
+// The chain: exhaustion -> TRACKED drain (non-cancelable reason) -> the drain
+// scan acknowledges it on the controller's behalf -> stop -> the drain-ack
+// finalize gives the stalled claim back (releaseExecutionStalledClaim) and,
+// finding the seat free, closes its bead -> the row is demand again -> a fresh
+// seat claims it. The release step is the one the production loop lacked
+// (vn-ttvpe81): without it the finalize kept the seat asleep on its claim, the
+// assigned-work wake restarted it, and the fresh-mode pool minted a second seat
+// for the same bead, every 20 minutes.
 
 type stalledConvergenceHarness struct {
 	env         *reconcilerTestEnv
@@ -104,14 +109,42 @@ func (h *stalledConvergenceHarness) sessionBead(t *testing.T) beads.Bead {
 }
 
 // drainRequester is the production wiring's shape: a tracked drain with the
-// non-cancelable execution-stalled reason.
+// non-cancelable execution-stalled reason, recorded on the session bead through
+// the session front door exactly as requestExecutionStalledDrain does. The
+// record is load-bearing: the finalize reads drain_reason off it to know this
+// stop gives its claim back.
 func (h *stalledConvergenceHarness) drainRequester(t *testing.T) func(beads.Bead) error {
 	t.Helper()
 	return func(sessionBead beads.Bead) error {
 		info := sessiontest.SeedBead(t, sessionBead)
-		beginSessionDrainInfo(info, h.env.sp, h.env.dt, executionStalledDrainReason, h.env.clk, defaultDrainTimeout, nil)
+		beginSessionDrainInfo(info, h.env.sp, h.env.dt, executionStalledDrainReason, h.env.clk, defaultDrainTimeout, sessionFrontDoor(h.env.store))
 		return nil
 	}
+}
+
+// reconcileDrainToTerminal ticks the reconciler, with the provider-backed drain
+// ops production uses, until the drained seat's bead closes or the budget runs
+// out: the drain scan sets the controller-owned ack, the next tick marks the
+// row stop-pending and queues the stop, and the tick after that finalizes it.
+func (h *stalledConvergenceHarness) reconcileDrainToTerminal(t *testing.T) beads.Bead {
+	t.Helper()
+	dops := newDrainOps(h.env.sp)
+	var bead beads.Bead
+	for i := 0; i < 8; i++ {
+		sessions, err := loadSessionBeads(h.env.store)
+		if err != nil {
+			t.Fatalf("loading session beads: %v", err)
+		}
+		h.env.reconcileWithPoolDesiredAndDrainOps(sessions, nil, dops)
+		bead = h.sessionBead(t)
+		if bead.Status == "closed" {
+			return bead
+		}
+		if bead.Metadata["state"] == "draining" && bead.Metadata["state_reason"] == "drain-ack-stop-pending" {
+			waitForProviderStopped(t, h.env.sp, h.sessionName)
+		}
+	}
+	return bead
 }
 
 // runBackstopToExhaustion drives the backstop past its grace and every attempt.
@@ -153,34 +186,29 @@ func TestExecutionStalledDrainConvergesToAReclaimableRow(t *testing.T) {
 		t.Fatalf("drain reason = %q, want %q", ds.reason, executionStalledDrainReason)
 	}
 
-	// The reconciler advances the tracked drain: deferred interrupt, then stop.
-	for i := 0; i < 6 && h.env.sp.IsRunning(h.sessionName); i++ {
-		h.env.clk.Advance(defaultDrainTimeout + time.Minute)
-		sessions, err := loadSessionBeads(h.env.store)
-		if err != nil {
-			t.Fatalf("loading session beads: %v", err)
-		}
-		h.env.reconcile(sessions)
-	}
+	// The reconciler advances the tracked drain the way production does: the
+	// controller acks it, stops the runtime, and the drain-ack finalize gives the
+	// claim back and closes the seat. No hand close: that step used to stand in
+	// for a release the finalize did not perform.
+	fake := events.NewFake()
+	h.env.rec = fake
+	final := h.reconcileDrainToTerminal(t)
 	if h.env.sp.IsRunning(h.sessionName) {
 		t.Fatalf("the runtime is still running after the drain advanced; stdout=%s stderr=%s",
 			h.env.stdout.String(), h.env.stderr.String())
 	}
-
-	// Retire the session bead the way the reconciler's stop path does, then let
-	// the dead-assignee reopen lane run: the claim must come back as claimable
-	// work rather than staying held by a session that no longer exists.
-	if err := h.env.store.Close(h.sessionID); err != nil {
-		t.Fatalf("closing the drained session bead: %v", err)
+	if final.Status != "closed" {
+		t.Fatalf("session bead status = %q state=%q sleep_reason=%q, want closed: the stalled stop must give its claim back so the close gate finds the seat free; stderr=%s",
+			final.Status, final.Metadata["state"], final.Metadata["sleep_reason"], h.env.stderr.String())
 	}
-	claimed, err := h.env.store.Get(h.work.ID)
-	if err != nil {
-		t.Fatalf("re-reading the claim: %v", err)
+	reopenedEvents := 0
+	for _, e := range fake.Events {
+		if e.Type == events.BeadDeadAssigneeReopened && e.Subject == h.work.ID {
+			reopenedEvents++
+		}
 	}
-	released := releaseOrphanedPoolAssignments(h.env.store, beads.SessionStore{Store: h.env.store}, h.env.cfg, "", nil,
-		[]beads.Bead{claimed}, []beads.Store{h.env.store}, []string{""}, nil, nil, nil)
-	if len(released) != 1 || released[0].ID != h.work.ID {
-		t.Fatalf("released = %+v, want the stalled claim reopened", released)
+	if reopenedEvents != 1 {
+		t.Fatalf("%s events for %s = %d, want exactly 1", events.BeadDeadAssigneeReopened, h.work.ID, reopenedEvents)
 	}
 
 	reopened, err := h.env.store.Get(h.work.ID)
@@ -318,5 +346,137 @@ func TestExecutionStalledDrainDoesNotStrandAMidDrainWake(t *testing.T) {
 	}
 	if strings.TrimSpace(reopened.Assignee) != "" {
 		t.Fatalf("the row is still assigned to a closed session (%q): stranded", reopened.Assignee)
+	}
+}
+
+// stalledFinalizeFixture stages the shape the finalize meets after a confirmed
+// execution-stalled stop: a pool seat, stop-pending, whose drain record names
+// the execution-stalled reason and whose backstop marker names one claim.
+type stalledFinalizeFixture struct {
+	env     *reconcilerTestEnv
+	session beads.Bead
+	rec     *events.Fake
+}
+
+func newStalledFinalizeFixture(t *testing.T, drainReason string, claims ...beads.Bead) (*stalledFinalizeFixture, []beads.Bead) {
+	t.Helper()
+	env := newReconcilerTestEnv()
+	env.cfg = &config.City{Agents: []config.Agent{{Name: "worker", MaxActiveSessions: intPtr(2)}}}
+	session := env.createSessionBead("worker", "worker")
+	env.setSessionMetadata(&session, map[string]string{"pool_managed": "true"})
+	var held []beads.Bead
+	inProgress := "in_progress"
+	assignee := session.ID
+	for _, c := range claims {
+		c.Type = "task"
+		if c.Metadata == nil {
+			c.Metadata = map[string]string{}
+		}
+		c.Metadata[beadmeta.RoutedToMetadataKey] = "worker"
+		created, err := env.store.Create(c)
+		if err != nil {
+			t.Fatalf("Create(%s): %v", c.Title, err)
+		}
+		// Create opens a bead; the claim is a second write, as in production.
+		if err := env.store.Update(created.ID, beads.UpdateOpts{Status: &inProgress, Assignee: &assignee}); err != nil {
+			t.Fatalf("claiming %s: %v", created.ID, err)
+		}
+		claimed, err := env.store.Get(created.ID)
+		if err != nil {
+			t.Fatalf("Get(%s): %v", created.ID, err)
+		}
+		held = append(held, claimed)
+	}
+	meta := map[string]string{sessionpkg.DrainReasonMetadataKey: drainReason}
+	if len(held) > 0 {
+		meta[executionClaimNudgeWorkKey] = held[0].ID
+	}
+	env.setSessionMetadata(&session, meta)
+	patch := sessionpkg.DrainAckStopPendingPatch(env.clk.Now().UTC())
+	if err := env.store.SetMetadataBatch(session.ID, patch); err != nil {
+		t.Fatalf("SetMetadataBatch(stop-pending): %v", err)
+	}
+	session.Metadata = patch.Apply(session.Metadata)
+	rec := events.NewFake()
+	env.rec = rec
+	return &stalledFinalizeFixture{env: env, session: session, rec: rec}, held
+}
+
+func (f *stalledFinalizeFixture) finalize(t *testing.T) beads.Bead {
+	t.Helper()
+	finalizeDrainAckStoppedSession(
+		"", f.env.cfg, f.env.store, nil, sessiontest.SeedBead(t, f.session), "worker", true,
+		newFakeDrainOps(), f.env.dt, f.env.clk, f.rec, &f.env.stderr,
+	)
+	got, err := f.env.store.Get(f.session.ID)
+	if err != nil {
+		t.Fatalf("Get(session): %v", err)
+	}
+	return got
+}
+
+func (f *stalledFinalizeFixture) claim(t *testing.T, id string) beads.Bead {
+	t.Helper()
+	got, err := f.env.store.Get(id)
+	if err != nil {
+		t.Fatalf("Get(%s): %v", id, err)
+	}
+	return got
+}
+
+// TestExecutionStalledStopReleasesItsClaimAndCloses: the named claim is given
+// back and the seat, now free, closes instead of sleeping on it.
+func TestExecutionStalledStopReleasesItsClaimAndCloses(t *testing.T) {
+	f, held := newStalledFinalizeFixture(t, executionStalledDrainReason, beads.Bead{Title: "claimed, never executed"})
+	session := f.finalize(t)
+	if session.Status != "closed" {
+		t.Fatalf("session status = %q (state=%q sleep_reason=%q), want closed; stderr=%s",
+			session.Status, session.Metadata["state"], session.Metadata["sleep_reason"], f.env.stderr.String())
+	}
+	claim := f.claim(t, held[0].ID)
+	if claim.Status != "open" || strings.TrimSpace(claim.Assignee) != "" {
+		t.Fatalf("claim = status %q assignee %q, want open and unassigned", claim.Status, claim.Assignee)
+	}
+	if got := claim.Metadata[beadmeta.RoutedToMetadataKey]; got != "worker" {
+		t.Fatalf("claim route = %q, want kept as worker", got)
+	}
+}
+
+// TestExecutionStalledStopReleasesOnlyTheNamedClaim: a second claim the seat
+// holds is not the backstop's business. It stays, and so does the seat.
+func TestExecutionStalledStopReleasesOnlyTheNamedClaim(t *testing.T) {
+	f, held := newStalledFinalizeFixture(t, executionStalledDrainReason,
+		beads.Bead{Title: "the stalled claim"}, beads.Bead{Title: "a second claim"})
+	session := f.finalize(t)
+	if session.Status == "closed" {
+		t.Fatalf("session closed while still holding a second claim")
+	}
+	if session.Metadata["state"] != "asleep" {
+		t.Fatalf("session state = %q, want asleep on its remaining claim", session.Metadata["state"])
+	}
+	if named := f.claim(t, held[0].ID); named.Status != "open" || strings.TrimSpace(named.Assignee) != "" {
+		t.Fatalf("named claim = status %q assignee %q, want released", named.Status, named.Assignee)
+	}
+	if other := f.claim(t, held[1].ID); other.Status != "in_progress" || other.Assignee != f.session.ID {
+		t.Fatalf("second claim = status %q assignee %q, want left with the seat", other.Status, other.Assignee)
+	}
+}
+
+// TestOtherDrainReasonKeepsItsClaim: an idle drain of a seat that holds work is
+// the pre-existing contract, unchanged: the seat sleeps on its claim and raises
+// session.drain_acked_with_assigned_work.
+func TestOtherDrainReasonKeepsItsClaim(t *testing.T) {
+	f, held := newStalledFinalizeFixture(t, "idle", beads.Bead{Title: "held through an idle drain"})
+	session := f.finalize(t)
+	if session.Status == "closed" {
+		t.Fatalf("session closed on an idle drain while holding work")
+	}
+	if claim := f.claim(t, held[0].ID); claim.Status != "in_progress" || claim.Assignee != f.session.ID {
+		t.Fatalf("claim = status %q assignee %q, want still held", claim.Status, claim.Assignee)
+	}
+	for _, e := range f.rec.Events {
+		if e.Type == events.BeadDeadAssigneeReopened {
+			t.Fatalf("an idle drain released a claim: %+v", e)
+		}
 	}
 }

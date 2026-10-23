@@ -56,6 +56,7 @@ var allProjectedMetadataKeys = []string{
 	PrimedAtMetadataKey, PrimingAttemptedAtMetadataKey, PromptHashMetadataKey,
 	DrainReasonMetadataKey, DrainInitiatorMetadataKey, DrainRequestedAtMetadataKey,
 	DrainCanceledAtMetadataKey, DrainCancelCountMetadataKey,
+	ExecutionClaimNudgeWorkMetadataKey,
 }
 
 // oracleBaseBeads returns diverse session beads: a fully-populated open bead, the
@@ -88,7 +89,7 @@ func oracleBaseBeads() []beads.Bead {
 		ResetCommittedAtKey: "2026-01-02T02:00:00Z",
 		"generation":        "4", "started_config_hash": "cfg", "pin_awake": "true",
 		"held_until": "2026-01-03T00:00:00Z", "wait_hold": "op", "churn_count": "2",
-		"wake_mode": "fresh", "drain_at": "2026-01-03T04:00:00Z",
+		"wake_mode": "fresh", ExecutionClaimNudgeWorkMetadataKey: "claim-7", "drain_at": "2026-01-03T04:00:00Z",
 		"sleep_intent": "idle-stop-pending", "instance_token": "it",
 		"detached_at": "2026-01-04T00:00:00Z", CurrentBeadIDKey: "bead-9",
 		"core_hash_breakdown": `{"a":1}`, "started_provision_hash": "ph",
