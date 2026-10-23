@@ -9,6 +9,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Upgrading Notes
 
+- **An unset `[daemon] session_reconciler` now runs the v2 reconciler where
+  the city can run it, and `[beads] conditional_writes` now defaults to
+  `"auto"`.** With the key unset, the controller resolves v2 at boot from
+  config alone when no feature v2 lacks is configured (agent `depends_on` or
+  `max_session_age`, `[chat_sessions] idle_timeout`, a session provider other
+  than tmux, acp or subprocess), conditional writes resolve on, and the
+  sessions and graph classes sit on a `sqlite-beads` `[storage]` binding.
+  Otherwise it runs legacy, as before, and logs a warning naming each reason;
+  `gc doctor` (`daemon-session-reconciler`) reports the same. Set
+  `session_reconciler = "legacy"` to keep legacy and silence the warning.
+  An explicit `"v2"` still refuses to start over those features. Under v2,
+  `[daemon] session_circuit_breaker`, `[session] progress_stall_timeout` and
+  `[session] claim_holder_stall_timeout` are deprecated and ignored (the work
+  ladder replaces them), with a boot and doctor warning; legacy still honors
+  them. Unset conditional writes now take compare-and-swap wherever the store
+  supports it, under legacy too; a store that cannot (an exec store, or a bd
+  without `--if-revision`) runs as before, quietly, with no degraded event or
+  status warning. Set `conditional_writes = "off"` (or
+  `GC_BEADS_CONDITIONAL_WRITES=off`) to keep unconditional writes. The mode
+  stays boot-latched, and `gc runtime drain`, `drain-ack` (including
+  `gc hook`'s drain-ack) and `undrain` follow the running controller's mode
+  until it restarts. A controller started by an earlier gc does not report
+  its mode, so these commands treat it as legacy unless city.toml sets
+  `session_reconciler = "v2"`: restart the controller after upgrading gc to
+  pick up the new default. The messages that said to remove
+  `session_reconciler` to run legacy now say to set it to `"legacy"`.
+  Rolling back: after rolling back the gc binary, restart the controller, so
+  the controller and the CLI resolve the mode under the same build.
+
 - **An exec session provider's `start` or `provision` that exits 2 now fails
   the start.** Exit 2 meant "unknown operation, treat as success" on `start`
   and `provision` too, so a `set -e` wrapper whose `grep` or `jq` exited 2 during `start`
