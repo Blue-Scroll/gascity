@@ -42,7 +42,8 @@ func (s *Server) humaHandleSessionList(_ context.Context, input *SessionListInpu
 func (s *Server) sessionListFromRuntime(input *SessionListInput) *ListOutput[sessionResponse] {
 	cfg := s.state.Config()
 	body := ListBody[sessionResponse]{Items: []sessionResponse{}}
-	live := &runningSessionsOnce{sp: s.state.SessionProvider()}
+	sp := s.state.SessionProvider()
+	live := &runningSessionsOnce{sp: sp}
 	names, err := live.ListRunning("")
 	if err != nil {
 		body.Partial = true
@@ -51,7 +52,7 @@ func (s *Server) sessionListFromRuntime(input *SessionListInput) *ListOutput[ses
 	if !liveSessionMatchesState(input.State) {
 		names = nil
 	}
-	configured := configuredSessionsByName(cfg, s.state.CityName(), live)
+	configured := configuredSessionsByName(cfg, s.state.CityName(), live, sp)
 	slices.Sort(names)
 	for _, name := range names {
 		info := session.Info{SessionName: name, State: session.StateActive}
@@ -103,18 +104,35 @@ type configuredSession struct {
 // configuredSessionsByName maps the session name of every configured agent,
 // pool slots included, to what its session bead would carry. live answers the
 // unlimited pools, so pass the listing you already made.
-func configuredSessionsByName(cfg *config.City, cityName string, live sessionLister) map[string]configuredSession {
+//
+// A live pool worker is keyed by its bead-scoped name too, found through its
+// env (see agent_live_session.go). Keyed by the derived name alone, every
+// polecat in this list had no template, alias or provider.
+func configuredSessionsByName(cfg *config.City, cityName string, live sessionLister, sp runtime.Provider) map[string]configuredSession {
 	out := make(map[string]configuredSession)
 	if cfg == nil {
 		return out
 	}
 	sessTmpl := cfg.Workspace.SessionTemplate
+	envBatch, _ := sp.(runtime.EnvironmentBatchProvider)
+	poolSessions := buildPoolSessionIndex(cfg.Agents, live, sp, envBatch)
 	for _, a := range cfg.Agents {
-		for _, ea := range expandAgent(a, cityName, sessTmpl, live) {
-			out[agentSessionName(cityName, ea.qualifiedName, sessTmpl)] = configuredSession{
+		expanded := expandAgent(a, cityName, sessTmpl, live)
+		if isMultiSessionAgent(a) {
+			expanded = appendUnlistedPoolMembers(expanded, a, poolSessions)
+		}
+		for _, ea := range expanded {
+			c := configuredSession{
 				template: a.QualifiedName(),
 				alias:    ea.qualifiedName,
 				provider: a.Provider,
+			}
+			out[agentSessionName(cityName, ea.qualifiedName, sessTmpl)] = c
+			if ea.pool == "" {
+				continue
+			}
+			if ps, ok := poolSessions.lookup(ea.pool, ea.qualifiedName); ok {
+				out[ps.name] = c
 			}
 		}
 	}

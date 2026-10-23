@@ -582,15 +582,33 @@ func (s *Server) humaHandleRigRestart(name string) (*RigActionResponse, error) {
 	// Best-effort kill: the agent set may change between config read and each
 	// Stop call (pool scaling, config reload). The reconciler is the
 	// convergence mechanism — survivors will be caught on its next tick.
+	var rigAgents []config.Agent
+	for _, a := range cfg.Agents {
+		if workdirutil.ConfiguredRigName(s.state.CityPath(), a, cfg.Rigs) == name {
+			rigAgents = append(rigAgents, a)
+		}
+	}
+	// Pool workers run under bead-scoped names that cannot be derived from
+	// the member name; see agent_live_session.go. Stopping only the derived
+	// name left every live polecat running through a rig restart.
+	running := &runningSessionsOnce{sp: sp}
+	envBatch, _ := sp.(runtime.EnvironmentBatchProvider)
+	poolSessions := buildPoolSessionIndex(rigAgents, running, sp, envBatch)
+
 	killed := make([]string, 0)
 	failed := make([]string, 0)
-	for _, a := range cfg.Agents {
-		if workdirutil.ConfiguredRigName(s.state.CityPath(), a, cfg.Rigs) != name {
-			continue
+	for _, a := range rigAgents {
+		expanded := expandAgent(a, cityName, cfg.Workspace.SessionTemplate, running)
+		if isMultiSessionAgent(a) {
+			expanded = appendUnlistedPoolMembers(expanded, a, poolSessions)
 		}
-		expanded := expandAgent(a, cityName, cfg.Workspace.SessionTemplate, sp)
 		for _, ea := range expanded {
 			sessionName := agentSessionName(cityName, ea.qualifiedName, cfg.Workspace.SessionTemplate)
+			if ea.pool != "" && !sp.IsRunning(sessionName) {
+				if ps, ok := poolSessions.lookup(ea.pool, ea.qualifiedName); ok {
+					sessionName = ps.name
+				}
+			}
 			if err := sp.Stop(sessionName); err != nil {
 				// "session gone" is benign — agent wasn't running.
 				if !runtime.IsSessionGone(err) {

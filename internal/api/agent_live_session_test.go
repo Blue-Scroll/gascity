@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"testing"
 
 	"github.com/gastownhall/gascity/internal/config"
@@ -143,5 +144,86 @@ func TestBeadScopedPoolPrefixMatchesPoolSessionName(t *testing.T) {
 	// PoolSessionName in cmd/gc builds "<basename(template)>-<bead id>".
 	if got := beadScopedPoolPrefix("vessel-network/polecat-opus-high"); got != "polecat-opus-high-" {
 		t.Errorf("beadScopedPoolPrefix = %q, want %q", got, "polecat-opus-high-")
+	}
+}
+
+// vn-ub0fz5t: a rig restart stopped only the derived name, so every live
+// polecat outlived it.
+func TestRigRestartStopsPoolMemberUnderBeadScopedName(t *testing.T) {
+	state := newFakeMutatorState(t)
+	state.cfg.Rigs = append(state.cfg.Rigs, config.Rig{Name: "otherrig", Path: "/tmp/otherrig"})
+	state.cfg.Agents = []config.Agent{
+		{
+			Name: "polecat", Dir: "myrig",
+			MinActiveSessions: intPtr(0), MaxActiveSessions: intPtr(3),
+			NamepoolNames: []string{"alpha", "bravo", "charlie"},
+		},
+		{
+			Name: "polecat", Dir: "otherrig",
+			MinActiveSessions: intPtr(0), MaxActiveSessions: intPtr(-1),
+		},
+	}
+	startBeadScopedPoolSession(t, state.fakeState, "polecat-hq-wisp-bravo", "myrig/polecat", "myrig/bravo")
+	// Same prefix, other rig's pool: a myrig restart must leave it alone.
+	startBeadScopedPoolSession(t, state.fakeState, "polecat-hq-wisp-other", "otherrig/polecat", "otherrig/polecat-2")
+	h := newTestCityHandler(t, state)
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, newPostRequest(cityURL(state, "/rig/myrig/restart"), nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	var got RigActionBody
+	if err := json.NewDecoder(rec.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	// The fake's Stop of an idle slot succeeds, so alpha and charlie are in
+	// killed too. What matters is which sessions are left running.
+	if got.Status != "ok" || !slices.Contains(got.Killed, "myrig/bravo") || slices.Contains(got.Killed, "otherrig/polecat-2") {
+		t.Errorf("restart = status %q, killed %v; want ok, with myrig/bravo and without otherrig/polecat-2", got.Status, got.Killed)
+	}
+	if state.sp.IsRunning("polecat-hq-wisp-bravo") {
+		t.Errorf("polecat-hq-wisp-bravo still running after a myrig restart")
+	}
+	if !state.sp.IsRunning("polecat-hq-wisp-other") {
+		t.Errorf("a myrig restart stopped otherrig's polecat-hq-wisp-other")
+	}
+}
+
+// vn-ub0fz5t: the store-free sessions list keyed configured members by their
+// derived name, so a live polecat listed with no template, alias or provider.
+func TestSessionListFromRuntimeNamesPoolMemberUnderBeadScopedName(t *testing.T) {
+	state := newFakeState(t)
+	state.cfg.Agents = []config.Agent{
+		{
+			Name: "polecat", Dir: "myrig", Provider: "test-agent",
+			MinActiveSessions: intPtr(0), MaxActiveSessions: intPtr(3),
+			NamepoolNames: []string{"alpha", "bravo", "charlie"},
+		},
+		{
+			Name: "polecat", Dir: "unlimited", Provider: "test-agent",
+			MinActiveSessions: intPtr(0), MaxActiveSessions: intPtr(-1),
+		},
+	}
+	startBeadScopedPoolSession(t, state, "polecat-hq-wisp-bravo", "myrig/polecat", "myrig/bravo")
+	startBeadScopedPoolSession(t, state, "polecat-hq-wisp-seven", "unlimited/polecat", "unlimited/polecat-7")
+
+	out := New(state).sessionListFromRuntime(&SessionListInput{})
+	rows := map[string]sessionResponse{}
+	for _, row := range out.Body.Items {
+		rows[row.SessionName] = row
+	}
+	for name, want := range map[string]struct{ template, alias string }{
+		"polecat-hq-wisp-bravo": {"myrig/polecat", "myrig/bravo"},
+		"polecat-hq-wisp-seven": {"unlimited/polecat", "unlimited/polecat-7"},
+	} {
+		row, ok := rows[name]
+		if !ok {
+			t.Fatalf("no row for %s in %v", name, rows)
+		}
+		if row.Template != want.template || row.Alias != want.alias || row.Provider == "" {
+			t.Errorf("%s = template %q, alias %q, provider %q; want %q, %q and a provider",
+				name, row.Template, row.Alias, row.Provider, want.template, want.alias)
+		}
 	}
 }
