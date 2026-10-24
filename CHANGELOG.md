@@ -430,6 +430,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`gc start --dry-run` no longer rewrites MCP config, skill links, or
+  `.gitignore` in the city and its rigs.** The preview ran the stage-1
+  passes for real while printing "No side effects executed": it adopted
+  provider-native MCP files (a rig's own `.mcp.json` was rewritten to hold
+  only gc's servers, its old content saved to a snapshot under
+  `.gc/mcp-adopted/`), linked skills into `.claude/skills/` and the other
+  provider sinks, added MCP entries to `.gitignore`, created agents' work
+  dirs and installed provider hooks into them, refreshed formula links, and
+  opened the event log. It now computes the same stage-1 changes without
+  applying them and lists them under "Would change in the city and its
+  rigs" (adopt, create, update, or remove each MCP file; links and legacy
+  stubs per skill sink; `.gitignore` additions), resolves the agents it
+  lists read-only, and skips the warm-up doctor scan, which can send mail.
+  A preview still fails where the start would, for example on conflicting
+  MCP targets. As before, it still writes gc's own state: it runs the
+  bead-store lifecycle to read pool demand (the store is started, and a rig
+  whose store is not yet initialized is initialized), fills the pack cache
+  with what it takes to load the config, and creates the city's runtime
+  directories under `.gc/` (`cache`, `system`, `runtime`, and an empty
+  `events.jsonl`) when they are missing. Its footer now says so, in place of
+  "No side effects executed".
+
 - **The core `orphan-sweep` order times out a minute before its next run is
   due.** The order declared no timeout, so it ran under the 300s exec
   default, equal to its 5m interval. The cooldown counts from when a run
