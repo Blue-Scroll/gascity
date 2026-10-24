@@ -1363,9 +1363,10 @@ func isSelfBlockedHookCandidate(item map[string]any) bool {
 	return false
 }
 
-// isHeldHookCandidate reports whether item carries a canonical dispatch hold
-// label (beadmeta.DispatchHoldLabels) — a bead deliberately parked because its
-// required next actor or condition is, by construction, not this session.
+// isHeldHookCandidate reports whether item carries a dispatch hold label (any
+// hold:<value>, beadmeta.IsDispatchHoldLabel) — a bead deliberately parked
+// because its required next actor or condition is, by construction, not this
+// session.
 //
 // Serving one as work is never right for ANY hook path: the assignee cannot
 // advance it, and because the assignment is never released the same bead comes
@@ -1376,9 +1377,11 @@ func isSelfBlockedHookCandidate(item map[string]any) bool {
 // hold dimension is filtered here, in the one seam every hook path already runs
 // through (the claim, the cross-store federation, and plain `gc hook`).
 //
-// Only the two canonical values match, compared exactly against the shared
-// beadmeta constants: unrelated labels that merely look hold-ish (`mpr-human-hold`,
-// the routing label `needs-mayor`) are ordinary work and must not be stranded.
+// The whole hold: family matches, not only the two canonical values: a stray
+// route on a hold:squad member otherwise reached a seat that could not use it
+// (vn-ar56o6i). Unrelated labels that merely look hold-ish (`mpr-human-hold`,
+// the routing label `needs-mayor`) do not carry the prefix, so they are
+// ordinary work and must not be stranded.
 //
 // An absent or null labels field means "no labels", never "unknown" — bd emits
 // labels:null for an unlabeled bead — so this fails open exactly like the
@@ -1394,15 +1397,8 @@ func isHeldHookCandidate(item map[string]any) bool {
 		return false
 	}
 	for _, entry := range raw {
-		label, ok := entry.(string)
-		if !ok {
-			continue
-		}
-		label = strings.TrimSpace(label)
-		for _, hold := range beadmeta.DispatchHoldLabels {
-			if strings.EqualFold(label, hold) {
-				return true
-			}
+		if label, ok := entry.(string); ok && beadmeta.IsDispatchHoldLabel(label) {
+			return true
 		}
 	}
 	return false

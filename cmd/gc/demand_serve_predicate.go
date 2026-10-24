@@ -15,7 +15,7 @@ package main
 //
 //   - a routed EPIC (an unassigned parent has no executable spec — the query
 //     excludes it deliberately, workquery.go),
-//   - a bead parked on hold:mayor / hold:external (parked precisely because the
+//   - a bead parked on any hold:<value> label (parked precisely because the
 //     next actor is not this worker),
 //   - a route stamped with a live slot suffix, "<base>-N", which the demand side
 //     normalizes to <base> and every raw consumer rejects.
@@ -197,20 +197,15 @@ func demandRowServable(b beads.Bead) bool {
 			return false
 		}
 	}
-	// LABEL: case-insensitive. Here the query is NOT the last word: whatever
-	// `gc ready` returns, the hook re-applies the hold filter in Go with
-	// EqualFold (isHeldHookCandidate) before serving a candidate, so a
-	// "Hold:Mayor" bead is served by the reader and then stripped by the hook.
-	// The worker never sees it, so it is not capacity demand.
-	for _, label := range b.Labels {
-		label = strings.TrimSpace(label)
-		for _, excluded := range rules.ExcludeLabels {
-			if strings.EqualFold(label, excluded) {
-				return false
-			}
-		}
-	}
-	return true
+	// LABEL: the whole hold: family, case-insensitive. Here the query is NOT the
+	// last word: whatever `gc ready` returns, the hook re-applies the hold filter
+	// in Go (isHeldHookCandidate) before serving a candidate, so a "Hold:Mayor"
+	// or a "hold:squad" bead is served by the reader and then stripped by the
+	// hook. The worker never sees it, so it is not capacity demand. This reads
+	// the same predicate the hook reads, not rules.ExcludeLabels, which holds only
+	// the values bd's exact-match flags can name (vn-ar56o6i: a stray route on a
+	// hold:squad member spawned a seat per re-route).
+	return !beadmeta.HasDispatchHoldLabel(b.Labels)
 }
 
 // demandRowClaimability names whether a trigger row a demand-spawned seat failed

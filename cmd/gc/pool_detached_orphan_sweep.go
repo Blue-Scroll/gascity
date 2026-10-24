@@ -185,9 +185,22 @@ func detachedOrphanRoutesFor(store, routeStore beads.Store) (detachedOrphanRoute
 // restoreCarriedWorkRoutes from its own declared route, and any non-empty
 // gc.kind is a workflow-root/control/topology bead that carriedPoolRoute
 // deliberately keeps out of pool demand.
+//
+// A held bead (any hold:<value> label) is never a candidate. Its missing route
+// is a decision, not a failed done sequence: whoever parked it took the bead
+// away from the pool on purpose. A squad adopt is the measured case. It labels
+// a polecat's bead hold:squad and clears its route, but the bead keeps the old
+// seat's gc.work_branch and gc.session_name. This sweep read those as a failed
+// hand-off and wrote the closed seat's pool back onto the bead, and each write
+// spawned a polecat that found nothing it could claim. Clearing the route by
+// hand only fed the delta lane a fresh event, so it came back 30 seconds later
+// (vn-ar56o6i).
 func isDetachedHandoffOrphanCandidate(b beads.Bead) bool {
 	if b.Status != "open" {
 		return false
+	}
+	if beadmeta.HasDispatchHoldLabel(b.Labels) {
+		return false // parked on purpose; not ours to hand back to a pool
 	}
 	if strings.TrimSpace(b.Assignee) != "" {
 		return false // still assigned — releaseOrphanedPoolAssignments covers this path

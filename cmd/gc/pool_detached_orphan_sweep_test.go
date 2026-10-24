@@ -1072,3 +1072,98 @@ func TestSweepDetachedHandoffOrphans_PartialSessionListStillResolvesByID(t *test
 		t.Fatalf("gc.routed_to=%q, want gascity/gastown.polecat", got.Metadata[beadmeta.RoutedToMetadataKey])
 	}
 }
+
+// TestSweepDetachedHandoffOrphans_LeavesAHeldSquadMemberAlone is the vn-ar56o6i
+// shape. A squad adopt took a polecat's bead: it labelled the bead hold:squad
+// and cleared its assignee and route, but the bead kept the old seat's
+// gc.work_branch, gc.session_id and gc.session_name, and that seat's session
+// bead is closed and still names the bead. The sweep must not hand the bead
+// back to the closed seat's pool: each restore spawned a polecat that found
+// nothing it could claim. Every hold:<value> is a decision, so the same holds
+// for a hold:mayor bead.
+func TestSweepDetachedHandoffOrphans_LeavesAHeldSquadMemberAlone(t *testing.T) {
+	for _, hold := range []string{"hold:squad", "hold:mayor", "Hold:Scratch"} {
+		t.Run(hold, func(t *testing.T) {
+			store := beads.NewMemStore()
+			sessionBead, err := store.Create(beads.Bead{
+				Title:  "drained polecat session",
+				Type:   sessionBeadType,
+				Labels: []string{sessionBeadLabel},
+				Metadata: map[string]string{
+					"session_name": "polecat-opus-high-hq-wisp-zy6uxsl",
+					"template":     "vessel-network/polecat-opus-high",
+					"state":        "drained",
+				},
+			})
+			if err != nil {
+				t.Fatalf("create session bead: %v", err)
+			}
+			closed := "closed"
+			if err := store.Update(sessionBead.ID, beads.UpdateOpts{Status: &closed}); err != nil {
+				t.Fatalf("close session bead: %v", err)
+			}
+			member, err := store.Create(beads.Bead{
+				Title:  "squad member",
+				Status: "open",
+				Labels: []string{"town-tooling", hold},
+				Metadata: map[string]string{
+					beadmeta.WorkBranchMetadataKey:  "polecat/vn-v5zrwhu-dag",
+					beadmeta.WorkDirMetadataKey:     "/rig/polecats/polecat-opus-high/dag",
+					beadmeta.ClaimedAtMetadataKey:   "2026-10-24T07:27:15Z",
+					beadmeta.SessionIDMetadataKey:   sessionBead.ID,
+					beadmeta.SessionNameMetadataKey: "polecat-opus-high-hq-wisp-zy6uxsl",
+				},
+			})
+			if err != nil {
+				t.Fatalf("create member bead: %v", err)
+			}
+			if err := store.SetMetadata(sessionBead.ID, "currently_processing_bead_id", member.ID); err != nil {
+				t.Fatalf("stamp session bead: %v", err)
+			}
+
+			if isDetachedHandoffOrphanCandidate(member) {
+				t.Fatalf("a %s bead is a detached-orphan candidate; it was parked on purpose", hold)
+			}
+			n, err := sweepDetachedHandoffOrphans(store)
+			if err != nil {
+				t.Fatalf("sweep: %v", err)
+			}
+			if n != 0 {
+				t.Fatalf("restored=%d, want 0 for a %s bead", n, hold)
+			}
+			got, err := store.Get(member.ID)
+			if err != nil {
+				t.Fatalf("get member bead: %v", err)
+			}
+			if route := got.Metadata[beadmeta.RoutedToMetadataKey]; route != "" {
+				t.Fatalf("gc.routed_to=%q on a %s bead, want it left empty", route, hold)
+			}
+
+			// Control: drop the hold and the same bead IS the failed-hand-off
+			// shape this sweep exists to recover, so the guard is the hold and
+			// nothing else.
+			if err := store.Update(member.ID, beads.UpdateOpts{RemoveLabels: []string{hold}}); err != nil {
+				t.Fatalf("remove hold: %v", err)
+			}
+			if n, err := sweepDetachedHandoffOrphans(store); err != nil || n != 1 {
+				t.Fatalf("unheld control: restored=%d err=%v, want 1", n, err)
+			}
+		})
+	}
+}
+
+// TestCarriedPoolRouteRefusesAHeldBead: route recovery copies a bead's own
+// gc.run_target back into gc.routed_to, and must not do it for a held bead,
+// whose empty route was cleared on purpose (vn-ar56o6i).
+func TestCarriedPoolRouteRefusesAHeldBead(t *testing.T) {
+	b := beads.Bead{ID: "w-1", Status: "open", Type: "task", Metadata: map[string]string{
+		beadmeta.RunTargetMetadataKey: "rig/polecat",
+	}}
+	if got := carriedPoolRoute(b); got != "rig/polecat" {
+		t.Fatalf("unheld control: carriedPoolRoute = %q, want rig/polecat", got)
+	}
+	b.Labels = []string{"hold:squad"}
+	if got := carriedPoolRoute(b); got != "" {
+		t.Fatalf("carriedPoolRoute on a hold:squad bead = %q, want empty", got)
+	}
+}

@@ -1,5 +1,7 @@
 package beadmeta
 
+import "strings"
+
 // HoldMayorLabel and HoldExternalLabel are the two canonical hold:<value>
 // bd label values (engdocs/contributors/hold-label-conventions.md,
 // ga-tug8ry.1): "the required next actor is the mayor" and "the required
@@ -12,10 +14,21 @@ const (
 	HoldExternalLabel = "hold:external"
 )
 
-// DispatchHoldLabels is the complete set of hold label values naming a bead
-// whose required next actor or condition is, by construction, not the worker
-// looking at it. Two different questions consume this list, and they answer
-// oppositely — conflating them is what produced both ga-5736js and gas-kg6:
+// HoldLabelPrefix opens every hold:<value> label. The two canonical values
+// above are not the whole family: a city mints its own (a squad member is
+// parked on hold:squad, a throwaway test bead on hold:scratch), and each one
+// means the same thing to a dispatcher — "not yours, do not serve it".
+const HoldLabelPrefix = "hold:"
+
+// DispatchHoldLabels is the set of hold label values the generated bd queries
+// name in their --exclude-label flags. bd matches a label exactly, so a flag
+// can only name values; it cannot name the family. Every Go and jq filter
+// matches the whole family instead (IsDispatchHoldLabel), and the hook re-applies
+// that filter to whatever bd returns, so a hold:<value> missing from this list
+// is still never served. This list only saves the row from being read.
+//
+// Two different questions consume the hold family, and they answer oppositely
+// — conflating them is what produced both ga-5736js and gas-kg6:
 //
 //   - "Is this bead WORK for whoever is asking?" — always no. Route-scoped,
 //     unassigned automatic dispatch (Tier 3 pool-demand queries and the
@@ -29,9 +42,31 @@ const (
 //     irrelevant; the assignment is a real ownership fact either way. The
 //     demand/liveness tiers that answer this (filterReadyByAssignee,
 //     ephemeralAssignedReadyProbeScript) stay hold-transparent by design and
-//     must never filter on this list (ga-5736js), or a parked bead's owner
+//     must never filter on holds (ga-5736js), or a parked bead's owner
 //     would go invisible to the pool and to crash recovery.
 //
 // The short rule: filter on holds when deciding what to DO, never when
 // deciding who EXISTS.
 var DispatchHoldLabels = []string{HoldMayorLabel, HoldExternalLabel}
+
+// IsDispatchHoldLabel reports whether label is any hold:<value> label, compared
+// case-insensitively after trimming. It is the one test for "this bead is
+// parked for someone else". Matching only the canonical values let a stray
+// route on a hold:squad member spawn a pool seat that found nothing to claim,
+// once per re-route (vn-ar56o6i). Labels that merely look hold-ish
+// (`mpr-human-hold`, the routing label `needs-mayor`) do not start with the
+// prefix, so they stay ordinary work.
+func IsDispatchHoldLabel(label string) bool {
+	label = strings.TrimSpace(label)
+	return len(label) >= len(HoldLabelPrefix) && strings.EqualFold(label[:len(HoldLabelPrefix)], HoldLabelPrefix)
+}
+
+// HasDispatchHoldLabel reports whether any of labels is a hold:<value> label.
+func HasDispatchHoldLabel(labels []string) bool {
+	for _, label := range labels {
+		if IsDispatchHoldLabel(label) {
+			return true
+		}
+	}
+	return false
+}

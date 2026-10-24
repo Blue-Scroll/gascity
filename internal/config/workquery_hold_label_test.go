@@ -1,6 +1,7 @@
 package config
 
 import (
+	"os/exec"
 	"strings"
 	"testing"
 
@@ -9,8 +10,8 @@ import (
 
 // This file expresses the ga-x9kptu / ga-5736js acceptance criteria at the
 // shell-generator level: route-scoped, unassigned pool-demand queries (Tier
-// 3, and the reconciler's count-form) must exclude beads carrying a
-// beadmeta.DispatchHoldLabels value, while the assignee-scoped ephemeral
+// 3, and the reconciler's count-form) must exclude beads carrying any
+// hold:<value> label, while the assignee-scoped ephemeral
 // probe (Tier 1/2) stays hold-transparent.
 
 func TestBdReadyPoolDemandShellExcludesDispatchHoldLabels(t *testing.T) {
@@ -38,10 +39,36 @@ func TestLegacyEphemeralPoolDemandShellRouteScopedExcludesDispatchHoldLabels(t *
 	if !strings.Contains(got, ".labels") {
 		t.Errorf("legacyEphemeralPoolDemandShell() = %q, missing a .labels reference", got)
 	}
-	for _, label := range beadmeta.DispatchHoldLabels {
-		if !strings.Contains(got, `"`+label+`"`) {
-			t.Errorf("legacyEphemeralPoolDemandShell() = %q, missing hold label %q", got, label)
-		}
+	if !strings.Contains(got, `startswith("`+beadmeta.HoldLabelPrefix+`")`) {
+		t.Errorf("legacyEphemeralPoolDemandShell() = %q, missing the hold: family match", got)
+	}
+}
+
+// TestHoldLabelJQFilterDropsTheWholeHoldFamily runs the shared jq hold clause
+// on real rows: every hold:<value> is dropped, hold:squad included, and labels
+// that only look hold-ish survive. It is the jq twin of
+// beadmeta.TestIsDispatchHoldLabelMatchesTheWholeHoldFamily (vn-ar56o6i).
+func TestHoldLabelJQFilterDropsTheWholeHoldFamily(t *testing.T) {
+	if _, err := exec.LookPath("jq"); err != nil {
+		t.Skip("jq not available; the work-query shell requires it")
+	}
+	rows := `[
+		{"id":"mayor","labels":["hold:mayor"]},
+		{"id":"external","labels":["x","hold:external"]},
+		{"id":"squad","labels":["hold:squad"]},
+		{"id":"upper","labels":["Hold:Squad"]},
+		{"id":"plain","labels":["town-tooling","mpr-human-hold","needs-mayor"]},
+		{"id":"none","labels":null},
+		{"id":"odd","labels":[7]}
+	]`
+	cmd := exec.Command("jq", "-c", `[.[]`+excludeHoldLabelsJQClause()+` | .id]`)
+	cmd.Stdin = strings.NewReader(rows)
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("jq %q: %v", excludeHoldLabelsJQClause(), err)
+	}
+	if got, want := strings.TrimSpace(string(out)), `["plain","none","odd"]`; got != want {
+		t.Fatalf("hold clause kept %s, want %s", got, want)
 	}
 }
 

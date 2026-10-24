@@ -208,10 +208,13 @@ func agreementRows() []agreementRow {
 }
 
 // holdLabelAgreementRows is generated from the label set itself, so a new
-// dispatch hold cannot be added without this property covering it.
+// dispatch hold cannot be added without this property covering it. hold:squad
+// rides along as the family member no bd flag names: the reader serves it and
+// the hook strips it, so it is not demand either (vn-ar56o6i).
 func holdLabelAgreementRows() []agreementRow {
-	rows := make([]agreementRow, 0, len(beadmeta.DispatchHoldLabels))
-	for i, label := range beadmeta.DispatchHoldLabels {
+	labels := append(append([]string(nil), beadmeta.DispatchHoldLabels...), "hold:squad")
+	rows := make([]agreementRow, 0, len(labels))
+	for i, label := range labels {
 		rows = append(rows, agreementRow{
 			name: "routed bead held by " + label,
 			bead: beads.Bead{

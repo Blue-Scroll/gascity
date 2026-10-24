@@ -201,7 +201,8 @@ func filterReadyByAssignee(ready []beads.Bead, assignee string, limit int) []bea
 	return out
 }
 
-// filterReadyByRoute mirrors `bd ready --metadata-field $metadataKey=$route --unassigned --exclude-type=epic --exclude-label "hold:mayor" --exclude-label "hold:external" --sort oldest --limit=N`.
+// filterReadyByRoute mirrors `bd ready --metadata-field $metadataKey=$route --unassigned --exclude-type=epic --exclude-label "hold:mayor" --exclude-label "hold:external" --sort oldest --limit=N`,
+// widened to the whole hold: family the hook refuses (beadmeta.IsDispatchHoldLabel).
 // This is a route-scoped, unassigned tier (Tier 3 pool-demand/control-dispatcher
 // routing), so held beads must be excluded (ga-5736js): filterReadyByAssignee
 // (Tier 1/2, assignee-scoped) stays hold-transparent by design and must not
@@ -215,14 +216,7 @@ func filterReadyByRoute(ready []beads.Bead, metadataKey, route string) []beads.B
 		if b.Metadata[metadataKey] != route {
 			continue
 		}
-		held := false
-		for _, label := range beadmeta.DispatchHoldLabels {
-			if beadLabelsContain(b.Labels, label) {
-				held = true
-				break
-			}
-		}
-		if held {
+		if beadmeta.HasDispatchHoldLabel(b.Labels) {
 			continue
 		}
 		matched = append(matched, b)

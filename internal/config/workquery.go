@@ -135,19 +135,17 @@ func bdReadyIncludeEphemeralArg(includeEphemeralReady bool) string {
 }
 
 // holdLabelMatchCondsJQ renders the jq boolean expression that tests whether
-// the label currently in scope (`.`) is one of the beadmeta.DispatchHoldLabels
-// values, e.g. `. == "hold:mayor" or . == "hold:external"`. Shared by every
-// jq-based hold filter so the label set is spelled exactly once.
+// the label currently in scope (`.`) is in the hold: family, the jq twin of
+// beadmeta.IsDispatchHoldLabel: case-insensitive on the prefix, so hold:squad
+// and Hold:Mayor match as well as the canonical values (vn-ar56o6i). A
+// non-string label reads as no hold. Shared by every jq-based hold filter so
+// the rule is spelled exactly once.
 func holdLabelMatchCondsJQ() string {
-	conds := make([]string, len(beadmeta.DispatchHoldLabels))
-	for i, label := range beadmeta.DispatchHoldLabels {
-		conds[i] = `. == "` + label + `"`
-	}
-	return strings.Join(conds, " or ")
+	return `((type == "string") and (ltrimstr(" ") | ascii_downcase | startswith("` + beadmeta.HoldLabelPrefix + `")))`
 }
 
 // excludeHoldLabelsJQClause returns a jq select(...) clause dropping beads
-// that carry any beadmeta.DispatchHoldLabels value, for jq-based pool-demand
+// that carry any hold:<value> label, for jq-based pool-demand
 // filters that have no bd-side --exclude-label flag to lean on. Mirrors the
 // bracketed-count style of the dependency-blocking select above it so both
 // clauses read the same way (ga-x9kptu / ga-5736js).
@@ -155,7 +153,7 @@ func excludeHoldLabelsJQClause() string {
 	return ` | select(([ (.labels // [])[] | select(` + holdLabelMatchCondsJQ() + `) ] | length) == 0)`
 }
 
-// heldLabelCountJQ counts how many beadmeta.DispatchHoldLabels values the FIRST
+// heldLabelCountJQ counts how many hold:<value> labels the FIRST
 // row of a work-query result carries. The in_progress serve gate reads it off
 // the candidate row it already holds, so the hold check costs no extra bd call.
 // `.[0].labels // []` absorbs both an absent row and bd's null-valued labels
@@ -558,7 +556,7 @@ func standardAssignedInProgressWorkQueryScript(topo QueryTopology) string {
 // any non-closed blocker counts.
 //
 // When checkHold is true, the same serve gate also skips a candidate parked
-// on a canonical dispatch hold (beadmeta.DispatchHoldLabels), read off the
+// on a dispatch hold (any hold:<value>, beadmeta.IsDispatchHoldLabel), read off the
 // candidate row this tier already holds — no extra bd call (gas-kg6). A held
 // bead has no blocking dependency, so the blocked_by gate alone let it
 // through and the tier re-served it on every tick; because the tier
@@ -761,8 +759,8 @@ func legacyControlAssignedReadyWorkQueryScript(topo QueryTopology) string {
 
 // ephemeralAssignedInProgressProbeScript is the ephemeral-store sibling of the
 // `bd list --status in_progress` crash-recovery query, in the same tier-1 slot.
-// It excludes candidates parked on a canonical dispatch hold
-// (beadmeta.DispatchHoldLabels) inside its own jq selection, the equivalent
+// It excludes candidates parked on a dispatch hold (any hold:<value>,
+// beadmeta.IsDispatchHoldLabel) inside its own jq selection, the equivalent
 // fall-through to the bd-list tier's nheld serve gate (gas-kg6, #5114 review):
 // without it a held ephemeral bead exited the script as the sole candidate, the
 // Go-side filter then stripped it, and the hook reported no_work while ready

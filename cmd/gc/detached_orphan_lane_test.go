@@ -286,8 +286,10 @@ func TestDetachedOrphanObserveKeepsOnlyTheOrphanShape(t *testing.T) {
 	assigned.Assignee = "someone"
 	noBranch := detachedOrphanWorkBead("N-1")
 	delete(noBranch.Metadata, beadmeta.WorkBranchMetadataKey)
+	held := detachedOrphanWorkBead("H-1")
+	held.Labels = append(held.Labels, "hold:squad") // vn-ar56o6i: parked on purpose
 
-	for _, b := range []beads.Bead{routed, assigned, noBranch} {
+	for _, b := range []beads.Bead{routed, assigned, noBranch, held} {
 		lane.observe(beadCreatedEvent(t, b))
 	}
 	if got := lane.takePending(); len(got) != 0 {

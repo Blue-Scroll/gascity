@@ -24,3 +24,30 @@ func TestDispatchHoldLabelsMatchCanonicalHoldValues(t *testing.T) {
 		}
 	}
 }
+
+// TestIsDispatchHoldLabelMatchesTheWholeHoldFamily pins the family rule: any
+// hold:<value> is a hold, whatever the value, so a city-minted hold such as
+// hold:squad is never served or counted as pool demand (vn-ar56o6i).
+func TestIsDispatchHoldLabelMatchesTheWholeHoldFamily(t *testing.T) {
+	for _, label := range []string{"hold:mayor", "hold:external", "hold:squad", "hold:scratch", "Hold:Squad", " hold:squad "} {
+		if !IsDispatchHoldLabel(label) {
+			t.Errorf("IsDispatchHoldLabel(%q) = false, want true", label)
+		}
+	}
+	for _, label := range []string{"", "hold", "mpr-human-hold", "needs-mayor", "squad", "on-hold", "threshold:hold:x"} {
+		if IsDispatchHoldLabel(label) {
+			t.Errorf("IsDispatchHoldLabel(%q) = true, want false", label)
+		}
+	}
+	for _, label := range DispatchHoldLabels {
+		if !IsDispatchHoldLabel(label) {
+			t.Errorf("canonical DispatchHoldLabels value %q is not in the hold family", label)
+		}
+	}
+	if !HasDispatchHoldLabel([]string{"town-tooling", "hold:squad"}) {
+		t.Error("HasDispatchHoldLabel missed hold:squad among other labels")
+	}
+	if HasDispatchHoldLabel([]string{"town-tooling", "squad"}) || HasDispatchHoldLabel(nil) {
+		t.Error("HasDispatchHoldLabel matched a bead with no hold label")
+	}
+}

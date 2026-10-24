@@ -51,7 +51,7 @@ func holdTestClaimOptions() hookClaimOptions {
 // regression: the exact observed sequence. An in_progress bead assigned to this
 // session and parked hold:external must not come back as action=work.
 func TestHookClaimDoesNotServeHeldExistingAssignment(t *testing.T) {
-	for _, label := range beadmeta.DispatchHoldLabels {
+	for _, label := range append(append([]string(nil), beadmeta.DispatchHoldLabels...), "hold:squad") {
 		t.Run(label, func(t *testing.T) {
 			const heldID = "gas-4cu"
 			runner := func(string, string) (string, error) {
