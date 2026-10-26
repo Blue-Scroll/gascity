@@ -2629,6 +2629,60 @@ func TestCmdNudgeStatusSurfacesDispatchSkips(t *testing.T) {
 	}
 }
 
+// TestTryDeliverQueuedNudgesByPollerReusesTheLaneStores pins vn-cq6w8n8. The
+// supervisor's nudge lane hands its open nudges and session stores to every
+// delivery. If the claim, the fence census, or the ack opens a store of its
+// own instead, each open loads the whole city config, and the claim does it
+// while holding the queue lock. That ran on every wake and every patrol
+// interval and held the supervisor at 350% CPU. A lane-shaped delivery must
+// open no store at all.
+func TestTryDeliverQueuedNudgesByPollerReusesTheLaneStores(t *testing.T) {
+	t.Setenv("GC_BEADS", "file")
+	dir := t.TempDir()
+	now := time.Now().Add(-1 * time.Minute)
+	store := openNudgeBeadStore(dir)
+	fake := runtime.NewFake()
+	mgr := newSessionManagerWithConfig(dir, store, fake, nil)
+	info, err := mgr.CreateSession(context.Background(), session.CreateOptions{Template: "worker", Title: "Worker", Command: "codex", WorkDir: dir, Provider: "codex", Env: nil, Resume: session.ProviderResume{}, Hints: runtime.Config{WorkDir: dir}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := mgr.Start(context.Background(), info.ID, "", runtime.Config{WorkDir: dir}); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if err := enqueueQueuedNudgeWithStore(dir, store, newQueuedNudge("worker", "review the deploy logs", now)); err != nil {
+		t.Fatalf("enqueueQueuedNudgeWithStore: %v", err)
+	}
+	// Fenced to a session that is gone, so the claim has to run the census.
+	stale := newQueuedNudgeWithOptions("worker", "rebind me", "session", now, queuedNudgeOptions{ID: "n-stale", SessionID: "gc-gone"})
+	if err := enqueueQueuedNudgeWithStore(dir, store, stale); err != nil {
+		t.Fatalf("enqueueQueuedNudgeWithStore stale: %v", err)
+	}
+	idleSince := time.Now().Add(-10 * time.Second)
+	fake.Activity = map[string]time.Time{info.SessionName: idleSince}
+
+	target := nudgeTarget{
+		cityPath:    dir,
+		agent:       config.Agent{Name: "worker"},
+		sessionID:   info.ID,
+		resolved:    &config.ResolvedProvider{Name: "codex"},
+		sessionName: info.SessionName,
+	}
+	obs := worker.LiveObservation{Running: true, LastActivity: &idleSince}
+
+	opens, _ := installCountingNudgeStoreSeam(t)
+	delivered, err := tryDeliverQueuedNudgesByPoller(target, store, store, fake, 0, obs)
+	if err != nil {
+		t.Fatalf("tryDeliverQueuedNudgesByPoller: %v", err)
+	}
+	if !delivered {
+		t.Fatal("delivered = false, want true")
+	}
+	if *opens != 0 {
+		t.Fatalf("lane delivery opened a nudge store %d times, want 0: every open reloads the whole city config (vn-cq6w8n8)", *opens)
+	}
+}
+
 func TestTryDeliverQueuedNudgesByPollerDeliversAndAcks(t *testing.T) {
 	t.Setenv("GC_BEADS", "file")
 	dir := t.TempDir()

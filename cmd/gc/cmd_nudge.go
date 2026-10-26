@@ -1803,7 +1803,10 @@ func tryDeliverQueuedNudgesByPoller(target nudgeTarget, store, sessStore beads.S
 	if !pollerSessionIdleEnough(target, sp, quiescence, obs) {
 		return false, nil
 	}
-	items, err := claimDueQueuedNudgesForTarget(target.cityPath, target, time.Now())
+	// Every queue write below reuses the stores the lane already holds open.
+	// A zero store makes each helper open its own, which loads the whole city
+	// config every time (vn-cq6w8n8).
+	items, err := claimDueQueuedNudgesForTargetWithStores(target.cityPath, beads.NudgesStore{Store: store}, sessStore, target, time.Now())
 	if err != nil || len(items) == 0 {
 		return false, err
 	}
@@ -1811,6 +1814,7 @@ func tryDeliverQueuedNudgesByPoller(target nudgeTarget, store, sessStore beads.S
 	if deliveryStore == nil {
 		deliveryStore = openNudgeBeadStore(target.cityPath).Store
 	}
+	queueStore := beads.NudgesStore{Store: deliveryStore}
 	// sessStore is the SESSION-class store the caller resolved from the WORK store
 	// (the dispatcher threads cr.sessionsBeadStore().Store; the CLI poll derives it
 	// from its work store), so the worker handle, the front-door stamp, and the
@@ -1842,18 +1846,18 @@ func tryDeliverQueuedNudgesByPoller(target nudgeTarget, store, sessStore beads.S
 	var bookkeepErr error
 	items, rejected := splitQueuedNudgesForTarget(target, items)
 	if len(rejected) > 0 {
-		if recErr := recordQueuedNudgeFailureWithStore(target.cityPath, beads.NudgesStore{Store: deliveryStore}, queuedNudgeIDs(rejected), errNudgeSessionFenceMismatch, time.Now()); recErr != nil {
+		if recErr := recordQueuedNudgeFailureWithStore(target.cityPath, queueStore, queuedNudgeIDs(rejected), errNudgeSessionFenceMismatch, time.Now()); recErr != nil {
 			bookkeepErr = fmt.Errorf("dead-lettering fence-mismatched nudges: %w", recErr)
 		}
 	}
 	candidates := items
 	items, blocked, err := splitQueuedNudgesForDelivery(sessionFrontDoor(deliverySessStore), deliveryMailProvider, candidates)
 	if err != nil {
-		relErr := releaseQueuedNudgeClaims(target.cityPath, queuedNudgeIDs(candidates))
+		relErr := releaseQueuedNudgeClaimsWithStore(target.cityPath, queueStore, queuedNudgeIDs(candidates))
 		return false, errors.Join(bookkeepErr, err, relErr)
 	}
 	if len(blocked) > 0 {
-		if termErr := terminalizeBlockedQueuedNudges(target.cityPath, blocked); termErr != nil {
+		if termErr := terminalizeBlockedQueuedNudgesWithStore(target.cityPath, queueStore, blocked); termErr != nil {
 			bookkeepErr = errors.Join(bookkeepErr, fmt.Errorf("withdrawing blocked nudges: %w", termErr))
 		}
 	}
@@ -1863,7 +1867,7 @@ func tryDeliverQueuedNudgesByPoller(target nudgeTarget, store, sessStore beads.S
 		fmt.Fprintf(nudgeWarningWriter, "gc nudge: warning: checking mail staleness for %s: %v\n", target.agentKey(), err) //nolint:errcheck
 	}
 	if len(staleMail) > 0 {
-		if termErr := terminalizeBlockedQueuedNudges(target.cityPath, map[string][]queuedNudge{"mail-already-read": staleMail}); termErr != nil {
+		if termErr := terminalizeBlockedQueuedNudgesWithStore(target.cityPath, queueStore, map[string][]queuedNudge{"mail-already-read": staleMail}); termErr != nil {
 			bookkeepErr = errors.Join(bookkeepErr, fmt.Errorf("withdrawing stale mail nudges: %w", termErr))
 		}
 	}
@@ -1878,7 +1882,7 @@ func tryDeliverQueuedNudgesByPoller(target nudgeTarget, store, sessStore beads.S
 	}
 	handle, err := workerHandleForNudgeTarget(target, handleSessStore, sp)
 	if err != nil {
-		relErr := releaseQueuedNudgeClaims(target.cityPath, queuedNudgeIDs(items))
+		relErr := releaseQueuedNudgeClaimsWithStore(target.cityPath, queueStore, queuedNudgeIDs(items))
 		return false, errors.Join(bookkeepErr, err, relErr)
 	}
 	result, err := handle.Nudge(context.Background(), worker.NudgeRequest{
@@ -1890,7 +1894,7 @@ func tryDeliverQueuedNudgesByPoller(target nudgeTarget, store, sessStore beads.S
 	if err != nil {
 		telemetry.RecordNudge(context.Background(), target.agentKey(), err)
 		if errors.Is(err, runtime.ErrSessionNotFound) {
-			if recErr := releaseQueuedNudgeClaims(target.cityPath, queuedNudgeIDs(items)); recErr != nil {
+			if recErr := releaseQueuedNudgeClaimsWithStore(target.cityPath, queueStore, queuedNudgeIDs(items)); recErr != nil {
 				return false, errors.Join(bookkeepErr, recErr)
 			}
 			return false, bookkeepErr
@@ -1902,10 +1906,10 @@ func tryDeliverQueuedNudgesByPoller(target nudgeTarget, store, sessStore beads.S
 			// attempt-counting/dead-letter path — that would re-inject the same
 			// reminder on the next pass.
 			stampLastNudgeDeliveredAt(deliverySessFront, target.sessionID, time.Now())
-			ackErr := ackQueuedNudgesWithOutcome(target.cityPath, queuedNudgeIDs(items), "injected_unobserved", "", "provider-nudge-return")
+			ackErr := ackQueuedNudgesWithOutcomeWithStore(target.cityPath, queueStore, queuedNudgeIDs(items), "injected_unobserved", "", "provider-nudge-return")
 			return true, errors.Join(bookkeepErr, ackErr)
 		}
-		if recErr := recordQueuedNudgeFailureWithStore(target.cityPath, beads.NudgesStore{Store: deliveryStore}, queuedNudgeIDs(items), err, time.Now()); recErr != nil {
+		if recErr := recordQueuedNudgeFailureWithStore(target.cityPath, queueStore, queuedNudgeIDs(items), err, time.Now()); recErr != nil {
 			return false, errors.Join(bookkeepErr, recErr)
 		}
 		return false, bookkeepErr
@@ -1914,12 +1918,12 @@ func tryDeliverQueuedNudgesByPoller(target nudgeTarget, store, sessStore beads.S
 		// The runtime declined without an error (e.g. the session stopped
 		// between observation and delivery). Release the claims so the next
 		// pass retries promptly instead of waiting out the in-flight lease.
-		relErr := releaseQueuedNudgeClaims(target.cityPath, queuedNudgeIDs(items))
+		relErr := releaseQueuedNudgeClaimsWithStore(target.cityPath, queueStore, queuedNudgeIDs(items))
 		return false, errors.Join(bookkeepErr, relErr)
 	}
 	telemetry.RecordNudge(context.Background(), target.agentKey(), nil)
 	stampLastNudgeDeliveredAt(deliverySessFront, target.sessionID, time.Now())
-	return true, errors.Join(bookkeepErr, ackQueuedNudges(target.cityPath, queuedNudgeIDs(items)))
+	return true, errors.Join(bookkeepErr, ackQueuedNudgesWithStore(target.cityPath, queueStore, queuedNudgeIDs(items)))
 }
 
 func stampLastNudgeDeliveredAt(sessFront *session.Store, sessionID string, t time.Time) {
@@ -2182,8 +2186,12 @@ func blockedQueuedMailNudgeReason(mp mail.Provider, item queuedNudge) (string, b
 }
 
 func terminalizeBlockedQueuedNudges(cityPath string, blocked map[string][]queuedNudge) error {
+	return terminalizeBlockedQueuedNudgesWithStore(cityPath, beads.NudgesStore{}, blocked)
+}
+
+func terminalizeBlockedQueuedNudgesWithStore(cityPath string, store beads.NudgesStore, blocked map[string][]queuedNudge) error {
 	for reason, items := range blocked {
-		if err := ackQueuedNudgesWithOutcome(cityPath, queuedNudgeIDs(items), "failed", reason, "delivery-withdrawn"); err != nil {
+		if err := ackQueuedNudgesWithOutcomeWithStore(cityPath, store, queuedNudgeIDs(items), "failed", reason, "delivery-withdrawn"); err != nil {
 			return err
 		}
 	}
@@ -2412,7 +2420,23 @@ func loadLiveNudgeFenceSessionIDsFromCity(cityPath string) map[string]struct{} {
 	if store.Store == nil {
 		return nil
 	}
-	open, err := loadOpenSessionInfos(cliSessionStore(store.Store, nil, cityPath))
+	return liveNudgeFenceSessionIDsFromSessionStore(cliSessionStore(store.Store, nil, cityPath))
+}
+
+// liveNudgeFenceSessionIDsWithSessionStore is the census for a caller that
+// already holds the session-class store open (the supervisor's nudge lane).
+// It reads that store instead of opening a fresh one, which costs a full city
+// config load (vn-cq6w8n8). A nil store, or an installed test seam, takes the
+// city path exactly as before.
+func liveNudgeFenceSessionIDsWithSessionStore(cityPath string, sessStore beads.Store) map[string]struct{} {
+	if liveNudgeFenceSessionIDs != nil || sessStore == nil {
+		return liveNudgeFenceSessionIDsForCity(cityPath)
+	}
+	return liveNudgeFenceSessionIDsFromSessionStore(sessStore)
+}
+
+func liveNudgeFenceSessionIDsFromSessionStore(sessStore beads.Store) map[string]struct{} {
+	open, err := loadOpenSessionInfos(sessStore)
 	if err != nil {
 		return nil
 	}
@@ -2624,23 +2648,44 @@ func nudgeDrainExplicitCityPath() (string, bool) {
 }
 
 func claimDueQueuedNudgesForTarget(cityPath string, target nudgeTarget, now time.Time) ([]queuedNudge, error) {
+	return claimDueQueuedNudgesForTargetWithStores(cityPath, beads.NudgesStore{}, nil, target, now)
+}
+
+// claimDueQueuedNudgesForTargetWithStores is the claim for a caller that
+// already holds the nudges-class and session-class stores open: the
+// supervisor's nudge lane. A zero store or a nil sessStore falls back to
+// opening one, as claimDueQueuedNudgesForTarget does.
+//
+// Do not drop the stores on the lane path. Opening one loads the whole city
+// config (every agent, every pack, every namepool), and the claim does it
+// while it holds the queue lock. Once the lane ran on every wake and every
+// patrol interval (vn-3dy94f5), that per-target open was the single largest
+// cost in a supervisor pinned at 350% CPU (vn-cq6w8n8).
+func claimDueQueuedNudgesForTargetWithStores(cityPath string, store beads.NudgesStore, sessStore beads.Store, target nudgeTarget, now time.Time) ([]queuedNudge, error) {
 	var (
 		liveOnce sync.Once
 		liveIDs  map[string]struct{}
 	)
 	liveSessions := func() map[string]struct{} {
 		liveOnce.Do(func() {
-			liveIDs = liveNudgeFenceSessionIDsForCity(cityPath)
+			liveIDs = liveNudgeFenceSessionIDsWithSessionStore(cityPath, sessStore)
 		})
 		return liveIDs
 	}
-	return claimDueQueuedNudgesMatching(cityPath, now, func(item queuedNudge) bool {
+	return claimDueQueuedNudgesMatchingWithStore(cityPath, store, now, func(item queuedNudge) bool {
 		return queuedNudgeClaimableForTarget(target, item, liveSessions)
 	})
 }
 
 func claimDueQueuedNudgesMatching(cityPath string, now time.Time, match func(queuedNudge) bool) ([]queuedNudge, error) {
-	maint := nudgeMaintenanceStore{cityPath: cityPath}
+	return claimDueQueuedNudgesMatchingWithStore(cityPath, beads.NudgesStore{}, now, match)
+}
+
+// claimDueQueuedNudgesMatchingWithStore reuses store for the maintenance
+// passes when the caller holds one open, and opens one lazily when store is
+// zero.
+func claimDueQueuedNudgesMatchingWithStore(cityPath string, store beads.NudgesStore, now time.Time, match func(queuedNudge) bool) ([]queuedNudge, error) {
+	maint := borrowedNudgeMaintenanceStore(cityPath, store)
 	defer maint.close() //nolint:errcheck // best-effort
 	var claimed []queuedNudge
 	err := withNudgeQueueState(cityPath, func(state *nudgeQueueState) error {
@@ -2988,14 +3033,24 @@ func enqueueQueuedNudgeWithStoreAndClock(cityPath string, store beads.NudgesStor
 }
 
 func ackQueuedNudges(cityPath string, ids []string) error {
-	return ackQueuedNudgesWithOutcome(cityPath, ids, "injected", "", "provider-nudge-return")
+	return ackQueuedNudgesWithStore(cityPath, beads.NudgesStore{}, ids)
+}
+
+func ackQueuedNudgesWithStore(cityPath string, store beads.NudgesStore, ids []string) error {
+	return ackQueuedNudgesWithOutcomeWithStore(cityPath, store, ids, "injected", "", "provider-nudge-return")
 }
 
 func ackQueuedNudgesWithOutcome(cityPath string, ids []string, outcome, reason, commitBoundary string) error {
+	return ackQueuedNudgesWithOutcomeWithStore(cityPath, beads.NudgesStore{}, ids, outcome, reason, commitBoundary)
+}
+
+// ackQueuedNudgesWithOutcomeWithStore reuses store when the caller holds one
+// open (see claimDueQueuedNudgesForTargetWithStores), else opens one.
+func ackQueuedNudgesWithOutcomeWithStore(cityPath string, store beads.NudgesStore, ids []string, outcome, reason, commitBoundary string) error {
 	if len(ids) == 0 {
 		return nil
 	}
-	maint := nudgeMaintenanceStore{cityPath: cityPath}
+	maint := borrowedNudgeMaintenanceStore(cityPath, store)
 	defer maint.close() //nolint:errcheck // best-effort
 	want := make(map[string]bool, len(ids))
 	for _, id := range ids {
@@ -3046,10 +3101,16 @@ func ackQueuedNudgesWithOutcome(cityPath string, ids []string, outcome, reason, 
 }
 
 func releaseQueuedNudgeClaims(cityPath string, ids []string) error {
+	return releaseQueuedNudgeClaimsWithStore(cityPath, beads.NudgesStore{}, ids)
+}
+
+// releaseQueuedNudgeClaimsWithStore reuses store when the caller holds one
+// open (see claimDueQueuedNudgesForTargetWithStores), else opens one.
+func releaseQueuedNudgeClaimsWithStore(cityPath string, store beads.NudgesStore, ids []string) error {
 	if len(ids) == 0 {
 		return nil
 	}
-	maint := nudgeMaintenanceStore{cityPath: cityPath}
+	maint := borrowedNudgeMaintenanceStore(cityPath, store)
 	defer maint.close() //nolint:errcheck // best-effort
 	want := make(map[string]bool, len(ids))
 	for _, id := range ids {
