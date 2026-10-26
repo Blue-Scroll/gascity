@@ -100,3 +100,20 @@ func TestCountCanonicalRunStatusesIncludesHistoryBeyondSummaryCap(t *testing.T) 
 		t.Fatalf("completed = %d, want %d beyond summary cap", got.Completed, completedRuns)
 	}
 }
+
+// TestCountCanonicalRunStatusesLaterDuplicateWins pins the root lookup when a
+// bead ID appears twice: the later copy decides the status. The lookup indexes
+// beadList by pointer instead of copying each bead (vn-cq6w8n8), and must keep
+// the rule the copying map had.
+func TestCountCanonicalRunStatusesLaterDuplicateWins(t *testing.T) {
+	lane := RunLane{ID: "run-dup"}
+	open := beads.Bead{ID: "run-dup", Status: "open"}
+	closed := beads.Bead{ID: "run-dup", Status: "closed", Metadata: beads.StringMap{beadmeta.OutcomeMetadataKey: beadmeta.OutcomeFail}}
+
+	if got := CountCanonicalRunStatuses([]beads.Bead{open, closed}, []RunLane{lane}); got.Failed != 1 {
+		t.Fatalf("open then closed: counts = %+v, want Failed=1", got)
+	}
+	if got := CountCanonicalRunStatuses([]beads.Bead{closed, open}, []RunLane{lane}); got.Pending != 1 {
+		t.Fatalf("closed then open: counts = %+v, want Pending=1", got)
+	}
+}

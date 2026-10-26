@@ -78,21 +78,20 @@ func CanonicalRunStatusForLane(lane RunLane, root *beads.Bead, startedCount int)
 // same folded bead snapshot. The caller supplies the uncapped lane census from
 // BuildRunSummaryWithAllLanes so row limits never truncate the counts.
 func CountCanonicalRunStatuses(beadList []beads.Bead, lanes []RunLane) CanonicalRunStatusCounts {
-	byID := make(map[string]beads.Bead, len(beadList))
+	// Pointers into beadList, not copies. The dashboard run tailer rebuilds
+	// this census over every run bead on each change, and copying each Bead
+	// into the map was most of its CPU (vn-cq6w8n8). A later duplicate ID
+	// still wins, as it did with copies.
+	byID := make(map[string]*beads.Bead, len(beadList))
 	for i := range beadList {
-		byID[beadList[i].ID] = beadList[i]
+		byID[beadList[i].ID] = &beadList[i]
 	}
 	startedByRun := canonicalStartedMembersByRun(beadList, lanes)
 
 	var counts CanonicalRunStatusCounts
 	for i := range lanes {
 		lane := lanes[i]
-		root, found := byID[lane.ID]
-		var rootPtr *beads.Bead
-		if found {
-			rootPtr = &root
-		}
-		switch CanonicalRunStatusForLane(lane, rootPtr, startedByRun[lane.ID]) {
+		switch CanonicalRunStatusForLane(lane, byID[lane.ID], startedByRun[lane.ID]) {
 		case CanonicalRunStatusPending:
 			counts.Pending++
 		case CanonicalRunStatusActive:
@@ -122,7 +121,7 @@ func canonicalStartedMembersByRun(beadList []beads.Bead, lanes []RunLane) map[st
 		counts[lanes[i].ID] = 0
 	}
 	for i := range beadList {
-		bead := beadList[i]
+		bead := &beadList[i]
 		status := strings.TrimSpace(bead.Status)
 		if status != "in_progress" && status != "closed" {
 			continue
