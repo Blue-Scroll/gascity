@@ -3273,10 +3273,10 @@ const nudgeMaintenanceSweepBudget = 5 * time.Minute
 // sweep and skipped (ga-2kzci3 FR4). The sweep has one production caller,
 // dispatchAllQueuedNudges (nudge_dispatcher.go), which runs it once per
 // dispatch pass, before the per-session loop -- so the bursts come from how
-// often a pass fires, not from the session count. nudgeDispatchTick fires
-// on every wake-socket signal plus once at the end of each patrol tick, so
-// a busy city can invoke this many times in quick succession for the same
-// queue.
+// often a pass fires, not from the session count. The nudge lane
+// (nudge_lane.go) runs a pass on wake-socket signals, on every tick's wake
+// and on its own backstop timer, so a busy city can invoke this many times
+// in quick succession for the same queue.
 const nudgeMaintenanceDebounceWindow = time.Second
 
 var (

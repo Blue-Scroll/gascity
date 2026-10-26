@@ -249,7 +249,7 @@ non-session phases, plus the maintenance sub-steps of `beadReconcileTick`:
 | `emit_due_compute_facts` | MAINT-045 |
 | `start_historical_transcript_meta_reconcile` | MAINT-046 |
 | `sweep_detached_handoff_orphans` | MAINT-048 |
-| `nudge_dispatch_tick` | part of MAINT-055 |
+| `wake_nudge_lane` | part of MAINT-055 |
 
 Two of those sub-steps still trace under their `bead_reconcile.*` names,
 so a trace query written for legacy finds them in both modes.

@@ -23,13 +23,13 @@ var beadReconcileMaintenancePhases = []tickPhase{
 		return false
 	}},
 	sweepDetachedHandoffOrphansPhase,
-	nudgeDispatchTickPhase,
+	wakeNudgeLanePhase,
 }
 
 // bootBeadReconcileMaintenancePhases is the boot pass's share, as the legacy
 // boot reconcile runs it: only the marker-gated terminal usage facts, no
 // historical transcript pass, then the detached-orphan delta and the nudge
-// fallback.
+// lane wake.
 var bootBeadReconcileMaintenancePhases = []tickPhase{
 	{name: "emit_due_compute_facts", run: func(cr *CityRuntime, p *tickPass) bool {
 		if cr.cityBeadStore() != nil {
@@ -38,7 +38,7 @@ var bootBeadReconcileMaintenancePhases = []tickPhase{
 		return false
 	}},
 	sweepDetachedHandoffOrphansPhase,
-	nudgeDispatchTickPhase,
+	wakeNudgeLanePhase,
 }
 
 var sweepDetachedHandoffOrphansPhase = tickPhase{name: "sweep_detached_handoff_orphans", run: func(cr *CityRuntime, p *tickPass) bool {
@@ -48,9 +48,9 @@ var sweepDetachedHandoffOrphansPhase = tickPhase{name: "sweep_detached_handoff_o
 	return false
 }}
 
-var nudgeDispatchTickPhase = tickPhase{name: "nudge_dispatch_tick", run: func(cr *CityRuntime, p *tickPass) bool {
+var wakeNudgeLanePhase = tickPhase{name: "wake_nudge_lane", run: func(cr *CityRuntime, p *tickPass) bool {
 	if cr.cityBeadStore() != nil {
-		cr.runNudgeDispatchTick(p.ctx, p.trace)
+		cr.runWakeNudgeLane(p.trace)
 	}
 	return false
 }}

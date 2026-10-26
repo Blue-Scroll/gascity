@@ -1143,7 +1143,7 @@ func TestSupervisorStartOneCityV2SharesTheWiringsWake(t *testing.T) {
 // phases the guard would then refuse and count, or the tick traced as a
 // controller tick (m15). A full tick() enters no legacy session path, runs
 // beadReconcileTick's maintenance sub-steps (the detached-orphan sweep and
-// the nudge fallback trace under bead_reconcile.*; the usage facts and the
+// the nudge lane wake trace under bead_reconcile.*; the usage facts and the
 // historical transcript pass leave their own marks), and traces as a
 // maintenance tick.
 func TestCityRuntimeV2FullTickRunsOnlyMaintenance(t *testing.T) {
@@ -1164,7 +1164,7 @@ func TestCityRuntimeV2FullTickRunsOnlyMaintenance(t *testing.T) {
 	}
 	assertLinesEqual(t, "v2 tick bead_reconcile sub-steps", subSteps, []string{
 		"bead_reconcile.sweep_detached_handoff_orphans",
-		"bead_reconcile.nudge_dispatch_tick",
+		"bead_reconcile.wake_nudge_lane",
 	})
 	if !transcriptMetaStarted(cr) {
 		t.Error("the v2 tick did not start the historical transcript pass")

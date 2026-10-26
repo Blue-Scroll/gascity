@@ -26,8 +26,8 @@ const pingNudgeWakeSocketDialTimeout = 200 * time.Millisecond
 // pingNudgeWakeSocket sends a best-effort wake signal to the supervisor's
 // nudge dispatcher. Callers invoke this after enqueueing a queued nudge so
 // the supervisor delivers within sub-second latency instead of waiting for
-// the next patrol tick. Failures (no listener, dial timeout, write error)
-// are intentionally silent: the patrol-tick fallback in supervisor mode
+// the nudge lane's backstop timer. Failures (no listener, dial timeout,
+// write error) are intentionally silent: that backstop in supervisor mode
 // and the per-session poller in legacy mode each guarantee eventual
 // delivery without the wake.
 func pingNudgeWakeSocket(cityPath string) {
@@ -106,7 +106,9 @@ func startNudgeWakeListener(ctx context.Context, cityPath string, wakeCh chan<- 
 	return lis, nil
 }
 
-// dispatchAllQueuedNudges runs one supervisor-side dispatcher pass: scan
+// dispatchAllQueuedNudges runs one supervisor-side dispatcher pass. Its one
+// production caller is the nudge lane (nudge_lane.go), off the controller
+// goroutine; never call it from the tick, which can run for hours. Scan
 // the queue for pending agents, resolve each to a nudgeTarget via
 // sessionBeads, and try delivery. Returns the number of targets that
 // successfully delivered at least one item.
@@ -170,9 +172,8 @@ func dispatchAllQueuedNudges(cityPath string, cfg *config.City, store, sessStore
 	}
 
 	// The dispatcher receives the nudges-class store (store) PLUS the session-class
-	// store (sessStore) the caller resolved from the WORK store — the controller
-	// threads cr.sessionsBeadStore().Store, whose fallback is the work store, NOT
-	// the nudges store. The session observe below and the queue-delivery path's
+	// store (sessStore) the caller resolved from the WORK store — the nudge lane
+	// threads resolveSessionStore over the city work store, NOT the nudges store. The session observe below and the queue-delivery path's
 	// session ops route through sessStore; the queue record/dead-letter stays on
 	// store. Identity today; corrects the pre-existing controller-side class mix
 	// (deriving sessStore from the nudges base would mis-resolve session beads once

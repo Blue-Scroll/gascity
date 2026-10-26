@@ -370,7 +370,7 @@ func runFixtureTickCtx(ctx context.Context, cr *CityRuntime, trigger string) {
 // lane) are pinned exactly as main's tick produced them before the split: any
 // phase reordered, dropped, duplicated or changed in what it reads or writes
 // fails here, and so does a moved beadReconcileTick helper
-// (runDetachedHandoffOrphansDelta, runNudgeDispatchTick) no longer called, or
+// (runDetachedHandoffOrphansDelta, runWakeNudgeLane) no longer called, or
 // a read-only phase body (the extmsg reapers) gutted under its record.
 func TestCityRuntimeTickPhasesMatchLegacyTickRecordsAndStoreOps(t *testing.T) {
 	for _, tc := range []struct {
@@ -417,7 +417,7 @@ func TestCityRuntimeTickPhasesMatchLegacyTickRecordsAndStoreOps(t *testing.T) {
 				"controller.tick.phase bead_reconcile.reconcile_sessions",
 				"controller.tick.phase bead_reconcile.record_trace_session_results",
 				"controller.tick.phase bead_reconcile.dispatch_wait_nudges",
-				"controller.tick.phase bead_reconcile.nudge_dispatch_tick",
+				"controller.tick.phase bead_reconcile.wake_nudge_lane",
 				"controller.tick.phase bead_reconcile.nudge_stalled_pool_claims",
 				"controller.tick.phase bead_reconcile_tick",
 				"controller.tick.phase reconcile_execution_completions",
@@ -512,7 +512,7 @@ func TestCityRuntimeTickPhasesMatchLegacyTickRecordsAndStoreOps(t *testing.T) {
 				"controller.tick.phase bead_reconcile.reconcile_sessions",
 				"controller.tick.phase bead_reconcile.record_trace_session_results",
 				"controller.tick.phase bead_reconcile.dispatch_wait_nudges",
-				"controller.tick.phase bead_reconcile.nudge_dispatch_tick",
+				"controller.tick.phase bead_reconcile.wake_nudge_lane",
 				"controller.tick.phase bead_reconcile.nudge_stalled_pool_claims",
 				"controller.tick.phase bead_reconcile_tick",
 				"controller.tick.phase reconcile_execution_completions",
@@ -652,7 +652,7 @@ func TestCityRuntimeStartupLegacyPhaseSequenceUnchanged(t *testing.T) {
 		"controller.tick.phase bead_reconcile.reconcile_sessions",
 		"controller.tick.phase bead_reconcile.record_trace_session_results",
 		"controller.tick.phase bead_reconcile.dispatch_wait_nudges",
-		"controller.tick.phase bead_reconcile.nudge_dispatch_tick",
+		"controller.tick.phase bead_reconcile.wake_nudge_lane",
 		"controller.tick.phase bead_reconcile.nudge_stalled_pool_claims",
 	})
 	assertLinesEqual(t, "startup store calls", store.recorded(), []string{
@@ -795,7 +795,7 @@ func transcriptMetaStarted(cr *CityRuntime) bool {
 // Kills: a session phase (chat auto-suspend, corpse cleanup, demand and
 // sync, bead reconcile, ...) left in what v2 leaves the tick, a maintenance
 // phase dropped from it, or a beadReconcileTick maintenance sub-step gutted:
-// the detached-orphan delta or the nudge fallback (their records), the
+// the detached-orphan delta or the nudge lane wake (their records), the
 // historical transcript pass (not started), or the usage facts flipped to
 // boot mode (no live-lane read of the awake session). Running that list
 // writes nothing to the session row and traces no session phase.
@@ -817,7 +817,7 @@ func TestCityRuntimeTickV2RunsMaintenancePhasesOnly(t *testing.T) {
 		"emit_due_compute_facts",
 		"start_historical_transcript_meta_reconcile",
 		"sweep_detached_handoff_orphans",
-		"nudge_dispatch_tick",
+		"wake_nudge_lane",
 		"retire_suspended_rig_scopes",
 		"reconcile_execution_completions",
 		"wisp_gc",
@@ -845,7 +845,7 @@ func TestCityRuntimeTickV2RunsMaintenancePhasesOnly(t *testing.T) {
 		"controller.tick.phase reap_stale_extmsg_bindings",
 		"controller.tick.phase reap_stale_extmsg_participants",
 		"controller.tick.phase bead_reconcile.sweep_detached_handoff_orphans",
-		"controller.tick.phase bead_reconcile.nudge_dispatch_tick",
+		"controller.tick.phase bead_reconcile.wake_nudge_lane",
 		"controller.tick.phase reconcile_execution_completions",
 		"controller.tick.phase workspace_service_tick",
 		"controller.tick.phase process_convergence_requests",
@@ -869,7 +869,7 @@ func TestCityRuntimeTickV2RunsMaintenancePhasesOnly(t *testing.T) {
 // Kills: a session phase left in what v2 leaves the startup step, or its
 // maintenance phases dropped or changed from the legacy boot reconcile's:
 // boot-mode usage facts (no live-lane read), no historical transcript pass,
-// then the detached-orphan delta and the nudge fallback.
+// then the detached-orphan delta and the nudge lane wake.
 func TestCityRuntimeStartupV2RunsMaintenancePhasesOnly(t *testing.T) {
 	assertLinesEqual(t, "v2 startup phases", taggedPhaseNames(maintenancePhases(legacyStartupPhases)), []string{
 		"managed_dolt_preflight",
@@ -878,7 +878,7 @@ func TestCityRuntimeStartupV2RunsMaintenancePhasesOnly(t *testing.T) {
 		"sweep_process_table_orphans",
 		"emit_due_compute_facts",
 		"sweep_detached_handoff_orphans",
-		"nudge_dispatch_tick",
+		"wake_nudge_lane",
 	})
 
 	cr, store := newPhaseFixtureRuntime(t, false, true)
@@ -891,7 +891,7 @@ func TestCityRuntimeStartupV2RunsMaintenancePhasesOnly(t *testing.T) {
 	assertLinesEqual(t, "v2 startup operation records", tickOperationRecords(t, cr), []string{
 		"controller.tick.phase reap_runtimes_bound_to_closed_beads",
 		"controller.tick.phase bead_reconcile.sweep_detached_handoff_orphans",
-		"controller.tick.phase bead_reconcile.nudge_dispatch_tick",
+		"controller.tick.phase bead_reconcile.wake_nudge_lane",
 	})
 	assertLinesEqual(t, "v2 startup store calls", store.recorded(), []string{
 		"List status=open type=session label= metadata= include_closed=false live=false",

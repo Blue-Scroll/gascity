@@ -342,7 +342,7 @@ func TestMetadataInfoOnlyFilesStayOnInfoSnapshot(t *testing.T) {
 // stamp (sessionFrontDoor(sessStore/deliverySessStore)), and the wait-bead reads in
 // splitQueuedNudgesForDelivery — through it. tryDeliverQueuedNudgesByPoller and
 // dispatchAllQueuedNudges take an explicit sessStore param that the CALLER resolves:
-// the controller threads cr.sessionsBeadStore().Store, whose fallback is the WORK
+// the nudge lane (nudge_lane.go) threads resolveSessionStore over the city WORK
 // store (NOT the nudges store) — this closed the live controller-dispatcher class-mix
 // where the session store was derived from cr.nudgesBeadStore().Store. The CLI
 // poll/drain paths derive sessStore from their openNudgeBeadStore base, which is
@@ -353,7 +353,7 @@ func TestMetadataInfoOnlyFilesStayOnInfoSnapshot(t *testing.T) {
 // stay on openNudgeBeadStore — enqueue/ack/release/record/terminalize/rollback and
 // nudgeFrontDoor are nudges class (their own E1.2 routing), mirroring cmd_sling.go's
 // deferred nudge enqueue. nudge_dispatcher.go is a pure RECEIVER of that session store
-// (routed at the controller boundary in city_runtime.go, a mixed file off this list),
+// (routed at the controller boundary in nudge_lane.go, off this list),
 // so it is intentionally absent from the routed-files list. The positive cliSessionStore(
 // tripwire protects the routed delivery arm; as a non-front-door router this guard is
 // a regression canary for the file, not a completeness proof.
