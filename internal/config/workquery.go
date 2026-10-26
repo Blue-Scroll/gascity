@@ -384,9 +384,18 @@ func poolDemandFirstRowFunctionScript(topo QueryTopology) string {
 // preference an older root can be returned forever while its ready child waits
 // behind it. A malformed reader payload is preserved for the hook's existing
 // fail-open handling rather than being converted into false-empty demand.
+//
+// It also drops every row on a dispatch hold (the whole hold: family, not only
+// the values bd's --exclude-label flags name). A routed hold:<value> row is
+// never pool work: a squad member whose stray gc.routed_to survived its
+// enlistment was handed to a polecat that way (vn-c4jeecr). Dropping it here,
+// before the tier decides whether it found anything, means a window holding
+// only held rows falls through to the legacy tiers instead of exiting with
+// rows the hook will strip.
 func preferExecutablePoolDemandScript() string {
 	predicate := graphWorkflowAnchorJQPredicate()
-	preferJQ := `[.[] | select((` + predicate + `) | not)] + [.[] | select(` + predicate + `)]`
+	unheld := `.[]` + excludeHoldLabelsJQClause()
+	preferJQ := `[` + unheld + ` | select((` + predicate + `) | not)] + [` + unheld + ` | select(` + predicate + `)]`
 	return `gc_preferred_pool_demand=$(printf "%s" "$r" | jq -c ` + shellquote.Quote(preferJQ) + ` 2>/dev/null); ` +
 		`[ -n "$gc_preferred_pool_demand" ] && r="$gc_preferred_pool_demand"; `
 }
@@ -424,13 +433,19 @@ func routedReadyTierCommand(topo QueryTopology) string {
 // expression (TestEffectiveScaleCheckUsesReadyOnly). That discipline is why this
 // form needed no new failure clause when the federated reader arrived — it is
 // the shape readyReaderFailurePropagation gives the worker-side tiers.
+//
+// The final count drops every held row (the whole hold: family), the twin of
+// preferExecutablePoolDemandScript: a row the worker tier will not serve must
+// not be counted as demand, or the pool spawns a seat that finds nothing
+// (vn-c4jeecr).
 func poolDemandCountShell(target string, topo QueryTopology) string {
+	countJQ := `(add // []) | [.[]` + excludeHoldLabelsJQClause() + `] | unique_by(.id) | length`
 	script := `target="$1"; ` +
 		`ready_json=$(` + bdReadyPoolDemandShell("--limit 0", topo) + `) || exit $?; ` +
 		`legacy_candidates=$(` + bdReadyPoolDemandMigrationShell("--limit 0", topo) + `) || exit $?; ` +
 		`legacy_json=$(printf "%s" "$legacy_candidates" | ` + poolDemandMigrationFilterJQ(0) + `) || exit $?; ` +
 		`legacy_ephemeral_json=$(` + legacyEphemeralPoolDemandShell(0, topo, false) + `); ` +
-		`printf "%s\n%s\n%s\n" "$ready_json" "$legacy_json" "$legacy_ephemeral_json" | jq -s "(add // []) | unique_by(.id) | length"`
+		`printf "%s\n%s\n%s\n" "$ready_json" "$legacy_json" "$legacy_ephemeral_json" | jq -s ` + shellquote.Quote(countJQ)
 	return shellquote.Join([]string{"sh", "-c", script, "--", target})
 }
 

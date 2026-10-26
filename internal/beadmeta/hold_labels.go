@@ -20,12 +20,22 @@ const (
 // means the same thing to a dispatcher — "not yours, do not serve it".
 const HoldLabelPrefix = "hold:"
 
+// HoldSquadLabel parks a squad member: a child of its squad bead, built only
+// by that squad, never claimed by any seat. The captain claims the SQUAD
+// bead, which carries the plain label "squad", not this one. A member that
+// still carries a stray gc.routed_to is exactly the row a pool must never be
+// handed (vn-c4jeecr), so it gets a bd-side exclude like the canonical two.
+const HoldSquadLabel = "hold:squad"
+
 // DispatchHoldLabels is the set of hold label values the generated bd queries
 // name in their --exclude-label flags. bd matches a label exactly, so a flag
 // can only name values; it cannot name the family. Every Go and jq filter
 // matches the whole family instead (IsDispatchHoldLabel), and the hook re-applies
 // that filter to whatever bd returns, so a hold:<value> missing from this list
-// is still never served. This list only saves the row from being read.
+// is still never served. This list keeps the row from being read at all, which
+// matters because the routed tier reads a bounded window (--limit=20): a held
+// row bd returns takes a slot an unheld row needed. So a hold value that rides
+// on routed beads in practice belongs here; hold:squad does (vn-c4jeecr).
 //
 // Two different questions consume the hold family, and they answer oppositely
 // — conflating them is what produced both ga-5736js and gas-kg6:
@@ -47,7 +57,7 @@ const HoldLabelPrefix = "hold:"
 //
 // The short rule: filter on holds when deciding what to DO, never when
 // deciding who EXISTS.
-var DispatchHoldLabels = []string{HoldMayorLabel, HoldExternalLabel}
+var DispatchHoldLabels = []string{HoldMayorLabel, HoldExternalLabel, HoldSquadLabel}
 
 // IsDispatchHoldLabel reports whether label is any hold:<value> label, compared
 // case-insensitively after trimming. It is the one test for "this bead is

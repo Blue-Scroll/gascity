@@ -6,7 +6,9 @@ import "testing"
 // named home for the two canonical hold values documented in
 // engdocs/contributors/hold-label-conventions.md (hold:mayor, hold:external)
 // so internal/config and cmd/gc can share one definition instead of each
-// re-spelling the label strings (ga-x9kptu / ga-5736js).
+// re-spelling the label strings (ga-x9kptu / ga-5736js). It also pins
+// hold:squad on the bd-side exclude list, so a squad member with a stray
+// route never fills a slot of the routed tier's window (vn-c4jeecr).
 func TestDispatchHoldLabelsMatchCanonicalHoldValues(t *testing.T) {
 	if HoldMayorLabel != "hold:mayor" {
 		t.Fatalf("HoldMayorLabel = %q, want %q", HoldMayorLabel, "hold:mayor")
@@ -14,7 +16,10 @@ func TestDispatchHoldLabelsMatchCanonicalHoldValues(t *testing.T) {
 	if HoldExternalLabel != "hold:external" {
 		t.Fatalf("HoldExternalLabel = %q, want %q", HoldExternalLabel, "hold:external")
 	}
-	want := []string{HoldMayorLabel, HoldExternalLabel}
+	if HoldSquadLabel != "hold:squad" {
+		t.Fatalf("HoldSquadLabel = %q, want %q", HoldSquadLabel, "hold:squad")
+	}
+	want := []string{HoldMayorLabel, HoldExternalLabel, HoldSquadLabel}
 	if len(DispatchHoldLabels) != len(want) {
 		t.Fatalf("DispatchHoldLabels = %#v, want %#v", DispatchHoldLabels, want)
 	}
