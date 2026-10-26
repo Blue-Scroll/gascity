@@ -1,11 +1,8 @@
 package main
 
 import (
-	"fmt"
 	"maps"
-	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 	"sync/atomic"
 )
@@ -62,16 +59,7 @@ func proxiedScopeRuntimeEnvInputs(cityPath, scopeRoot string) []string {
 }
 
 func proxiedScopeRuntimeEnvStamp(cityPath, scopeRoot string) string {
-	var stamp strings.Builder
-	for _, path := range proxiedScopeRuntimeEnvInputs(cityPath, scopeRoot) {
-		info, err := os.Stat(path)
-		if err != nil {
-			stamp.WriteString("-|")
-			continue
-		}
-		fmt.Fprintf(&stamp, "%d.%d|", info.Size(), info.ModTime().UnixNano())
-	}
-	return stamp.String()
+	return fileSetStamp(proxiedScopeRuntimeEnvInputs(cityPath, scopeRoot))
 }
 
 func proxiedScopeRuntimeEnvCacheKey(cityPath, scopeRoot string) proxiedScopeRuntimeEnvKey {

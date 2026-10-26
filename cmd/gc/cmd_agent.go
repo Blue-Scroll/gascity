@@ -94,16 +94,23 @@ func loadCityConfigWithoutBuiltinPackRefresh(cityPath string, warningWriter ...i
 // only in skipping the refresh; opts is what separates a blocking load from an
 // advisory one.
 func loadPrematerializedCityConfig(fs fsys.FS, tomlPath string, opts config.LoadOptions, warnings io.Writer) (*config.City, error) {
+	cfg, _, err := loadPrematerializedCityConfigWithProvenance(fs, tomlPath, opts, warnings)
+	return cfg, err
+}
+
+// loadPrematerializedCityConfigWithProvenance also returns which files the
+// load read, for a caller that caches against them (cityWorkspaceEnv).
+func loadPrematerializedCityConfigWithProvenance(fs fsys.FS, tomlPath string, opts config.LoadOptions, warnings io.Writer) (*config.City, *config.Provenance, error) {
 	cfg, prov, err := config.LoadWithIncludesOptions(fs, tomlPath, opts)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	emitLoadCityConfigWarnings(warnings, prov)
 	if err := validatePackRuntimeRegistrations(cfg); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	applyFeatureFlags(cfg)
-	return cfg, nil
+	return cfg, prov, nil
 }
 
 // advisoryLoad is the load option set for a config load nobody asked for.

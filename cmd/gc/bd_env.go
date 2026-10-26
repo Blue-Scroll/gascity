@@ -153,16 +153,17 @@ func workspacePinnedBdBinaryOptional(cityPath string) (string, error) {
 	} else if err != nil {
 		return "", err
 	}
-	// Resolving an executable is an environment-only operation. Use the
-	// no-refresh loader here: the full loader rewrites the generated managed
-	// provider shim as a config-load side effect, which can race an in-flight
-	// lifecycle operation and replace a caller's already-selected provider
-	// entrypoint.
-	cfg, err := loadCityConfigWithoutBuiltinPackRefresh(cityPath, io.Discard)
+	// Resolving an executable is an environment-only operation, so read only
+	// workspace.env, memoised against the config files (cityWorkspaceEnv). It
+	// loads with the no-refresh loader: the full loader rewrites the generated
+	// managed provider shim as a config-load side effect, which can race an
+	// in-flight lifecycle operation and replace a caller's already-selected
+	// provider entrypoint.
+	workspaceEnv, err := cityWorkspaceEnv(cityPath)
 	if err != nil {
 		return "", err
 	}
-	env := expandEnvMap(cfg.Workspace.Env)
+	env := expandEnvMap(workspaceEnv)
 	if raw := strings.TrimSpace(env["BD_BIN"]); raw != "" {
 		if !filepath.IsAbs(raw) {
 			return "", fmt.Errorf("workspace.env BD_BIN must be an absolute executable path")
