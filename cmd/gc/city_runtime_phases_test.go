@@ -387,6 +387,7 @@ func TestCityRuntimeTickPhasesMatchLegacyTickRecordsAndStoreOps(t *testing.T) {
 			withLane:   true,
 			trigger:    "reload",
 			wantOps: []string{
+				"config.reload config_reload.steps",
 				"controller.tick.phase managed_dolt_preflight",
 				"controller.tick.phase wake_orders_lane",
 				"controller.tick.phase runtime_inventory_lane",

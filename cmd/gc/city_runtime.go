@@ -2477,6 +2477,11 @@ func (cr *CityRuntime) reloadConfigTraced(
 		warnings = append(warnings, message)
 		fmt.Fprintf(cr.stderr, "%s: warning: %s\n", cr.logPrefix, message) //nolint:errcheck // best-effort stderr
 	}
+	// Time every step, so a slow reload names its step in the trace and, while
+	// it is still running, in the supervisor log (config_reload_steps.go).
+	steps := startReloadSteps(cr.stderr, cr.logPrefix)
+	defer steps.finish(trace)
+	steps.enter("load_candidate")
 
 	configName := cr.configName
 	if configName == "" {
@@ -2534,6 +2539,7 @@ func (cr *CityRuntime) reloadConfigTraced(
 		}
 	}
 	if cr.configRev != "" && result.Revision == cr.configRev {
+		steps.enter("order_rescan")
 		ordersChanged, orderSummary, orderErr := cr.rescanOrderDispatcher(ctx, cityRoot, result.Cfg, "gc reload: order scan", time.Now())
 		if orderErr != nil {
 			err := fmt.Errorf("order reload: %w", orderErr)
@@ -2549,6 +2555,7 @@ func (cr *CityRuntime) reloadConfigTraced(
 				Warnings: warnings,
 			}
 		}
+		steps.enter("store_metadata_publish")
 		if cr.cs != nil && cr.cs.storeMetadataChanged(result.Cfg) {
 			if !cr.cs.updateFromRuntime(result.Cfg, cr.sp, result.Revision) {
 				return rejectSuperseded("during same-revision metadata publication")
@@ -2595,6 +2602,7 @@ func (cr *CityRuntime) reloadConfigTraced(
 		}
 	}
 
+	steps.enter("prepare")
 	oldAgentCount := len(cr.cfg.Agents)
 	oldRigCount := len(cr.cfg.Rigs)
 	nextCfg := result.Cfg
@@ -2646,6 +2654,7 @@ func (cr *CityRuntime) reloadConfigTraced(
 	if newProviderName != *lastProviderName || packRuntimeDeclarationChanged(cr.cfg, nextCfg, newProviderName) || compositionChanged {
 		// Build through the transport resolver, not the bare registry, so a city
 		// that routes some sessions to ACP keeps its auto composition.
+		steps.enter("session_provider")
 		newSp, spErr := resolveSessionTransportProvider(sessionProviderContextForCity(nextCfg, cr.cityPath, newProviderName), cr.loadSessionBeadSnapshot())
 		if spErr != nil {
 			appendWarning(fmt.Sprintf("new session provider %q: %v (keeping old provider)", newProviderName, spErr))
@@ -2657,6 +2666,7 @@ func (cr *CityRuntime) reloadConfigTraced(
 		}
 	}
 
+	steps.enter("validate_rigs")
 	if err := config.ValidateRigs(nextCfg.Rigs, config.EffectiveHQPrefix(nextCfg)); err != nil {
 		appendWarning(fmt.Sprintf("config reload: %v", err))
 	}
@@ -2664,6 +2674,7 @@ func (cr *CityRuntime) reloadConfigTraced(
 		appendWarning(fmt.Sprintf("config reload: %s", w))
 	}
 	resolveRigPaths(cityRoot, nextCfg.Rigs)
+	steps.enter("beads_lifecycle")
 	var lifecycleErr error
 	for attempt := 1; attempt <= cityRuntimeReloadLifecycleRetryLimit; attempt++ {
 		lifecycleErr = cityRuntimeStartBeadsLifecycle(cityRoot, cr.cityName, nextCfg, cr.stderr)
@@ -2691,6 +2702,7 @@ func (cr *CityRuntime) reloadConfigTraced(
 			Warnings: warnings,
 		}
 	}
+	steps.enter("resolve_formulas")
 	if len(nextCfg.FormulaLayers.City) > 0 {
 		if err := ResolveFormulas(cityRoot, nextCfg.FormulaLayers.City); err != nil {
 			appendWarning(fmt.Sprintf("config reload: city formulas: %v", err))
@@ -2715,6 +2727,7 @@ func (cr *CityRuntime) reloadConfigTraced(
 
 	// A provider swap stops every running session, which cannot be undone:
 	// refuse a candidate that is already stale before doing it.
+	steps.enter("provider_swap")
 	if providerChanged && cr.cs != nil && !cr.cs.runtimeUpdateWouldBeAccepted(nextCfg, result.Revision) {
 		return rejectSuperseded("before provider effects")
 	}
@@ -2766,6 +2779,7 @@ func (cr *CityRuntime) reloadConfigTraced(
 	// accepts, so the tick loop never runs a config the API rejected. On
 	// rejection nothing below runs: the order dispatcher is neither staged
 	// nor installed, so the lane keeps the controller's generation.
+	steps.enter("publish_runtime_config")
 	if !cr.publishRuntimeConfig(nextCfg, nextSp, nextDops, result.Revision) {
 		return rejectSuperseded("during runtime publication")
 	}
@@ -2779,6 +2793,7 @@ func (cr *CityRuntime) reloadConfigTraced(
 		*lastProviderName = pendingProviderName
 	}
 
+	steps.enter("runtime_trackers")
 	cr.poolSessions = computePoolSessions(nextCfg, cr.cityName, cr.cityPath, nextSp)
 	cr.publishPoolDeathHandlers(computePoolDeathHandlers(nextCfg, cr.cityName, cityRoot, nextSp, cr.stderr))
 	cr.suspendedNames = computeSuspendedNames(nextCfg, cr.cityName, cr.cityPath)
@@ -2832,6 +2847,7 @@ func (cr *CityRuntime) reloadConfigTraced(
 	// with reload short-circuits it; timed-out dispatchers are retained and
 	// drained again during shutdown. A lane mid-pass installs it at the
 	// start of its next pass instead — the reload never waits on dispatch.
+	steps.enter("order_dispatcher")
 	nextOD, orderSnapshot := buildOrderDispatcherWithSnapshot(cr.storageRoutes, cityRoot, nextCfg, cr.rec, cr.stderr, "gc reload: order scan")
 	orderSummary := cr.stageOrderDispatcher(nextOD, orderSnapshot.Orders, orderSnapshot.Signature, time.Now())
 	cr.tryInstallPendingOrderDispatcher(ctx)
@@ -2842,6 +2858,7 @@ func (cr *CityRuntime) reloadConfigTraced(
 		fmt.Fprintf(cr.stderr, "%s: orders reloaded: %s\n", cr.logPrefix, orderSummary) //nolint:errcheck // best-effort stderr
 	}
 
+	steps.enter("service_reload")
 	// Re-point the session-event pump at the new provider's stream (or
 	// deactivate it when the new provider has none). Nil until run() wires
 	// it — startup one-shot reloads happen before the pump exists.
@@ -2855,6 +2872,7 @@ func (cr *CityRuntime) reloadConfigTraced(
 		}
 	}
 
+	steps.enter("standalone_stores")
 	if cr.cs == nil {
 		// Refresh standalone city store for auto-suspend.
 		// Also recovers from nil → non-nil when bd becomes available after startup.
@@ -2870,6 +2888,7 @@ func (cr *CityRuntime) reloadConfigTraced(
 		cr.setStandaloneStores(cityStore, buildStandaloneRigStores(nextCfg, cr.cityPath, cr.stderr))
 	}
 
+	steps.enter("convergence")
 	// Rebuild convergence scopes against the reloaded config so rigs added,
 	// removed, or rebound by this reload are honored live (#2403). New
 	// scopes repopulate their active index via the needsStartupReconcile
@@ -2882,6 +2901,7 @@ func (cr *CityRuntime) reloadConfigTraced(
 		cr.sessionDrains = newDrainTracker()
 		cr.providerHealthGate = newProviderHealthGate()
 	}
+	steps.enter("config_watcher")
 	cr.configRev = result.Revision
 	cr.watchTargets = config.WatchTargets(result.Prov, nextCfg, cityRoot)
 	cr.restartConfigWatcher()
@@ -2906,6 +2926,7 @@ func (cr *CityRuntime) reloadConfigTraced(
 	// passed agent validation; on collision we keep the previously
 	// materialized sink in place (supervisor semantics) and surface a
 	// warning rather than aborting the reload.
+	steps.enter("skill_materialization")
 	if err := checkSkillCollisions(nextCfg, cr.cityPath); err != nil {
 		appendWarning(fmt.Sprintf("skill collision; skipping materialization: %v", err))
 	} else {
