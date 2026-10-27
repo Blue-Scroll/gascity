@@ -458,3 +458,163 @@ func TestSupervisorEventStreamCarriesPendingTransitions(t *testing.T) {
 		t.Fatalf("second tagged_event = %s, want beta session.pending for %s", frame.Data, betaInfo.ID)
 	}
 }
+
+// slowPendingMonitor makes a started monitor run one cycle and then rest for
+// the rest of the test, so every later probe is one a GET made.
+func slowPendingMonitor(t *testing.T) {
+	t.Helper()
+	prev := pendingMonitorInterval
+	pendingMonitorInterval = time.Hour
+	t.Cleanup(func() { pendingMonitorInterval = prev })
+}
+
+// startPendingMonitor holds a lease on the city's monitor, as an open event
+// stream does, and waits for its first snapshot.
+func startPendingMonitor(t *testing.T, srv *Server, cityPath string) func() {
+	t.Helper()
+	release := srv.acquirePendingMonitor()
+	t.Cleanup(release)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, ok := pendingMonitorFor(cityPath).freshSnapshot(); ok {
+			return release
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("pending monitor stored no snapshot within 5s")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func getSessionPending(t *testing.T, h http.Handler, url string) sessionPendingResponse {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("GET", url, nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET %s = %d; body: %s", url, rec.Code, rec.Body.String())
+	}
+	var resp sessionPendingResponse
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode %s: %v", url, err)
+	}
+	return resp
+}
+
+// While the monitor runs, both pending GETs answer from its snapshot and run
+// no probe of their own. A dashboard polling every session's pending used to
+// run one tmux capture per session per poll, 2 to 8 s each (vn-8ckrsgv).
+func TestPendingGetsShareRunningMonitorSnapshot(t *testing.T) {
+	slowPendingMonitor(t)
+	fs := newSessionFakeState(t)
+	srv := New(fs)
+	h := newTestCityHandlerWith(t, fs, srv)
+	waiting := createTestSession(t, fs.cityBeadStore, fs.sp, "Waiting")
+	idle := createTestSession(t, fs.cityBeadStore, fs.sp, "Idle")
+	fs.sp.SetPendingInteraction(waiting.SessionName, approvalFor("req-1"))
+
+	startPendingMonitor(t, srv, fs.cityPath)
+	before := fs.sp.CountCalls("Pending", waiting.SessionName) + fs.sp.CountCalls("Pending", idle.SessionName)
+
+	for i := 0; i < 3; i++ {
+		got := getSessionPending(t, h, cityURL(fs, "/session/")+waiting.ID+"/pending")
+		if !got.Supported || got.Pending == nil || got.Pending.RequestID != "req-1" || got.Pending.Prompt != approvalFor("req-1").Prompt {
+			t.Fatalf("waiting session pending = %#v, want the full req-1 interaction", got)
+		}
+		if got := getSessionPending(t, h, cityURL(fs, "/session/")+idle.ID+"/pending"); !got.Supported || got.Pending != nil {
+			t.Fatalf("idle session pending = %#v, want supported and none", got)
+		}
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest("GET", cityURL(fs, "/pending"), nil))
+		if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"req-1"`) {
+			t.Fatalf("city pending = %d %s, want req-1 listed", rec.Code, rec.Body.String())
+		}
+	}
+
+	after := fs.sp.CountCalls("Pending", waiting.SessionName) + fs.sp.CountCalls("Pending", idle.SessionName)
+	if after != before {
+		t.Fatalf("GETs ran %d probes of their own while the monitor ran, want 0", after-before)
+	}
+}
+
+// An answer drops the snapshot, so the next GET probes live and does not show
+// the interaction that was just answered.
+func TestPendingGetProbesLiveAfterAnswer(t *testing.T) {
+	slowPendingMonitor(t)
+	fs := newSessionFakeState(t)
+	srv := New(fs)
+	h := newTestCityHandlerWith(t, fs, srv)
+	info := createTestSession(t, fs.cityBeadStore, fs.sp, "Waiting")
+	fs.sp.SetPendingInteraction(info.SessionName, approvalFor("req-1"))
+	startPendingMonitor(t, srv, fs.cityPath)
+
+	fs.sp.SetPendingInteraction(info.SessionName, nil)
+	srv.pokePendingMonitor()
+
+	if got := getSessionPending(t, h, cityURL(fs, "/session/")+info.ID+"/pending"); got.Pending != nil {
+		t.Fatalf("pending after the answer = %#v, want none", got.Pending)
+	}
+}
+
+// A cycle whose probe began before an answer must not store what it saw: the
+// snapshot would show the answered interaction until the next cycle.
+func TestPendingSnapshotFromBeforeADropIsNotStored(t *testing.T) {
+	m := newPendingMonitor(t.TempDir())
+	m.done = make(chan struct{}) // running, as far as freshSnapshot can tell
+
+	gen := m.snapshotGen()
+	m.dropSnapshot()
+	m.storeSnapshot(gen, cityPendingSnapshot{})
+	if _, ok := m.freshSnapshot(); ok {
+		t.Fatal("a snapshot probed before the drop was served")
+	}
+
+	m.storeSnapshot(m.snapshotGen(), cityPendingSnapshot{})
+	if _, ok := m.freshSnapshot(); !ok {
+		t.Fatal("a snapshot probed after the drop was not served")
+	}
+}
+
+// A snapshot is served only while the loop that refreshes it runs, and only
+// while it is younger than pendingSnapshotMaxAge.
+func TestPendingSnapshotServedOnlyWhileFresh(t *testing.T) {
+	slowPendingMonitor(t)
+	fs := newSessionFakeState(t)
+	srv := New(fs)
+	h := newTestCityHandlerWith(t, fs, srv)
+	info := createTestSession(t, fs.cityBeadStore, fs.sp, "Waiting")
+	url := cityURL(fs, "/session/") + info.ID + "/pending"
+
+	release := startPendingMonitor(t, srv, fs.cityPath)
+	m := pendingMonitorFor(fs.cityPath)
+	m.snapMu.Lock()
+	m.snapAt = time.Now().Add(-2 * pendingSnapshotMaxAge)
+	m.snapMu.Unlock()
+	before := fs.sp.CountCalls("Pending", info.SessionName)
+	getSessionPending(t, h, url)
+	if fs.sp.CountCalls("Pending", info.SessionName) == before {
+		t.Fatal("a GET answered from a snapshot older than pendingSnapshotMaxAge")
+	}
+
+	release()
+	assertPendingMonitorStopped(t, fs.cityPath)
+	before = fs.sp.CountCalls("Pending", info.SessionName)
+	getSessionPending(t, h, url)
+	if fs.sp.CountCalls("Pending", info.SessionName) == before {
+		t.Fatal("a GET answered from a stopped monitor's snapshot")
+	}
+}
+
+// After a slow cycle the monitor rests as long as the cycle took, so on a
+// loaded host it probes at most half the time instead of back to back.
+func TestPendingMonitorRestsAsLongAsASlowCycle(t *testing.T) {
+	prev := pendingMonitorInterval
+	pendingMonitorInterval = 2 * time.Second
+	t.Cleanup(func() { pendingMonitorInterval = prev })
+
+	if got := pendingMonitorRest(100 * time.Millisecond); got != 2*time.Second {
+		t.Errorf("rest after a 100ms cycle = %s, want the 2s interval", got)
+	}
+	if got := pendingMonitorRest(16 * time.Second); got != 16*time.Second {
+		t.Errorf("rest after a 16s cycle = %s, want 16s", got)
+	}
+}

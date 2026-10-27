@@ -509,6 +509,23 @@ func (s *Server) humaHandleSessionPending(_ context.Context, input *SessionIDInp
 		}, nil
 	}
 
+	// The running pending monitor already probed this session; answer from
+	// its snapshot rather than run another tmux capture (vn-8ckrsgv). A row
+	// whose probe failed probes again, so the error reaches this caller.
+	if snap, ok := s.cachedCityPending(); ok {
+		for _, row := range snap.rows {
+			if row.info.ID == id && row.err == nil {
+				return &IndexOutput[sessionPendingResponse]{
+					Index: s.latestIndex(),
+					Body: sessionPendingResponse{
+						Supported: row.supported,
+						Pending:   row.pending,
+					},
+				}, nil
+			}
+		}
+	}
+
 	mgr := s.sessionManager(store.Store)
 	pending, supported, err := mgr.Pending(id)
 	if err != nil {
@@ -624,12 +641,19 @@ func (s *Server) humaHandleCityPending(_ context.Context, _ *CityPendingInput) (
 	if store.Store == nil {
 		return nil, apierr.ServiceUnavailable.Msg("no bead store configured")
 	}
-	snap, err := s.probeCityPending()
-	if err != nil {
-		return nil, apierr.Internal.Msg(err.Error())
+	// The running pending monitor probes the same set on its own cadence;
+	// share its snapshot instead of probing every session again.
+	snap, ok := s.cachedCityPending()
+	if !ok {
+		var err error
+		snap, err = s.probeCityPending()
+		if err != nil {
+			return nil, apierr.Internal.Msg(err.Error())
+		}
 	}
 
-	partialErrors := snap.listingErrors
+	// A clone: the snapshot is shared, and the loop below appends.
+	partialErrors := slices.Clone(snap.listingErrors)
 	entries := make([]cityPendingEntry, 0, len(snap.rows))
 	for _, row := range snap.rows {
 		if row.err != nil {

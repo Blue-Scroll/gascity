@@ -41,6 +41,20 @@ import (
 // which is what it replaces. A successful POST .../respond pokes it so the
 // clear lands immediately rather than on the next tick.
 //
+// After a cycle the monitor rests for pendingMonitorInterval or for as long
+// as the cycle took, whichever is longer. A probe is a tmux capture per
+// session, so on a loaded host a cycle can take 16 s for 30 sessions; with a
+// fixed ticker the next cycle would start at once and the monitor would probe
+// without a break. Resting as long as the cycle took caps it at half the time.
+//
+// Readers share the monitor's work. While the monitor runs, GET /pending and
+// GET .../session/{id}/pending answer from its latest snapshot instead of
+// probing again (freshSnapshot). A dashboard holds the event stream open, so
+// the monitor runs, and it also polls each session's pending; before this
+// every such poll ran its own tmux capture, 2 to 8 s each on a loaded host
+// (vn-8ckrsgv). A poke drops the snapshot, so the read right after an answer
+// probes live instead of showing the answered interaction.
+//
 // Delivery. A transition is marked published only after the event log
 // acknowledges the append (events.AckRecorder), so a dropped append is retried
 // on the next cycle rather than lost, and while the monitor runs an unchanged
@@ -72,6 +86,12 @@ import (
 
 // pendingMonitorInterval is how often an active pending monitor probes.
 var pendingMonitorInterval = 2 * time.Second
+
+// pendingSnapshotMaxAge is the oldest monitor snapshot a GET may answer from.
+// A running monitor refreshes it every cycle plus rest (about 32 s at the
+// measured worst of a 16 s cycle), so this only trips when a cycle hangs; the
+// GET then probes live, as it did before readers shared the snapshot.
+var pendingSnapshotMaxAge = 60 * time.Second
 
 // pendingMonitorStateFile is the persisted published set, relative to the
 // city's runtime data directory.
@@ -107,6 +127,14 @@ type pendingMonitor struct {
 	cycleMu   sync.Mutex
 	loaded    bool
 	published map[string]publishedPending
+
+	// snapMu guards the snapshot readers share (see freshSnapshot). snapGen
+	// counts drops, so a cycle whose probe began before a drop cannot store
+	// what it saw before the answer.
+	snapMu  sync.Mutex
+	snap    *cityPendingSnapshot
+	snapAt  time.Time
+	snapGen uint64
 }
 
 func newPendingMonitor(cityPath string) *pendingMonitor {
@@ -145,9 +173,19 @@ func (s *Server) acquirePendingMonitor() func() {
 }
 
 // pokePendingMonitor asks a running monitor to probe now, e.g. right after an
-// interaction was answered. It does nothing when no stream is watching.
+// interaction was answered, and drops its snapshot so no GET answers with the
+// interaction that was just answered. It does nothing else when no stream is
+// watching.
 func (s *Server) pokePendingMonitor() {
-	pendingMonitorFor(s.state.CityPath()).wake()
+	m := pendingMonitorFor(s.state.CityPath())
+	m.dropSnapshot()
+	m.wake()
+}
+
+// cachedCityPending returns the running monitor's latest snapshot, or false
+// when a GET must probe for itself.
+func (s *Server) cachedCityPending() (cityPendingSnapshot, bool) {
+	return pendingMonitorFor(s.state.CityPath()).freshSnapshot()
 }
 
 func (m *pendingMonitor) acquire(srv *Server) {
@@ -177,6 +215,63 @@ func (m *pendingMonitor) release() {
 	m.mu.Unlock()
 	cancel()
 	<-done
+	// Nothing refreshes the snapshot once the loop is gone.
+	m.dropSnapshot()
+}
+
+// running reports whether the detection loop is live.
+func (m *pendingMonitor) running() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.done != nil
+}
+
+// freshSnapshot returns the latest cycle's snapshot while the loop that keeps
+// it current is running and it is younger than pendingSnapshotMaxAge.
+func (m *pendingMonitor) freshSnapshot() (cityPendingSnapshot, bool) {
+	if !m.running() {
+		return cityPendingSnapshot{}, false
+	}
+	m.snapMu.Lock()
+	defer m.snapMu.Unlock()
+	if m.snap == nil || time.Since(m.snapAt) > pendingSnapshotMaxAge {
+		return cityPendingSnapshot{}, false
+	}
+	return *m.snap, true
+}
+
+// snapshotGen reads the drop count before a probe, for storeSnapshot.
+func (m *pendingMonitor) snapshotGen() uint64 {
+	m.snapMu.Lock()
+	defer m.snapMu.Unlock()
+	return m.snapGen
+}
+
+// storeSnapshot keeps a cycle's snapshot for readers, unless a drop happened
+// after the probe began (gen is stale): that probe may predate the answer.
+func (m *pendingMonitor) storeSnapshot(gen uint64, snap cityPendingSnapshot) {
+	m.snapMu.Lock()
+	defer m.snapMu.Unlock()
+	if gen != m.snapGen {
+		return
+	}
+	m.snap = &snap
+	m.snapAt = time.Now()
+}
+
+// dropSnapshot forgets the snapshot, so readers probe live until the next
+// cycle stores a new one.
+func (m *pendingMonitor) dropSnapshot() {
+	m.snapMu.Lock()
+	defer m.snapMu.Unlock()
+	m.snap = nil
+	m.snapGen++
+}
+
+// pendingMonitorRest is how long the loop waits after a cycle that took
+// cycle: the interval, or the cycle's own length if that is longer.
+func pendingMonitorRest(cycle time.Duration) time.Duration {
+	return max(pendingMonitorInterval, cycle)
 }
 
 func (m *pendingMonitor) wake() {
@@ -194,17 +289,21 @@ func (m *pendingMonitor) currentServer() *Server {
 
 func (m *pendingMonitor) run(ctx context.Context, done chan struct{}) {
 	defer close(done)
-	ticker := time.NewTicker(pendingMonitorInterval)
-	defer ticker.Stop()
 	for {
+		rest := pendingMonitorInterval
 		if srv := m.currentServer(); srv != nil {
+			start := time.Now()
 			m.cycle(srv)
+			rest = pendingMonitorRest(time.Since(start))
 		}
+		timer := time.NewTimer(rest)
 		select {
 		case <-ctx.Done():
+			timer.Stop()
 			return
-		case <-ticker.C:
+		case <-timer.C:
 		case <-m.poke:
+			timer.Stop()
 		}
 	}
 }
@@ -223,11 +322,13 @@ func (m *pendingMonitor) cycle(srv *Server) {
 	if ep == nil {
 		return
 	}
+	gen := m.snapshotGen()
 	snap, err := srv.probeCityPending()
 	if err != nil {
 		log.Printf("api: pending monitor %s: listing sessions: %v", m.cityPath, err)
 		return
 	}
+	m.storeSnapshot(gen, snap)
 
 	changed := false
 	seen := make(map[string]bool, len(snap.rows))
