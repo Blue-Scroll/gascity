@@ -18,41 +18,104 @@ import (
 // that is handed one and returns cleanly read nothing from it.
 type untouchableStore struct{ beads.Store }
 
-// The async message and submit paths reuse the id the 202 gate resolved. A
-// second resolve repeated every store read before delivery (vn-lwg9dmi).
-func TestResolveDeliverableSessionIDReusesGateID(t *testing.T) {
+// The async message and submit paths reuse the target the 202 gate resolved.
+// A second resolve repeated every store read before delivery (vn-lwg9dmi).
+func TestResolveDeliverableSessionReusesGateTarget(t *testing.T) {
 	srv := New(newSessionFakeState(t))
 
-	id, err := srv.resolveDeliverableSessionID(context.Background(), untouchableStore{}, "mayor", "gc-42")
+	target, err := srv.resolveDeliverableSession(context.Background(), untouchableStore{}, "mayor", resolvedSessionTarget{id: "gc-42"})
 	if err != nil {
-		t.Fatalf("resolveDeliverableSessionID: %v", err)
+		t.Fatalf("resolveDeliverableSession: %v", err)
 	}
-	if id != "gc-42" {
-		t.Fatalf("id = %q, want the gate's id gc-42", id)
+	if target.id != "gc-42" {
+		t.Fatalf("id = %q, want the gate's id gc-42", target.id)
 	}
 }
 
-// The gate returns "" for a configured named session with no bead yet, so the
-// async path must still materialize it.
+// The gate returns a zero target for a configured named session with no bead
+// yet, so the async path must still materialize it.
 func TestSessionTargetDeliverableLeavesNamedSessionToMaterialize(t *testing.T) {
 	fs := newSessionFakeState(t)
 	srv := New(fs)
 
-	gateID, err := srv.sessionTargetDeliverable(context.Background(), fs.cityBeadStore, "worker")
+	gate, err := srv.sessionTargetDeliverable(context.Background(), fs.cityBeadStore, "worker")
 	if err != nil {
 		t.Fatalf("sessionTargetDeliverable: %v", err)
 	}
-	if gateID != "" {
-		t.Fatalf("gate id = %q, want empty for a named session with no bead", gateID)
+	if gate.id != "" || gate.record != nil {
+		t.Fatalf("gate = %+v, want a zero target for a named session with no bead", gate)
 	}
 
 	info := createTestSession(t, fs.cityBeadStore, fs.sp, "Live")
-	gateID, err = srv.sessionTargetDeliverable(context.Background(), fs.cityBeadStore, info.ID)
+	gate, err = srv.sessionTargetDeliverable(context.Background(), fs.cityBeadStore, info.ID)
 	if err != nil {
 		t.Fatalf("sessionTargetDeliverable(%s): %v", info.ID, err)
 	}
-	if gateID != info.ID {
-		t.Fatalf("gate id = %q, want %q", gateID, info.ID)
+	if gate.id != info.ID {
+		t.Fatalf("gate id = %q, want %q", gate.id, info.ID)
+	}
+}
+
+// A send addressed by session id reads the session once, in the 202 gate. The
+// handle is built from that record: the second store read was most of the
+// handle phase, the slowest prep phase in 306 of 313 sends over 300ms
+// (vn-q4axjq5).
+func TestDeliverableSessionHandleReusesGateRecord(t *testing.T) {
+	fs := newSessionFakeState(t)
+	srv := New(fs)
+	info := createTestSession(t, fs.cityBeadStore, fs.sp, "Once")
+	store := &getCountingStore{Store: fs.cityBeadStore}
+
+	gate, err := srv.sessionTargetDeliverable(context.Background(), store, info.ID)
+	if err != nil {
+		t.Fatalf("sessionTargetDeliverable: %v", err)
+	}
+	if gate.record == nil {
+		t.Fatalf("gate record = nil, want the record its exact-ID read returned")
+	}
+	if got := store.gets.Load(); got != 1 {
+		t.Fatalf("gate read the session %d times, want 1", got)
+	}
+
+	target, err := srv.resolveDeliverableSession(context.Background(), store, info.ID, gate)
+	if err != nil {
+		t.Fatalf("resolveDeliverableSession: %v", err)
+	}
+	var prep sessionDeliveryPrep
+	prep.resolved = time.Now()
+	handle, err := srv.deliverableSessionHandle(store, target, &prep)
+	if err != nil {
+		t.Fatalf("deliverableSessionHandle: %v", err)
+	}
+	if handle == nil {
+		t.Fatalf("handle = nil")
+	}
+	if got := store.gets.Load(); got != 1 {
+		t.Fatalf("send read the session %d times, want 1 (the gate's read only)", got)
+	}
+	if prep.got.IsZero() || prep.built.Before(prep.got) {
+		t.Fatalf("prep = %+v, want got and built stamped in order", prep)
+	}
+}
+
+// A target the gate could not read (a named session it left to materialize)
+// still gets one record read, and a handle.
+func TestDeliverableSessionHandleReadsRecordWhenGateHadNone(t *testing.T) {
+	fs := newSessionFakeState(t)
+	srv := New(fs)
+	info := createTestSession(t, fs.cityBeadStore, fs.sp, "Late")
+	store := &getCountingStore{Store: fs.cityBeadStore}
+
+	var prep sessionDeliveryPrep
+	handle, err := srv.deliverableSessionHandle(store, resolvedSessionTarget{id: info.ID}, &prep)
+	if err != nil {
+		t.Fatalf("deliverableSessionHandle: %v", err)
+	}
+	if handle == nil {
+		t.Fatalf("handle = nil")
+	}
+	if got := store.gets.Load(); got != 1 {
+		t.Fatalf("read the session %d times, want 1", got)
 	}
 }
 
@@ -132,7 +195,7 @@ func TestSessionMessageAndSubmitLogDeliveryPrep(t *testing.T) {
 			}
 			time.Sleep(10 * time.Millisecond)
 		}
-		for _, phase := range []string{" wait=", " resolve=", " handle="} {
+		for _, phase := range []string{" wait=", " resolve=", " handle=", " get=", " build="} {
 			if !strings.Contains(logs.String(), phase) {
 				t.Fatalf("logs = %q, want phase %q", logs.String(), phase)
 			}

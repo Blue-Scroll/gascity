@@ -471,14 +471,37 @@ func resolveLiveSessionByPathAlias(store beads.Store, identifier string) (string
 	return best.ID, true, nil
 }
 
-// resolveSessionTargetIDWithContext drives session.DecideSessionTarget: the
+// sessionRecord is a session's persisted record as one store read returned
+// it: the shape worker.Factory.SessionByRecord builds a handle from.
+type sessionRecord struct {
+	info session.Info
+	pr   session.PersistedResponse
+}
+
+// resolvedSessionTarget is a resolved session id plus, when the exact-ID step
+// selected it, the record that step read. Every other step resolves an id
+// only, so record is nil there.
+type resolvedSessionTarget struct {
+	id     string
+	record *sessionRecord
+}
+
+func (s *Server) resolveSessionTargetIDWithContext(ctx context.Context, store beads.Store, identifier string, opts apiSessionResolveOptions) (string, error) {
+	target, err := s.resolveSessionTargetWithContext(ctx, store, identifier, opts)
+	return target.id, err
+}
+
+// resolveSessionTargetWithContext drives session.DecideSessionTarget: the
 // classifier owns the precedence ladder, this adapter performs the lookup
 // each gather action names and keeps the matched ID or error for the step a
 // terminal decision cites. Lookups run exactly when the old inline ladder
 // ran them — an exact-ID hit never reaches the live scan.
-func (s *Server) resolveSessionTargetIDWithContext(ctx context.Context, store beads.Store, identifier string, opts apiSessionResolveOptions) (string, error) {
+//
+// The exact-ID step keeps the record its one store read returned, so a caller
+// that goes on to build a worker handle need not read the session again.
+func (s *Server) resolveSessionTargetWithContext(ctx context.Context, store beads.Store, identifier string, opts apiSessionResolveOptions) (resolvedSessionTarget, error) {
 	if store == nil {
-		return "", fmt.Errorf("session store unavailable")
+		return resolvedSessionTarget{}, fmt.Errorf("session store unavailable")
 	}
 	_, templateForm := parseAPITemplateTarget(identifier)
 	facts := session.TargetFacts{
@@ -487,6 +510,7 @@ func (s *Server) resolveSessionTargetIDWithContext(ctx context.Context, store be
 	}
 	selected := map[session.TargetStep]string{}
 	failed := map[session.TargetStep]error{}
+	var exactRecord *sessionRecord
 	// The classifier gathers each of the ladder's six facts at most once, so
 	// classification terminates within seven decisions. The bound (matching
 	// gatherSequence in the classifier tests) turns a classifier regression
@@ -497,20 +521,29 @@ func (s *Server) resolveSessionTargetIDWithContext(ctx context.Context, store be
 		if dec.Action == session.TargetDone {
 			switch dec.Result {
 			case session.TargetSelected:
-				return selected[dec.Source], nil
+				target := resolvedSessionTarget{id: selected[dec.Source]}
+				if dec.Source == session.TargetStepExactID {
+					target.record = exactRecord
+				}
+				return target, nil
 			case session.TargetRejectedByConfig:
-				return "", apiSessionTargetRejectedByConfig(identifier)
+				return resolvedSessionTarget{}, apiSessionTargetRejectedByConfig(identifier)
 			case session.TargetError:
-				return "", failed[dec.Source]
+				return resolvedSessionTarget{}, failed[dec.Source]
 			default:
-				return "", apiSessionTargetNotFound(identifier)
+				return resolvedSessionTarget{}, apiSessionTargetNotFound(identifier)
 			}
 		}
 		switch dec.Gather {
 		case session.TargetStepExactID:
-			id, err := session.ResolveSessionIDByExactID(store, identifier)
+			// The record twin of ResolveSessionIDByExactID: the same one
+			// store read and the same errors.
+			info, pr, err := session.ResolveSessionRecordByExactID(store, identifier)
 			facts.ExactID = lookupFact(err)
-			selected[dec.Gather], failed[dec.Gather] = id, err
+			selected[dec.Gather], failed[dec.Gather] = info.ID, err
+			if err == nil {
+				exactRecord = &sessionRecord{info: info, pr: pr}
+			}
 		case session.TargetStepConfiguredName:
 			id, matched, err := s.resolveConfiguredNamedSessionIDWithContext(ctx, store, identifier, opts)
 			switch {
@@ -558,10 +591,10 @@ func (s *Server) resolveSessionTargetIDWithContext(ctx context.Context, store be
 			facts.Closed = lookupFact(err)
 			selected[dec.Gather], failed[dec.Gather] = id, err
 		default:
-			return "", fmt.Errorf("session target classifier requested unknown step %v", dec.Gather)
+			return resolvedSessionTarget{}, fmt.Errorf("session target classifier requested unknown step %v", dec.Gather)
 		}
 	}
-	return "", fmt.Errorf("session target classifier did not terminate for %q", identifier)
+	return resolvedSessionTarget{}, fmt.Errorf("session target classifier did not terminate for %q", identifier)
 }
 
 // lookupFact maps a Resolve* error to the classifier's tri-state lookup
@@ -631,46 +664,82 @@ func (s *Server) resolveSessionIDAllowClosedWithConfig(store beads.Store, identi
 // that can never deliver, while keeping the accept-then-work model for slow
 // paths (cold named-session wakes).
 //
-// It returns the session id when the target already resolves, or "" when only
-// a configured named session matched. Hand that result to
-// resolveDeliverableSessionID in the async path; never resolve the target a
-// second time.
-func (s *Server) sessionTargetDeliverable(ctx context.Context, store beads.Store, identifier string) (string, error) {
-	if id, err := s.resolveSessionTargetIDWithContext(ctx, store, identifier, apiSessionResolveOptions{}); err == nil {
-		return id, nil
+// It returns the resolved target when one already exists, or a zero target
+// when only a configured named session matched. Hand that result to
+// deliverableSessionHandle in the async path; never resolve the target, or
+// read its record, a second time.
+func (s *Server) sessionTargetDeliverable(ctx context.Context, store beads.Store, identifier string) (resolvedSessionTarget, error) {
+	if target, err := s.resolveSessionTargetWithContext(ctx, store, identifier, apiSessionResolveOptions{}); err == nil {
+		return target, nil
 	} else if !errors.Is(err, session.ErrSessionNotFound) {
-		return "", err
+		return resolvedSessionTarget{}, err
 	}
 	if _, ok, specErr := s.findNamedSessionSpecForTarget(store, identifier); specErr == nil && ok {
-		return "", nil
+		return resolvedSessionTarget{}, nil
 	}
-	return "", apiSessionTargetNotFound(identifier)
+	return resolvedSessionTarget{}, apiSessionTargetNotFound(identifier)
 }
 
-// resolveDeliverableSessionID is the async half of sessionTargetDeliverable.
-// It reuses the id the gate resolved, and runs the resolve ladder again
+// resolveDeliverableSession is the async half of sessionTargetDeliverable.
+// It reuses the target the gate resolved, and runs the resolve ladder again
 // (materializing) only when the gate matched a configured named session that
 // has no bead yet. Resolving a found id again repeated every store read before
 // delivery, and under load one read can wait seconds on the bead cache: 2.4s
 // passed between the 202 and the worker starting (vn-lwg9dmi).
-func (s *Server) resolveDeliverableSessionID(ctx context.Context, store beads.Store, identifier, gateID string) (string, error) {
-	if gateID != "" {
-		return gateID, nil
+func (s *Server) resolveDeliverableSession(ctx context.Context, store beads.Store, identifier string, gate resolvedSessionTarget) (resolvedSessionTarget, error) {
+	if gate.id != "" {
+		return gate, nil
 	}
-	return s.resolveSessionIDMaterializingNamedWithContext(ctx, store, identifier)
+	return s.resolveSessionTargetWithContext(ctx, store, identifier, apiSessionResolveOptions{materialize: true})
+}
+
+// sessionDeliveryPrep holds when each phase of an async send's prep ended.
+// got is when the session record was in hand, which is right after resolved
+// when the 202 gate's exact-ID read already supplied it.
+type sessionDeliveryPrep struct {
+	accepted, started, resolved, got, built time.Time
+}
+
+// deliverableSessionHandle builds the worker handle for a resolved send
+// target. It reads the session record only when the resolve did not already
+// return one. Reading it again repeated the gate's store read inside the
+// handle phase, the slowest prep phase in 306 of 313 sends over 300ms
+// (vn-q4axjq5). The tmux overlay still runs here, so the handle sees live
+// runtime state.
+func (s *Server) deliverableSessionHandle(store beads.Store, target resolvedSessionTarget, prep *sessionDeliveryPrep) (worker.Handle, error) {
+	defer func() { prep.built = time.Now() }()
+	record := target.record
+	if record == nil {
+		info, pr, err := session.ResolveSessionRecordByExactID(store, target.id)
+		if err != nil {
+			prep.got = time.Now()
+			return nil, err
+		}
+		record = &sessionRecord{info: info, pr: pr}
+	}
+	prep.got = time.Now()
+	factory, err := s.workerFactory(store)
+	if err != nil {
+		return nil, err
+	}
+	return factory.SessionByRecord(record.info, record.pr)
 }
 
 // logSessionDeliveryPrep writes how long the async path took between the 202
 // and the worker starting: waiting for the goroutine, resolving the target,
-// and building the worker handle. The target is under 300ms in total
-// (vn-lwg9dmi), so a slow phase shows up here by name.
-func logSessionDeliveryPrep(op, reqID, sessionID string, acceptedAt, startedAt, resolvedAt, builtAt time.Time) {
-	log.Printf("api: %s prep request_id=%s session_id=%s total=%s wait=%s resolve=%s handle=%s",
+// and building the worker handle. handle is get (reading the session record,
+// 0 when the gate already read it) plus build (the tmux overlay and the
+// runtime resolve). The target is under 300ms in total (vn-lwg9dmi), so a slow
+// phase shows up here by name.
+func logSessionDeliveryPrep(op, reqID, sessionID string, prep sessionDeliveryPrep) {
+	log.Printf("api: %s prep request_id=%s session_id=%s total=%s wait=%s resolve=%s handle=%s get=%s build=%s",
 		op, reqID, sessionID,
-		builtAt.Sub(acceptedAt).Round(time.Millisecond),
-		startedAt.Sub(acceptedAt).Round(time.Millisecond),
-		resolvedAt.Sub(startedAt).Round(time.Millisecond),
-		builtAt.Sub(resolvedAt).Round(time.Millisecond))
+		prep.built.Sub(prep.accepted).Round(time.Millisecond),
+		prep.started.Sub(prep.accepted).Round(time.Millisecond),
+		prep.resolved.Sub(prep.started).Round(time.Millisecond),
+		prep.built.Sub(prep.resolved).Round(time.Millisecond),
+		prep.got.Sub(prep.resolved).Round(time.Millisecond),
+		prep.built.Sub(prep.got).Round(time.Millisecond))
 }
 
 func (s *Server) resolveSessionIDMaterializingNamed(store beads.Store, identifier string) (string, error) {
