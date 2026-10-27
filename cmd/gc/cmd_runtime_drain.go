@@ -964,7 +964,8 @@ func runtimeDrainAck(dops drainOps, target sessionRuntimeTarget, operator bool, 
 // ---------------------------------------------------------------------------
 
 func newRuntimeRequestRestartCmd(stdout, stderr io.Writer) *cobra.Command {
-	return &cobra.Command{
+	var key string
+	cmd := &cobra.Command{
 		Use:   "request-restart",
 		Short: "Request controller restart this session (returns immediately)",
 		Long: `Ask the controller to stop this session and start it again fresh.
@@ -984,7 +985,7 @@ request is refused; keep that variable in the agent's subprocess environment.
 
 Exits 0 once the request is recorded, even when the controller could not be
 signaled: a warning says so, and the controller acts at its next pass. Exits 1
-with nothing recorded and no runtime hint set when the request cannot be
+with no restart requested and no runtime hint set when the request cannot be
 recorded: no session context or GC_INSTANCE_TOKEN, an unreachable session
 store, a session whose row and live runtime name another incarnation, or a
 session store that cannot compare-and-swap where the request needs it: a v2
@@ -992,19 +993,34 @@ city records the request only by compare-and-swap, and
 [beads] conditional_writes = "require" refuses any write the store cannot
 fence.
 
+While the op journal records lifecycle ops, the request is recorded as a
+restart{fresh} op, which closes with the request's outcome, a refusal
+included; a rerun with the same --key reports the first run's outcome instead
+of requesting again. The key is request-restart's own: gc handoff or gc
+session reset under the same --key records another op. The restart stops this
+session, and so can stop the run before it closes its op: a rerun with the
+same --key is then refused as in progress until the op's deadline passes, and
+after that replays the first run's success while the session row still
+records the restart as pending, else reports the op's failure, also once the
+restart has run, since the op records no context to tell it by.
+
 This command is designed to be called from within a session context.
 It emits a session.draining event once the request is recorded.`,
 		Args: cobra.NoArgs,
 		RunE: func(_ *cobra.Command, _ []string) error {
-			if cmdRuntimeRequestRestart(stdout, stderr) != 0 {
+			if cmdRuntimeRequestRestart(key, stdout, stderr) != 0 {
 				return errExit
 			}
 			return nil
 		},
 	}
+	addOpKeyFlag(cmd, &key, restartOpKeyNote)
+	return cmd
 }
 
-func cmdRuntimeRequestRestart(stdout, stderr io.Writer) int {
+// cmdRuntimeRequestRestart records this session's restart request row first
+// (SG-3), as a restart{fresh} op under the op key key (empty mints one; OJ-6).
+func cmdRuntimeRequestRestart(key string, stdout, stderr io.Writer) int {
 	const verb = "gc runtime request-restart"
 	current, err := currentSessionRuntimeTarget()
 	if err != nil {
@@ -1043,9 +1059,10 @@ func cmdRuntimeRequestRestart(stdout, stderr io.Writer) int {
 	routeCfg, _ := loadCityConfigWithoutBuiltinPackRefresh(current.cityPath, io.Discard)
 	sessStore := cliSessionStore(store, routeCfg, current.cityPath)
 	rec := openCityRecorderAt(current.cityPath, stderr)
-	cfg, _ := loadCityConfig(current.cityPath, stderr)
+	cfg, cfgErr := loadCityConfig(current.cityPath, stderr)
 	r.record = sessionRestartRecorder(current.cityPath, sessStore, sp, cfg, current.sessionName)
 	r.hint = restartHintOps(current.cityPath, sp)
+	r.ops = newRestartOps(cfg, cfgErr, sessStore, key, current.sessionName, current.display, false, stdout, stderr)
 	return doRuntimeRequestRestart(r, rec, stdout)
 }
 
@@ -1077,7 +1094,19 @@ func controllerRestartTimeout(cfg *config.City) time.Duration {
 // notified, and 1 when nothing was recorded: then no runtime hint is set, no
 // event is recorded and the controller is not poked (a v2 refusal on a store
 // with no conditional writer has asked it for identify, nothing more).
+//
+// A recorded request (r.ops) proposes its restart op first: a refusal exits 1
+// before any effect, and a replay of a successful op prints the success line
+// and exits 0 without acting again.
 func doRuntimeRequestRestart(r rowFirstRestart, rec events.Recorder, stdout io.Writer) int {
+	switch r.ops.startRestart(r.verb) {
+	case cliOpRefused:
+		return 1
+	case cliOpReplayed:
+		fmt.Fprint(stdout, "Restart requested.\n") //nolint:errcheck // best-effort stdout
+		return 0
+	}
+	defer r.ops.end()
 	if err := r.recordRestart(); err != nil {
 		fmt.Fprintf(r.stderr, "%s: %s\n", r.verb, r.notRecorded(err)) //nolint:errcheck // best-effort stderr
 		return 1
