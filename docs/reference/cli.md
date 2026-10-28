@@ -29,7 +29,7 @@ gc [flags]
 | [gc agent](#gc-agent) | Manage agent configuration |
 | [gc agent-script](#gc-agent-script) | Run a deterministic YAML agent script |
 | [gc analyze](#gc-analyze) | Read-only analysis over events and beads |
-| [gc bd](#gc-bd) | Run bd in the correct rig directory |
+| [gc bd](#gc-bd) | Run a bd command in the correct rig directory |
 | [gc beads](#gc-beads) | Manage the beads provider |
 | [gc build-image](#gc-build-image) | Build a prebaked agent container image |
 | [gc cities](#gc-cities) | List registered cities |
@@ -356,8 +356,8 @@ conditionally resets an in-progress assignment only when the bead still has
 that assignee.
 
 gc bd forces BD_EXPORT_AUTO=false to prevent bd's git auto-export hook
-from wedging the wrapper after printing command output. If you need
-auto-export behavior, invoke bd directly.
+from wedging the wrapper after printing command output. To write a JSONL
+snapshot, run "gc bd export".
 
 ```
 gc bd [bd-args...]
@@ -5089,6 +5089,7 @@ gc storage
 | [gc storage recover-stranded](#gc-storage-recover-stranded) | Copy stranded infrastructure beads from the work store into the converged binding |
 | [gc storage repair-sequence](#gc-storage-repair-sequence) | Inspect or raise a SQLite bead store's id-sequence floor |
 | [gc storage status](#gc-storage-status) | Report this city's storage-class layout (read-only) |
+| [gc storage vouch-bd](#gc-storage-vouch-bd) | Walk a scope's bd and, if it matches a pinned gc bd inventory, vouch for it |
 
 ## gc storage migrate
 
@@ -5266,6 +5267,30 @@ every check the migration makes without migrating.
 ```
 gc storage status
 ```
+
+## gc storage vouch-bd
+
+On a split city, gc bd judges commands only for a bd binary whose command
+tree matches a pinned gc bd inventory. It walks each new binary's --help tree
+once and caches the verdict. This command walks the city's bd (or a rig's, with
+--rig) for real and, only if the tree matches, records a vouch for that binary
+by path and bytes (sha256) in .gc/bd-inventory-vouch.json, so gc bd admits it without
+walking it again. A binary whose tree matches no inventory is refused and
+nothing is written. city.toml is never edited.
+
+The vouch is a convenience, not a security boundary: gc doctor re-walks
+binaries and reports a mismatch, and the first admission by a vouch in each
+gc process records a gc_bd.vouch_used event. A gc whose pinned inventories
+differ from the ones the vouch was written under ignores it and walks the
+binary again.
+
+```
+gc storage vouch-bd [flags]
+```
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--rig` | string |  | vouch for this rig's bd instead of the city's |
 
 ## gc supervisor
 
