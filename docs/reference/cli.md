@@ -2147,7 +2147,12 @@ failed work query is an error (nothing on stdout), never a drain result.
 A work query that gets no answer from the bead store (a connection error, a
 timeout, a killed query, a locked database, or bd's circuit breaker failing
 fast) exits 2 and prints GC_HOOK_STORE_UNAVAILABLE on stderr: the answer is
-unknown, not empty. This applies with and without --claim. Any other
+unknown, not empty. This applies with and without --claim. The answers that
+count as "no answer" are shared with the storage gate's transient faults and
+include a hosted bd serve answering 502, 503 or 504, "cannot reach bd serve",
+a killed bd ("signal: killed"), "too many open files", network timeouts and
+unreachable hosts (EHOSTUNREACH), and EMFILE/EAGAIN; each of these exits 2
+with the token (stdout keeps any partial output). Any other
 work-query failure exits 2 without --claim and 1 with --claim. Neither writes a
 drain result. When another store the hook searches serves work, a store that
 failed is named on stderr and the work is served; when no store has work, a
@@ -2158,6 +2163,19 @@ rig is not searched at all (gc ready does not read it either), and a rig whose
 managed Dolt server is not running is named on stderr but does not hold the
 answer up. A failed query is also recorded as a session.work_query_failed event,
 one per store that failed, naming it.
+
+Before the work query, a session keyed by $GC_SESSION_ID is checked for a
+pending drain (the drain fence), with and without --claim. A draining session
+gets the drain result instead of work. If the session row cannot be read, the
+fence depends on why. A store fault that may clear on its own (a timeout, a
+locked database, a work store the storage gate could not read) fails open:
+the hook proceeds, names the fault on stderr, and records a
+session.drain_fence_unavailable event. A standing storage refusal (the city's
+storage gate refuses to serve its relocated classes, for example a retained
+work store holding infrastructure beads the binding cannot read) fails closed:
+nothing is claimed or served, GC_HOOK_STORE_UNAVAILABLE is printed on stderr
+with the refusal, the hook exits 2, and the event says the fence failed
+closed.
 
 The agent is determined from $GC_AGENT or a positional argument.
 
@@ -5174,10 +5192,11 @@ gc storage preflight
 Copy the infrastructure beads a converged city's proven copy never carried
 out of the retained work store and into the binding that is already serving.
 
-This is the recovery the stranded-write refusal names. It is additive: it moves
-only ids the binding does not hold and the proven-copy manifest does not record,
-it deletes nothing from either store, and it extends the manifest only after
-every moved bead has been proven equal against a closed and reopened
+This is the recovery the stranded-write refusal names. Unless you name a row
+with --replace-binding-row or --drop-work-row (below), it is additive: it
+moves only ids the binding does not hold and the proven-copy manifest does not
+record, it deletes nothing from either store, and it extends the manifest only
+after every moved bead has been proven equal against a closed and reopened
 destination. A bead whose class it cannot state is named and left where it is.
 
 It refuses on a city that has NOT converged — the whole copy is still owed
@@ -5189,16 +5208,43 @@ what the binding does.
 The recovered beads stay in the work store until the migration is run again,
 which clears them exactly as it clears the cutover's own copies.
 
+A manifest written by an older build may list a work-store row by id alone,
+with nothing that says whether it is the bead the copy carried: no time
+bounds the entry, the row carries no created_at, or the row is younger than
+the manifest, which an older recover-stranded extended with the id of every
+row it carried. When the binding no longer holds such a row, a closed one is
+moved. One that is not closed is refused and shown (status, type,
+timestamps, title): nothing here can tell whether the binding collected the
+bead the copy carried or never received it. Decide per id with --move &lt;id&gt;
+(copy it in as it is) or --record-carried &lt;id&gt; (record it as carried; the
+clear then deletes its work-store row, and the clear's backup keeps it).
+Both also accept closed rows. --dry-run and --dump show these rows without
+writing, and naming an already-resolved id again is a no-op.
+
+A work-store row can also reuse an id the binding still holds for a
+different bead: the work store minted the id again after the copy carried
+the original. No copy can carry it under that id, so it is named and left
+unrecorded until you decide per id: --replace-binding-row &lt;id&gt; (the
+work-store row replaces the binding's) or --drop-work-row &lt;id&gt; (the
+work-store row is removed and the binding's stays). These are the only
+choices that remove a row, and each first backs up the row it removes, with
+every edge touching it, to infra.recover-choices.jsonl at the binding root.
+--dry-run shows both rows of each such id.
+
 ```
 gc storage recover-stranded [flags]
 ```
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
+| `--drop-work-row` | stringSlice |  | for a work-store row whose id the binding holds for a different bead: back up and remove the work-store row, keeping the binding's (repeatable, comma-separated) |
 | `--dry-run` | bool |  | report the gap and write the dump without touching the binding or the manifest |
 | `--dump` | string |  | write every stranded bead and its source dep edges to this JSON file before any write |
 | `--fleet-stopped` | bool |  | attest that every writer that can reach this city's work store is stopped — not just its controller, which this command proves on its own |
 | `--from-work` | bool |  | recover the stranded infrastructure beads out of this city's work store |
+| `--move` | stringSlice |  | for a work-store row the manifest lists by id alone and the binding no longer holds: copy it into the binding as it is (required for a row that is not closed; a closed one is moved by default) (repeatable, comma-separated) |
+| `--record-carried` | stringSlice |  | for a work-store row the manifest lists by id alone and the binding no longer holds: record it as the bead the copy carried, so the clear deletes its work-store row (the backup keeps it); accepted for closed rows too (repeatable, comma-separated) |
+| `--replace-binding-row` | stringSlice |  | for a work-store row whose id the binding holds for a different bead: back up and remove the binding's row, then copy the work-store row in under the id (repeatable, comma-separated) |
 
 ## gc storage repair-sequence
 
