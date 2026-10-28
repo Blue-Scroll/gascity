@@ -889,6 +889,10 @@ func sessionBackendEnvWithError(cityPath, rigRoot string, rigs []config.Rig) (ma
 	// Explicit empty values let tmux unset stale Dolt vars inherited from
 	// the server environment when the current city/rig does not use them.
 	setProjectedDoltEnvEmpty(env)
+	// Only withholdMirroredManagedDoltPort marks a target managed-local. The
+	// explicit empty value also outranks a marker that passthroughEnv copies
+	// from the controller's own environment.
+	env["GC_DOLT_MANAGED_LOCAL"] = ""
 	applySessionSharedServerOptOut(env, cityPath, rigRoot)
 
 	// Session env projection must not trigger provider recovery. Session setup
@@ -916,6 +920,12 @@ func sessionBackendEnvWithError(cityPath, rigRoot string, rigs []config.Rig) (ma
 			if !isRecoverableManagedDoltEnvError(err) {
 				return env, err
 			}
+		} else {
+			// The projection carries the live port; withhold it when the
+			// scope's own port mirror already carries the same fact, so the
+			// session's raw bd follows the mirror across a managed Dolt
+			// restart onto a new port (gastownhall/gascity#1656).
+			withholdMirroredManagedDoltPort(env, cityPath, cityPath)
 		}
 		return env, nil
 	}
@@ -930,6 +940,12 @@ func sessionBackendEnvWithError(cityPath, rigRoot string, rigs []config.Rig) (ma
 		if !isRecoverableManagedDoltEnvError(err) {
 			return env, err
 		}
+	} else {
+		// Same withhold as the city branch, judged against the rig's own
+		// .beads/dolt-server.port mirror: an inherited-city rig session's
+		// raw bd should follow the mirror gc reconciles, not the port dolt
+		// ran on when the session was spawned (gastownhall/gascity#1656).
+		withholdMirroredManagedDoltPort(env, cityPath, rigRoot)
 	}
 	return env, nil
 }
