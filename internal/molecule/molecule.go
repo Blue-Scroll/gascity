@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -18,6 +19,7 @@ import (
 
 	"github.com/gastownhall/gascity/internal/beadmeta"
 	"github.com/gastownhall/gascity/internal/beads"
+	"github.com/gastownhall/gascity/internal/beads/closeorder"
 	"github.com/gastownhall/gascity/internal/formula"
 )
 
@@ -60,6 +62,13 @@ type Options struct {
 	DeferAssignees bool
 
 	nativeStepTopologyPrepared bool
+
+	// keepFailedOpen leaves a failed pour's beads open (still marked
+	// molecule_failed) instead of closing them. Only Attach sets it: its
+	// fence recovery finds a failed partial through live-only lists
+	// (findExistingAttach, dispatch failedAttemptAttachRootID). Unexported
+	// so every other pour cleans up after itself.
+	keepFailedOpen bool
 }
 
 const (
@@ -406,6 +415,7 @@ func Attach(ctx context.Context, store beads.Store, recipe *formula.Recipe, atta
 		PreserveRootType:           true,
 		DeferAssignees:             fencedDeferred,
 		nativeStepTopologyPrepared: true,
+		keepFailedOpen:             true,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("instantiate: %w", err)
@@ -822,8 +832,8 @@ func attachStepRefs(step formula.RecipeStep) []string {
 //
 // Steps are created in order (root first, then children depth-first).
 // Dependencies are wired after all beads exist. On partial failure,
-// already-created beads are marked with "molecule_failed" metadata
-// for cleanup.
+// already-created beads are marked with "molecule_failed" metadata and
+// closed (see abandonFailedPour), so a failed pour leaves no open work.
 func Instantiate(ctx context.Context, store beads.Store, recipe *formula.Recipe, opts Options) (*Result, error) {
 	if recipe == nil {
 		return nil, fmt.Errorf("recipe is nil")
@@ -1017,24 +1027,23 @@ func Instantiate(ctx context.Context, store beads.Store, recipe *formula.Recipe,
 		// as agent-readable templates resolved at claim time.
 		if strings.Contains(b.Title, "{{") {
 			if residual := formula.CheckResidualVars(b.Title); len(residual) > 0 {
-				markFailed(store, createdIDs)
+				abandonFailedPour(store, createdIDs, opts.keepFailedOpen)
 				return nil, fmt.Errorf("step %q: bead title contains unresolved variable(s) %s — missing or misspelled --var(s)?", step.ID, strings.Join(residual, ", "))
 			}
 		}
 		// Same guard, extended to routing metadata — see #5060.
 		if err := validateResidualRoutingVars(step.ID, b.Metadata); err != nil {
-			markFailed(store, createdIDs)
+			abandonFailedPour(store, createdIDs, opts.keepFailedOpen)
 			return nil, err
 		}
 		if err := validateTimeoutMetadataVars(step.ID, b.Metadata); err != nil {
-			markFailed(store, createdIDs)
+			abandonFailedPour(store, createdIDs, opts.keepFailedOpen)
 			return nil, err
 		}
 
 		created, err := store.Create(b)
 		if err != nil {
-			// Best-effort cleanup: mark already-created beads as failed.
-			markFailed(store, createdIDs)
+			abandonFailedPour(store, createdIDs, opts.keepFailedOpen)
 			return nil, fmt.Errorf("creating bead for step %q: %w", step.ID, err)
 		}
 
@@ -1058,13 +1067,13 @@ func Instantiate(ctx context.Context, store beads.Store, recipe *formula.Recipe,
 			if dep.Type == "parent-child" && createdParentByStep[dep.StepID] != toID {
 				parentID := toID
 				if err := store.Update(fromID, beads.UpdateOpts{ParentID: &parentID}); err != nil {
-					markFailed(store, createdIDs)
+					abandonFailedPour(store, createdIDs, opts.keepFailedOpen)
 					return nil, fmt.Errorf("setting parent for dep %s->%s: %w", dep.StepID, dep.DependsOnID, err)
 				}
 				createdParentByStep[dep.StepID] = toID
 			}
 			if err := store.DepAdd(fromID, toID, dep.Type); err != nil {
-				markFailed(store, createdIDs)
+				abandonFailedPour(store, createdIDs, opts.keepFailedOpen)
 				return nil, fmt.Errorf("wiring dep %s->%s: %w", dep.StepID, dep.DependsOnID, err)
 			}
 		}
@@ -1082,7 +1091,7 @@ func Instantiate(ctx context.Context, store beads.Store, recipe *formula.Recipe,
 				continue
 			}
 			if err := store.DepAdd(fromID, dep.DependsOnID, dep.Type); err != nil {
-				markFailed(store, createdIDs)
+				abandonFailedPour(store, createdIDs, opts.keepFailedOpen)
 				return nil, fmt.Errorf("wiring external dep %s->%s: %w", stepID, dep.DependsOnID, err)
 			}
 		}
@@ -1098,7 +1107,7 @@ func Instantiate(ctx context.Context, store beads.Store, recipe *formula.Recipe,
 				continue
 			}
 			if err := store.Update(beadID, beads.UpdateOpts{Assignee: &assignee}); err != nil {
-				markFailed(store, createdIDs)
+				abandonFailedPour(store, createdIDs, opts.keepFailedOpen)
 				return nil, fmt.Errorf("assigning graph step %q: %w", stepID, err)
 			}
 		}
@@ -1111,7 +1120,7 @@ func Instantiate(ctx context.Context, store beads.Store, recipe *formula.Recipe,
 				continue
 			}
 			if err := activateFencedGraphWorkflowBead(store, beadID); err != nil {
-				markFailed(store, createdIDs)
+				abandonFailedPour(store, createdIDs, opts.keepFailedOpen)
 				return nil, fmt.Errorf("activating graph step %q: %w", step.ID, err)
 			}
 		}
@@ -1754,6 +1763,36 @@ func markFailedReporting(store beads.Store, ids []string) error {
 		}
 	}
 	return firstErr
+}
+
+// FailedPourClosedReason is the close_reason Instantiate stamps on the
+// beads of a pour that failed partway. bd's validation.on-close=error
+// needs a reason of at least 20 chars, or the close is refused.
+const FailedPourClosedReason = "molecule cleanup: pour failed, partial beads closed"
+
+// abandonFailedPour marks the beads a failed pour already made as
+// molecule_failed, then closes them. Marking alone left them open and
+// claimable, and nothing ever closed them: burning the root does not
+// reach steps linked only by gc.root_bead_id. One ledger held 67 such
+// orphans from failed pours (vn-qe56l9b).
+//
+// The mark comes first so it survives a failed close. keepOpen skips the
+// close; see Options.keepFailedOpen. Best-effort: we are already on an
+// error path.
+func abandonFailedPour(store beads.Store, ids []string, keepOpen bool) {
+	markFailed(store, ids)
+	if keepOpen || len(ids) == 0 {
+		return
+	}
+	// ids is in creation order, root first. Reversed, children come before
+	// their parents; closeorder then puts in-set blockers first.
+	reversed := slices.Clone(ids)
+	slices.Reverse(reversed)
+	ordered, err := closeorder.Order(store, reversed)
+	if err != nil {
+		ordered = reversed
+	}
+	_, _ = store.CloseAll(ordered, map[string]string{"close_reason": FailedPourClosedReason})
 }
 
 // markFailed sets beadmeta.MoleculeFailedMetadataKey on all created beads.

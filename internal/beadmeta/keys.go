@@ -435,8 +435,9 @@ const (
 
 	// MoleculeFailedMetadataKey marks the beads of a partially-instantiated
 	// molecule as failed (value "true"). Written best-effort by
-	// internal/molecule markFailed on instantiation error paths; read by
-	// dispatch/sling/cmd/gc to skip or close failed roots.
+	// internal/molecule on instantiation error paths, which also close
+	// those beads (except Attach, whose fence recovery reads them open);
+	// read by dispatch/sling/cmd/gc to skip or close failed roots.
 	MoleculeFailedMetadataKey = "molecule_failed"
 
 	// MergeStrategyMetadataKey records the merge strategy chosen for a slung bead.

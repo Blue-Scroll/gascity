@@ -1043,21 +1043,7 @@ func TestInstantiateGraphWorkflowFailureClearsInstantiationFence(t *testing.T) {
 		t.Fatal("expected error on dep failure")
 	}
 
-	all, err := base.ListOpen()
-	if err != nil {
-		t.Fatalf("ListOpen: %v", err)
-	}
-	if len(all) != 2 {
-		t.Fatalf("open beads = %d, want 2", len(all))
-	}
-	for _, b := range all {
-		full, err := base.Get(b.ID)
-		if err != nil {
-			t.Fatalf("Get(%s): %v", b.ID, err)
-		}
-		if full.Metadata["molecule_failed"] != "true" {
-			t.Errorf("bead %s molecule_failed = %q, want true", full.ID, full.Metadata["molecule_failed"])
-		}
+	for _, full := range requireFailedPourClosed(t, base, 2) {
 		if full.Metadata[InstantiatingMetadataKey] != "" {
 			t.Errorf("bead %s instantiating metadata = %q, want cleared", full.ID, full.Metadata[InstantiatingMetadataKey])
 		}
@@ -2313,15 +2299,35 @@ func TestInstantiateCreateFailure(t *testing.T) {
 		t.Fatal("expected error on create failure")
 	}
 
-	// Root bead should exist but be marked as failed
-	all, _ := base.ListOpen()
-	if len(all) != 1 {
-		t.Fatalf("expected 1 bead (root), got %d", len(all))
+	// The root was made before the failure: it must be marked and closed.
+	requireFailedPourClosed(t, base, 1)
+}
+
+// requireFailedPourClosed asserts the store holds exactly want beads, every
+// one marked molecule_failed and closed with FailedPourClosedReason. A failed
+// pour that left them open is the vn-qe56l9b leak: open, claimable step
+// beads that nothing ever closes.
+func requireFailedPourClosed(t *testing.T, store beads.Store, want int) []beads.Bead {
+	t.Helper()
+	all, err := store.List(beads.ListQuery{AllowScan: true, IncludeClosed: true})
+	if err != nil {
+		t.Fatalf("List: %v", err)
 	}
-	root, _ := base.Get(all[0].ID)
-	if root.Metadata["molecule_failed"] != "true" {
-		t.Error("root bead not marked as molecule_failed")
+	if len(all) != want {
+		t.Fatalf("beads = %d, want %d", len(all), want)
 	}
+	for _, b := range all {
+		if b.Metadata["molecule_failed"] != "true" {
+			t.Errorf("bead %s molecule_failed = %q, want true", b.ID, b.Metadata["molecule_failed"])
+		}
+		if b.Status != "closed" {
+			t.Errorf("bead %s status = %q, want closed", b.ID, b.Status)
+		}
+		if got := b.Metadata["close_reason"]; got != FailedPourClosedReason {
+			t.Errorf("bead %s close_reason = %q, want %q", b.ID, got, FailedPourClosedReason)
+		}
+	}
+	return all
 }
 
 // errDepStore fails on DepAdd.
@@ -2356,14 +2362,8 @@ func TestInstantiateDepFailure(t *testing.T) {
 		t.Fatal("expected error on dep failure")
 	}
 
-	// All beads should be marked as failed
-	all, _ := base.ListOpen()
-	for _, b := range all {
-		full, _ := base.Get(b.ID)
-		if full.Metadata["molecule_failed"] != "true" {
-			t.Errorf("bead %s not marked as molecule_failed", b.ID)
-		}
-	}
+	// All three beads were made before wiring failed: all marked and closed.
+	requireFailedPourClosed(t, base, 3)
 }
 
 func TestCookOnRequiresParentID(t *testing.T) {
