@@ -439,6 +439,98 @@ adopts it.
   before it proposed the op had the lane send nothing, and answers from
   itself: `in_flight` until the op sweeper closes it at its `finish_by`,
   then that close.
+- `/submit` and `/messages` (message listed): a lane message op under the
+  operator, keyed by the Idempotency-Key or a minted one, with
+  `LaneMessageOpPolicy` (default and follow_up at the boundary,
+  interrupt_now as a deliver-now unit, which never hard-restarts), proposed
+  after a configured named session's row is materialized. `resume: true`
+  consumes the session's operator hold once the op is proposed, and
+  nothing else, recording the session's wake in the same write
+  (`session.Store.ResumeHeld`): no wait is canceled and no will-not-start
+  verdict refuses it (the result reports one). It consumes only a hold
+  stamped at or before the op's `created_at`, so a hold the operator
+  places while the message waits stands through every retry and the CLI
+  fallback's resume. A proposal
+  that fails leaves the hold in place. A closed, closing or archived
+  session is refused 409 and one draining under the operator's suspend
+  409 `session_stopping` before anything is written
+  (`session.Store.ResumeHeldRefusal`), so the key stays free for a retry.
+  A resume refused once the op is written (the row changed since that
+  read, a revision fence lost on every attempt, a store error) cancels the
+  op the request wrote (it created it, or its create committed and
+  answered an error under a key the request minted) before the lane is
+  rung, and the error says the key is spent: a retry under it reports that
+  op instead of sending again. It offers a resend under a new key only when
+  the cancel closed the op: an op the lane host's scan took first (the
+  cancel only requested), or whose cancel failed, may still deliver the
+  message, and the error says so instead (`laneKeySpent`). Never reuse
+  `wakeSession` there: it cancels
+  the session's waits. The 202 follows the commit, `request_id` the op
+  id, and the acceptance is recorded before the lane is rung (a refused
+  acceptance cancels the op; a cancel only requested, the lane host's scan
+  having taken it, is logged). The terminal event
+  follows `laneSubmitSettle` (5 s) later through `cityOps.emit`: the
+  result, queued false, for an op closed succeeded; `request.failed`
+  (`messageReplayErrorCode`) for one closed otherwise; the result, queued
+  true, for one still open, its `will_start` read alone (`laneWillStart`:
+  `session.WakeRequestVerdict` on the row as the lane host reads it, a
+  dormant row as not running and any other with its runtime's reading
+  (`laneWakeVerdict`), and the `WakeStartRefuser` reading, no wake written
+  and no poke, since the lane host's wake request does both). A failed read
+  of the op gets the result from the op as accepted, queued true: a
+  `request.failed` would invite a resend of a message the lane may still
+  deliver, and the op's fate is `op.changed`'s. A held
+  session's reason offers the same-key `resume: true` resend, under the
+  `idempotency_key` of the request's 202 (the client's or a minted one),
+  when that resend lifts every hold (`session.ResumeHeldPreview`: a
+  suspend stamped by the op's `created_at`); when it lifts that suspend
+  and other holds stand, the reason names the suspend and those holds and
+  offers the resend for the suspend; when a drain is stopping the session,
+  whose stop refuses the resume 409 `session_stopping` until it is done,
+  the reason names the holds and the drain and offers the resend once the
+  drain is done (`laneDrainingReason`); and otherwise it names the holds
+  the resend leaves standing (`session.Disposition.ConsumeHolds`: a wait,
+  a quarantine, a heartbeat, a later suspend); a refusal carries no
+  `resume: true` hint, as resume starts nothing under the lane. A
+  `/submit` result says the intent the op's policy runs
+  (`submitIntentForWhen`), as its replay does: follow_up is the default
+  request on the lane, so under one key either answers from the other's
+  op. A same-key retry of a closed op replays it
+  (`storedReplayAnswer`); an open lane op is accepted again
+  (`answerLaneMessage`: its acceptance recorded, the lane rung and its
+  terminal event emitted after the retry's cursor, so its `request_id`
+  resolves, 409 `in_flight` while a terminal event of the op's stays
+  kept), its `resume: true` run again first, since the request that wrote
+  the op may have died before its own resume (a hold stamped after the
+  op's `created_at` stands); a resume refused there leaves the op open, as
+  an earlier answer may have accepted it. An open legacy op is 409
+  `in_flight`. A legacy op the key names from before the flip answers only
+  the request it recorded (`sameLegacyMessage`). The `Idempotency-Key`
+  LRU keeps no answer of a request the lane accepts
+  (`withMessageIdempotency`, which reads `laneExecutes` once per request
+  and hands that reading to `acceptMessageOp`), so a same-key retry
+  reaches the op on the API process that answered the first request too:
+  a resend that adds `resume: true`, or sends follow_up for default, is
+  answered from the op, where the LRU, which hashes the whole body, would
+  refuse it 422 or replay the first 202 without running its resume. The
+  op answers a same-key retry whatever the session waits on: only a
+  request no op under its key answers is refused 409 `pending_interaction`,
+  writing nothing (`checkNewLaneMessage`), so a retry of a message that
+  raised an approval is not told to answer it before sending text its 202
+  already accepted (request_id rule 8). The
+  LRU still holds the key while the request runs (a concurrent same-key
+  request is 409 `in_flight`), and still replays an answer it kept before
+  the lane host ran, which the journal may not have recorded. A
+  message over `opjournal.MaxInlinePayload` (16 KiB) is 422
+  `payload_too_large`. extmsg member notices are lane notices from
+  `gc:extmsg`, their inbound text cut to fit that limit (`extmsgNotice`). A
+  provider session create's initial message (`POST /sessions`, `kind:
+  provider`, with `message`) is an operator lane message op at the boundary
+  under a minted key (`deliverInitialMessage`), refused 422 before anything
+  is created when it is over the limit (`checkInitialMessage`); only a
+  failed proposal fails the create and rolls it back. An agent create's
+  message rides its first start's prompt
+  (`template_overrides.initial_message`) and is no lane op.
 - Run cancel (interrupt listed): one op per holder session with a turn to
   stop, or that may have one, as for `/stop` (`sessionHasNoTurn`), keyed
   `run-cancel:<run id>:<gen>` (one per holder incarnation, so a holder that
